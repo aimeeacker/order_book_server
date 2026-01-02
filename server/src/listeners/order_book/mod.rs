@@ -17,8 +17,8 @@ use chrono::{Timelike, Utc};
 use fs::File;
 use log::{error, info};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use std::thread;
 use std::{
-    cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
@@ -330,6 +330,9 @@ pub(crate) struct OrderBookListener {
     last_fill_len: u64,
     last_order_status_len: u64,
     last_order_diff_len: u64,
+    last_fill_offset: u64,
+    last_order_status_offset: u64,
+    last_order_diff_offset: u64,
     snapshot_requested: bool,
 }
 
@@ -352,6 +355,9 @@ impl OrderBookListener {
             last_fill_len: 0,
             last_order_status_len: 0,
             last_order_diff_len: 0,
+            last_fill_offset: 0,
+            last_order_status_offset: 0,
+            last_order_diff_offset: 0,
             snapshot_requested: false,
         }
     }
@@ -371,28 +377,12 @@ impl OrderBookListener {
     #[allow(clippy::type_complexity)]
     // pops earliest pair of cached updates that have the same timestamp if possible
     fn pop_cache(&mut self) -> Option<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
-        // synchronize to same block
-        while let Some(t) = self.order_diff_cache.front() {
-            if let Some(s) = self.order_status_cache.front() {
-                match t.block_number().cmp(&s.block_number()) {
-                    Ordering::Less => {
-                        self.order_diff_cache.pop_front();
-                    }
-                    Ordering::Equal => {
-                        return self
-                            .order_status_cache
-                            .pop_front()
-                            .and_then(|t| self.order_diff_cache.pop_front().map(|s| (t, s)));
-                    }
-                    Ordering::Greater => {
-                        self.order_status_cache.pop_front();
-                    }
-                }
-            } else {
-                break;
-            }
+        let diff = self.order_diff_cache.front()?;
+        let status = self.order_status_cache.front()?;
+        if diff.block_number() != status.block_number() {
+            return None;
         }
-        None
+        self.order_status_cache.pop_front().and_then(|t| self.order_diff_cache.pop_front().map(|s| (t, s)))
     }
 
     fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
@@ -494,6 +484,14 @@ impl OrderBookListener {
         }
     }
 
+    fn last_offset_mut(&mut self, event_source: EventSource) -> &mut u64 {
+        match event_source {
+            EventSource::Fills => &mut self.last_fill_offset,
+            EventSource::OrderStatuses => &mut self.last_order_status_offset,
+            EventSource::OrderDiffs => &mut self.last_order_diff_offset,
+        }
+    }
+
     fn request_snapshot(&mut self) {
         self.snapshot_requested = true;
     }
@@ -523,8 +521,7 @@ impl OrderBookListener {
             // Unfortunately, we miss the update that occurs at this time step.
             // We go to the end of the file to read for updates after that.
             if self.is_reading(event_source) {
-                if let Ok(metadata) = new_path.metadata() {
-                    let size = metadata.len();
+                if let Ok(size) = stable_size(new_path) {
                     let last_len = *self.last_len_mut(event_source);
                     if size == last_len {
                         return Ok(());
@@ -534,6 +531,7 @@ impl OrderBookListener {
                         if let Some(file) = self.file_mut(event_source).as_mut() {
                             file.seek(SeekFrom::Start(0))?;
                         }
+                        *self.last_offset_mut(event_source) = 0;
                     }
                     *self.last_len_mut(event_source) = size;
                 }
@@ -544,6 +542,7 @@ impl OrderBookListener {
                 new_file.seek(SeekFrom::End(0))?;
                 if let Ok(metadata) = new_path.metadata() {
                     *self.last_len_mut(event_source) = metadata.len();
+                    *self.last_offset_mut(event_source) = metadata.len();
                 }
                 *self.pending_line_mut(event_source) = String::new();
                 *self.file_mut(event_source) = Some(new_file);
@@ -579,6 +578,19 @@ impl DirectoryListener for OrderBookListener {
             }
         }
         *self.file_mut(event_source) = Some(File::open(new_file)?);
+        *self.last_offset_mut(event_source) = 0;
+        Ok(())
+    }
+
+    fn on_file_modification(&mut self, event_source: EventSource) -> Result<()> {
+        let mut buf = String::new();
+        let last_offset = *self.last_offset_mut(event_source);
+        let file = self.file_mut(event_source).as_mut().ok_or("No file being tracked")?;
+        file.seek(SeekFrom::Start(last_offset))?;
+        file.read_to_string(&mut buf)?;
+        let new_offset = file.seek(SeekFrom::Current(0))?;
+        *self.last_offset_mut(event_source) = new_offset;
+        self.process_data(buf, event_source)?;
         Ok(())
     }
 
@@ -642,6 +654,13 @@ impl DirectoryListener for OrderBookListener {
         }
         Ok(())
     }
+}
+
+fn stable_size(path: &PathBuf) -> Result<u64> {
+    let _first = path.metadata()?.len();
+    thread::sleep(Duration::from_millis(5));
+    let second = path.metadata()?.len();
+    Ok(second)
 }
 
 pub(crate) struct L2Snapshots(HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>);
