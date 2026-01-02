@@ -604,7 +604,8 @@ impl DirectoryListener for OrderBookListener {
             }
             if let Err(err) = self.receive_batch(event_batch) {
                 self.order_book_state = None;
-                return Err(err);
+                error!("{event_source} update error: {err}. Waiting for next snapshot.");
+                return Ok(());
             }
         }
         let snapshot = self.l2_snapshots(true);
