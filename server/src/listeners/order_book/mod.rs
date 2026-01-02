@@ -494,6 +494,11 @@ impl OrderBookListener {
         }
     }
 
+    fn reset_file_tracking(&mut self, event_source: EventSource) {
+        *self.pending_line_mut(event_source) = String::new();
+        *self.last_len_mut(event_source) = 0;
+    }
+
     fn request_snapshot(&mut self) {
         self.snapshot_requested = true;
     }
@@ -541,11 +546,13 @@ impl OrderBookListener {
             } else {
                 info!("-- Event: {} modified, tracking it now --", new_path.display());
                 let mut new_file = File::open(new_path)?;
-                new_file.seek(SeekFrom::End(0))?;
+                new_file.seek(SeekFrom::Start(0))?;
                 if let Ok(metadata) = new_path.metadata() {
                     *self.last_len_mut(event_source) = metadata.len();
                 }
+                self.reset_file_tracking(event_source);
                 *self.file_mut(event_source) = Some(new_file);
+                self.on_file_modification(event_source)?;
             }
         }
         Ok(())
