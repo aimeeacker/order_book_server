@@ -109,24 +109,27 @@ pub(crate) async fn hl_listen(
                 Some(Ok(event)) => {
                     if event.kind.is_create() || event.kind.is_modify() {
                         let new_path = &event.paths[0];
+                        let mut listener_guard = listener.lock().await;
                         if new_path.starts_with(&order_statuses_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
+                            listener_guard
                                 .process_update(&event, new_path, EventSource::OrderStatuses)
                                 .map_err(|err| format!("Order status processing error: {err}"))?;
                         } else if new_path.starts_with(&fills_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
+                            listener_guard
                                 .process_update(&event, new_path, EventSource::Fills)
                                 .map_err(|err| format!("Fill update processing error: {err}"))?;
                         } else if new_path.starts_with(&order_diffs_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
+                            listener_guard
                                 .process_update(&event, new_path, EventSource::OrderDiffs)
                                 .map_err(|err| format!("Book diff processing error: {err}"))?;
+                        }
+                        let snapshot_requested = listener_guard.take_snapshot_request();
+                        drop(listener_guard);
+                        if snapshot_requested {
+                            let listener = listener.clone();
+                            let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
+                            let active_symbols = active_symbols.clone();
+                            fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
                         }
                     }
                 }
@@ -327,6 +330,7 @@ pub(crate) struct OrderBookListener {
     last_fill_len: u64,
     last_order_status_len: u64,
     last_order_diff_len: u64,
+    snapshot_requested: bool,
 }
 
 impl OrderBookListener {
@@ -348,6 +352,7 @@ impl OrderBookListener {
             last_fill_len: 0,
             last_order_status_len: 0,
             last_order_diff_len: 0,
+            snapshot_requested: false,
         }
     }
 
@@ -488,6 +493,22 @@ impl OrderBookListener {
             EventSource::OrderDiffs => &mut self.last_order_diff_len,
         }
     }
+
+    fn request_snapshot(&mut self) {
+        self.snapshot_requested = true;
+    }
+
+    fn take_snapshot_request(&mut self) -> bool {
+        std::mem::take(&mut self.snapshot_requested)
+    }
+
+    fn reset_state_for_snapshot(&mut self) {
+        self.order_book_state = None;
+        self.order_diff_cache = BatchQueue::new();
+        self.order_status_cache = BatchQueue::new();
+        self.fetched_snapshot_cache = None;
+        self.request_snapshot();
+    }
 }
 
 impl OrderBookListener {
@@ -603,8 +624,8 @@ impl DirectoryListener for OrderBookListener {
                 info!("{event_source} block: {height}");
             }
             if let Err(err) = self.receive_batch(event_batch) {
-                self.order_book_state = None;
                 error!("{event_source} update error: {err}. Waiting for next snapshot.");
+                self.reset_state_for_snapshot();
                 return Ok(());
             }
         }
