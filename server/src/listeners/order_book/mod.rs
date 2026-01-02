@@ -3,7 +3,7 @@ use crate::{
     listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
     order_book::{
         Coin, Snapshot,
-        multi_book::{Snapshots, load_snapshots_from_json},
+        multi_book::{Snapshots, load_snapshots_from_slice},
     },
     prelude::*,
     types::{
@@ -13,6 +13,7 @@ use crate::{
     },
 };
 use alloy::primitives::Address;
+use chrono::{Timelike, Utc};
 use fs::File;
 use log::{error, info};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
@@ -30,16 +31,46 @@ use tokio::{
         broadcast::Sender,
         mpsc::{UnboundedSender, unbounded_channel},
     },
-    time::{Instant, interval_at, sleep},
+    time::{Instant, sleep, sleep_until},
 };
-use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
+use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency_with_hashes};
 
 mod state;
 mod utils;
 
+enum SnapshotFetchOutcome {
+    Validated,
+    Initialize { height: u64, expected_snapshot: Snapshots<InnerL4Order> },
+}
+
+fn next_snapshot_instant() -> Instant {
+    let now = Utc::now();
+    let schedule = [(1, 30), (31, 30)];
+    let mut next = None;
+    for (minute, second) in schedule {
+        if let Some(candidate) = now.with_minute(minute).and_then(|t| t.with_second(second)) {
+            if candidate > now {
+                next = Some(candidate);
+                break;
+            }
+        }
+    }
+    let target = next.unwrap_or_else(|| {
+        let next_hour = now + chrono::Duration::hours(1);
+        next_hour.with_minute(schedule[0].0).and_then(|t| t.with_second(schedule[0].1)).unwrap_or(next_hour)
+    });
+    let duration = target.signed_duration_since(now);
+    let wait = duration.to_std().unwrap_or_else(|_| Duration::from_secs(0));
+    Instant::now() + wait
+}
+
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
-pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: PathBuf) -> Result<()> {
+pub(crate) async fn hl_listen(
+    listener: Arc<Mutex<OrderBookListener>>,
+    dir: PathBuf,
+    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
+) -> Result<()> {
     let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
     let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
     let order_diffs_dir = EventSource::OrderDiffs.event_source_dir(&dir).canonicalize()?;
@@ -68,8 +99,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     watcher.watch(&order_statuses_dir, RecursiveMode::Recursive)?;
     watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
-    let start = Instant::now() + Duration::from_secs(5);
-    let mut ticker = interval_at(start, Duration::from_secs(10));
+    let mut next_snapshot = Box::pin(sleep_until(next_snapshot_instant()));
     loop {
         tokio::select! {
             event = fs_event_rx.recv() =>  match event {
@@ -117,10 +147,12 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                     Some(Ok(())) => {}
                 }
             }
-            _ = ticker.tick() => {
+            () = &mut next_snapshot => {
                 let listener = listener.clone();
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                let active_symbols = active_symbols.clone();
+                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
+                next_snapshot.as_mut().reset(next_snapshot_instant());
             }
             () = sleep(Duration::from_secs(5)) => {
                 let listener = listener.lock().await;
@@ -137,53 +169,78 @@ fn fetch_snapshot(
     listener: Arc<Mutex<OrderBookListener>>,
     tx: UnboundedSender<Result<()>>,
     ignore_spot: bool,
+    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
         let res = match process_rmp_file(&dir).await {
-            Ok(output_fln) => {
+            Ok(snapshot_bytes) => {
                 let state = {
                     let mut listener = listener.lock().await;
                     listener.begin_caching();
                     listener.clone_state()
                 };
-                let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
                 info!("Snapshot fetched");
                 // sleep to let some updates build up.
                 sleep(Duration::from_secs(1)).await;
-                let mut cache = {
+                let cache = {
                     let mut listener = listener.lock().await;
                     listener.take_cache()
                 };
+                let active_symbols = {
+                    let active_symbols = active_symbols.lock().await;
+                    active_symbols
+                        .iter()
+                        .filter(|(_, count)| **count > 0)
+                        .map(|(coin, _)| coin.clone())
+                        .collect::<HashSet<_>>()
+                };
                 info!("Cache has {} elements", cache.len());
-                match snapshot {
-                    Ok((height, expected_snapshot)) => {
-                        if let Some(mut state) = state {
-                            while state.height() < height {
-                                if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                    state.apply_updates(order_statuses, order_diffs)?;
-                                } else {
-                                    return Err::<(), Error>("Not enough cached updates".into());
-                                }
+                let blocking_result = tokio::task::spawn_blocking(move || {
+                    let mut snapshot_bytes = snapshot_bytes;
+                    let mut cache = cache;
+                    let (height, expected_snapshot) =
+                        load_snapshots_from_slice::<InnerL4Order, (Address, L4Order)>(&mut snapshot_bytes)?;
+                    if let Some(mut state) = state {
+                        while state.height() < height {
+                            if let Some((order_statuses, order_diffs)) = cache.pop_front() {
+                                state.apply_updates(order_statuses, order_diffs)?;
+                            } else {
+                                return Err::<SnapshotFetchOutcome, Error>("Not enough cached updates".into());
                             }
-                            if state.height() > height {
-                                return Err("Fetched snapshot lagging stored state".into());
-                            }
-                            let stored_snapshot = state.compute_snapshot().snapshot;
-                            info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
-                        } else {
-                            listener.lock().await.init_from_snapshot(expected_snapshot, height);
-                            Ok(())
                         }
+                        if state.height() > height {
+                            return Err("Fetched snapshot lagging stored state".into());
+                        }
+                        let stored_snapshot = state.compute_snapshot().snapshot;
+                        info!("Validating snapshot");
+                        validate_snapshot_consistency_with_hashes(
+                            &stored_snapshot,
+                            expected_snapshot,
+                            &active_symbols,
+                            ignore_spot,
+                        )?;
+                        Ok(SnapshotFetchOutcome::Validated)
+                    } else {
+                        Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })
                     }
-                    Err(err) => Err(err),
+                })
+                .await
+                .map_err(|err| format!("Snapshot validation task join error: {err}"));
+
+                match blocking_result {
+                    Ok(Ok(SnapshotFetchOutcome::Validated)) => Ok(()),
+                    Ok(Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })) => {
+                        listener.lock().await.init_from_snapshot(expected_snapshot, height);
+                        Ok(())
+                    }
+                    Ok(Err(err)) => Err(err),
+                    Err(err) => Err(err.into()),
                 }
             }
             Err(err) => Err(err),
         };
         let _unused = tx.send(res);
-        Ok(())
     });
 }
 
@@ -200,6 +257,12 @@ pub(crate) struct OrderBookListener {
     // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    pending_fill_line: String,
+    pending_order_status_line: String,
+    pending_order_diff_line: String,
+    last_fill_len: u64,
+    last_order_status_len: u64,
+    last_order_diff_len: u64,
 }
 
 impl OrderBookListener {
@@ -215,6 +278,12 @@ impl OrderBookListener {
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
+            pending_fill_line: String::new(),
+            pending_order_status_line: String::new(),
+            pending_order_diff_line: String::new(),
+            last_fill_len: 0,
+            last_order_status_len: 0,
+            last_order_diff_len: 0,
         }
     }
 
@@ -339,6 +408,22 @@ impl OrderBookListener {
     fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
         self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
     }
+
+    fn pending_line_mut(&mut self, event_source: EventSource) -> &mut String {
+        match event_source {
+            EventSource::Fills => &mut self.pending_fill_line,
+            EventSource::OrderStatuses => &mut self.pending_order_status_line,
+            EventSource::OrderDiffs => &mut self.pending_order_diff_line,
+        }
+    }
+
+    fn last_len_mut(&mut self, event_source: EventSource) -> &mut u64 {
+        match event_source {
+            EventSource::Fills => &mut self.last_fill_len,
+            EventSource::OrderStatuses => &mut self.last_order_status_len,
+            EventSource::OrderDiffs => &mut self.last_order_diff_len,
+        }
+    }
 }
 
 impl OrderBookListener {
@@ -353,13 +438,29 @@ impl OrderBookListener {
             // Unfortunately, we miss the update that occurs at this time step.
             // We go to the end of the file to read for updates after that.
             if self.is_reading(event_source) {
+                if let Ok(metadata) = new_path.metadata() {
+                    let size = metadata.len();
+                    let last_len = *self.last_len_mut(event_source);
+                    if size == last_len {
+                        return Ok(());
+                    }
+                    if size < last_len {
+                        *self.pending_line_mut(event_source) = String::new();
+                        if let Some(file) = self.file_mut(event_source).as_mut() {
+                            file.seek(SeekFrom::Start(0))?;
+                        }
+                    }
+                    *self.last_len_mut(event_source) = size;
+                }
                 self.on_file_modification(event_source)?;
             } else {
                 info!("-- Event: {} modified, tracking it now --", new_path.display());
-                let file = self.file_mut(event_source);
                 let mut new_file = File::open(new_path)?;
                 new_file.seek(SeekFrom::End(0))?;
-                *file = Some(new_file);
+                if let Ok(metadata) = new_path.metadata() {
+                    *self.last_len_mut(event_source) = metadata.len();
+                }
+                *self.file_mut(event_source) = Some(new_file);
             }
         }
         Ok(())
@@ -395,9 +496,18 @@ impl DirectoryListener for OrderBookListener {
         Ok(())
     }
 
-    fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
-        let total_len = data.len();
-        let lines = data.lines();
+    fn process_data(&mut self, incoming: String, event_source: EventSource) -> Result<()> {
+        let pending = self.pending_line_mut(event_source).clone();
+        let mut combined = pending;
+        combined.push_str(&incoming);
+        let ends_with_newline = combined.ends_with('\n');
+        let mut lines: Vec<&str> = combined.split('\n').collect();
+        let pending_line = if ends_with_newline { None } else { lines.pop() };
+        if let Some(pending_line) = pending_line {
+            *self.pending_line_mut(event_source) = pending_line.to_string();
+        } else {
+            self.pending_line_mut(event_source).clear();
+        }
         for line in lines {
             if line.is_empty() {
                 continue;
@@ -419,11 +529,9 @@ impl DirectoryListener for OrderBookListener {
                     error!(
                         "{event_source} serialization error {err}, height: {:?}, line: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
+                        line.chars().take(100).collect::<String>(),
                     );
-                    #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
+                    *self.pending_line_mut(event_source) = line.to_string();
                     break;
                 }
             };

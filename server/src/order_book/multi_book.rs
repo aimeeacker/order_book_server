@@ -4,6 +4,7 @@ use crate::{
 };
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
+use simd_json::serde::from_slice;
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
@@ -69,6 +70,8 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     }
 }
 
+#[allow(dead_code)]
+/// Legacy string-based snapshot loading kept for tests/compatibility.
 pub(crate) fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
@@ -91,6 +94,30 @@ where
     ))
 }
 
+pub(crate) fn load_snapshots_from_slice<O, R>(bytes: &mut [u8]) -> Result<(u64, Snapshots<O>)>
+where
+    O: TryFrom<R, Error = Error>,
+    R: Serialize + for<'a> Deserialize<'a>,
+{
+    #[allow(clippy::type_complexity)]
+    let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = from_slice(bytes)?;
+    Ok((
+        height,
+        Snapshots::new(
+            snapshot
+                .into_iter()
+                .map(|(coin, [bids, asks])| {
+                    let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+                    let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+                    Ok((Coin::new(&coin), Snapshot([bids, asks])))
+                })
+                .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?,
+        ),
+    ))
+}
+
+#[allow(dead_code)]
+/// Legacy JSON file loader kept for reference/testing.
 pub(crate) async fn load_snapshots_from_json<O, R>(path: &Path) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
