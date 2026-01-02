@@ -31,6 +31,7 @@ use yawc::{FrameView, OpCode, WebSocket};
 
 pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_level: u32) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
+    let active_symbols = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
 
     // Central task: listen to messages and forward them for distribution
     let home_dir = home_dir().ok_or("Could not find home directory")?;
@@ -41,8 +42,9 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
     let listener = Arc::new(Mutex::new(listener));
     {
         let listener = listener.clone();
+        let active_symbols = active_symbols.clone();
         tokio::spawn(async move {
-            if let Err(err) = hl_listen(listener, home_dir).await {
+            if let Err(err) = hl_listen(listener, home_dir, active_symbols).await {
                 error!("Listener fatal error: {err}");
                 std::process::exit(1);
             }
@@ -55,8 +57,16 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
         "/ws",
         get({
             let internal_message_tx = internal_message_tx.clone();
+            let active_symbols = active_symbols.clone();
             async move |ws_upgrade| {
-                ws_handler(ws_upgrade, internal_message_tx.clone(), listener.clone(), ignore_spot, websocket_opts)
+                ws_handler(
+                    ws_upgrade,
+                    internal_message_tx.clone(),
+                    listener.clone(),
+                    ignore_spot,
+                    websocket_opts,
+                    active_symbols.clone(),
+                )
             }
         }),
     );
@@ -78,6 +88,7 @@ fn ws_handler(
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
     websocket_opts: yawc::Options,
+    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
 ) -> impl IntoResponse {
     let (resp, fut) = incoming.upgrade(websocket_opts).unwrap();
     tokio::spawn(async move {
@@ -89,7 +100,7 @@ fn ws_handler(
             }
         };
 
-        handle_socket(ws, internal_message_tx, listener, ignore_spot).await
+        handle_socket(ws, internal_message_tx, listener, ignore_spot, active_symbols).await
     });
 
     resp
@@ -100,6 +111,7 @@ async fn handle_socket(
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
+    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
 ) {
     let mut internal_message_rx = internal_message_tx.subscribe();
     let is_ready = listener.lock().await.is_ready();
@@ -139,6 +151,7 @@ async fn handle_socket(
                     }
                     Err(err) => {
                         error!("Receiver error: {err}");
+                        prune_active_symbols(&mut manager, &active_symbols).await;
                         return;
                     }
                 }
@@ -153,6 +166,7 @@ async fn handle_socket(
                                 Err(err) => {
                                     log::warn!("unable to parse websocket content: {err}: {:?}", frame.payload.as_ref());
                                     // deserves to close the connection because the payload is not a valid utf8 string.
+                                    prune_active_symbols(&mut manager, &active_symbols).await;
                                     return;
                                 }
                             };
@@ -160,7 +174,15 @@ async fn handle_socket(
                             info!("Client message: {text}");
 
                             if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
-                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone()).await;
+                                receive_client_message(
+                                    &mut socket,
+                                    &mut manager,
+                                    value,
+                                    &universe,
+                                    listener.clone(),
+                                    active_symbols.clone(),
+                                )
+                                .await;
                             }
                             else {
                                 let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
@@ -169,12 +191,14 @@ async fn handle_socket(
                         }
                         OpCode::Close => {
                             info!("Client disconnected");
+                            prune_active_symbols(&mut manager, &active_symbols).await;
                             return;
                         }
                         _ => {}
                     }
                 } else {
                     info!("Client connection closed");
+                    prune_active_symbols(&mut manager, &active_symbols).await;
                     return;
                 }
             }
@@ -188,6 +212,7 @@ async fn receive_client_message(
     client_message: ClientMessage,
     universe: &HashSet<String>,
     listener: Arc<Mutex<OrderBookListener>>,
+    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
 ) {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
@@ -199,11 +224,16 @@ async fn receive_client_message(
         send_socket_message(socket, msg).await;
         return;
     }
-    let (word, success) = match &client_message {
-        ClientMessage::Subscribe { .. } => ("", manager.subscribe(subscription)),
-        ClientMessage::Unsubscribe { .. } => ("un", manager.unsubscribe(subscription)),
+    let is_subscribe = matches!(client_message, ClientMessage::Subscribe { .. });
+    let (word, success) = if is_subscribe {
+        ("", manager.subscribe(subscription.clone()))
+    } else {
+        ("un", manager.unsubscribe(subscription.clone()))
     };
     if success {
+        if let Some(coin) = subscription_coin(&subscription) {
+            update_active_symbols(active_symbols, coin, is_subscribe).await;
+        }
         let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
             let msg = subscription.handle_immediate_snapshot(listener).await;
             match msg {
@@ -226,6 +256,32 @@ async fn receive_client_message(
     } else {
         let msg = ServerResponse::Error(format!("Already {word}subscribed: {sub}"));
         send_socket_message(socket, msg).await;
+    }
+}
+
+async fn update_active_symbols(active_symbols: Arc<Mutex<HashMap<String, usize>>>, coin: String, is_subscribe: bool) {
+    let mut active_symbols = active_symbols.lock().await;
+    let entry = active_symbols.entry(coin).or_insert(0);
+    if is_subscribe {
+        *entry = entry.saturating_add(1);
+    } else if *entry > 0 {
+        *entry -= 1;
+    }
+}
+
+async fn prune_active_symbols(manager: &mut SubscriptionManager, active_symbols: &Arc<Mutex<HashMap<String, usize>>>) {
+    let subscriptions = manager.subscriptions().clone();
+    for subscription in subscriptions {
+        if let Some(coin) = subscription_coin(&subscription) {
+            update_active_symbols(active_symbols.clone(), coin, false).await;
+        }
+    }
+}
+
+fn subscription_coin(subscription: &Subscription) -> Option<String> {
+    match subscription {
+        Subscription::L4Book { coin } => Some(coin.clone()),
+        _ => None,
     }
 }
 
