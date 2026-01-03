@@ -48,6 +48,13 @@ enum SnapshotFetchOutcome {
 const SNAPSHOT_CACHE_DELAY_MS: u64 = 100;
 const NEW_FILE_WINDOW_MS: i64 = 60_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitializationState {
+    Uninitialized,
+    Initializing,
+    Initialized,
+}
+
 fn next_snapshot_instant() -> Instant {
     let now = Utc::now();
     let base = now.with_second(30).unwrap_or(now);
@@ -331,6 +338,7 @@ pub(crate) struct OrderBookListener {
     order_diff_file: Option<File>,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
+    initialization_state: InitializationState,
     last_fill: Option<u64>,
     order_diff_cache: BatchQueue<NodeDataOrderDiff>,
     order_status_cache: BatchQueue<NodeDataOrderStatus>,
@@ -360,6 +368,7 @@ impl OrderBookListener {
             order_status_file: None,
             order_diff_file: None,
             order_book_state: None,
+            initialization_state: InitializationState::Uninitialized,
             last_fill: None,
             fetched_snapshot_cache: None,
             internal_message_tx,
@@ -425,56 +434,91 @@ impl OrderBookListener {
                 }
             }
         }
-        if self.is_ready() {
-            if self.validation_in_progress {
-                while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                    if let Some(cache) = &mut self.fetched_snapshot_cache {
-                        cache.push_back((order_statuses.clone(), order_diffs.clone()));
-                    } else {
-                        self.fetched_snapshot_cache = Some(VecDeque::new());
+        
+        // Hot path optimization: early return for uninitialized/initializing states
+        match self.initialization_state {
+            InitializationState::Uninitialized => return Ok(()),
+            InitializationState::Initializing => {
+                // During initialization, accumulate updates in fetched_snapshot_cache if validation is in progress
+                if self.validation_in_progress {
+                    while let Some((order_statuses, order_diffs)) = self.pop_cache() {
                         if let Some(cache) = &mut self.fetched_snapshot_cache {
                             cache.push_back((order_statuses.clone(), order_diffs.clone()));
+                        } else {
+                            self.fetched_snapshot_cache = Some(VecDeque::new());
+                            if let Some(cache) = &mut self.fetched_snapshot_cache {
+                                cache.push_back((order_statuses.clone(), order_diffs.clone()));
+                            }
                         }
-                    }
-                    if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let updates = Arc::new(InternalMessage::L4BookUpdates {
-                                diff_batch: order_diffs,
-                                status_batch: order_statuses,
+                        if let Some(tx) = &self.internal_message_tx {
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let updates = Arc::new(InternalMessage::L4BookUpdates {
+                                    diff_batch: order_diffs,
+                                    status_batch: order_statuses,
+                                });
+                                let _unused = tx.send(updates);
                             });
-                            let _unused = tx.send(updates);
-                        });
+                        }
                     }
                 }
-            } else {
-                while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                    if let Some(state) = &self.order_book_state {
-                        let expected = state.height() + 1;
-                        let height = order_statuses.block_number();
-                        if height > expected {
-                            error!("Order statuses jumped from {expected} to {height}. Waiting for next snapshot.");
-                            self.reset_state_for_snapshot();
-                            return Ok(());
-                        }
-                    }
-                    self.order_book_state
-                        .as_mut()
-                        .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
-                        .transpose()?;
+                return Ok(());
+            }
+            InitializationState::Initialized => {
+                // Fast path: process updates normally
+            }
+        }
+        
+        // Initialized state processing
+        if self.validation_in_progress {
+            while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+                if let Some(cache) = &mut self.fetched_snapshot_cache {
+                    cache.push_back((order_statuses.clone(), order_diffs.clone()));
+                } else {
+                    self.fetched_snapshot_cache = Some(VecDeque::new());
                     if let Some(cache) = &mut self.fetched_snapshot_cache {
                         cache.push_back((order_statuses.clone(), order_diffs.clone()));
                     }
-                    if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let updates = Arc::new(InternalMessage::L4BookUpdates {
-                                diff_batch: order_diffs,
-                                status_batch: order_statuses,
-                            });
-                            let _unused = tx.send(updates);
+                }
+                if let Some(tx) = &self.internal_message_tx {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let updates = Arc::new(InternalMessage::L4BookUpdates {
+                            diff_batch: order_diffs,
+                            status_batch: order_statuses,
                         });
+                        let _unused = tx.send(updates);
+                    });
+                }
+            }
+        } else {
+            while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+                // Block continuity detection
+                if let Some(state) = &self.order_book_state {
+                    let expected = state.height() + 1;
+                    let height = order_statuses.block_number();
+                    if height > expected {
+                        error!("Block height jumped from {expected} to {height}. Triggering full update.");
+                        self.reset_state_for_snapshot();
+                        return Ok(());
                     }
+                }
+                self.order_book_state
+                    .as_mut()
+                    .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
+                    .transpose()?;
+                if let Some(cache) = &mut self.fetched_snapshot_cache {
+                    cache.push_back((order_statuses.clone(), order_diffs.clone()));
+                }
+                if let Some(tx) = &self.internal_message_tx {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let updates = Arc::new(InternalMessage::L4BookUpdates {
+                            diff_batch: order_diffs,
+                            status_batch: order_statuses,
+                        });
+                        let _unused = tx.send(updates);
+                    });
                 }
             }
         }
@@ -486,6 +530,14 @@ impl OrderBookListener {
             self.fetched_snapshot_cache = Some(VecDeque::new());
         }
         self.validation_in_progress = true;
+        
+        // For uninitialized state, don't transfer accumulated updates yet
+        // They will be evaluated after snapshot is received
+        if self.initialization_state == InitializationState::Uninitialized {
+            self.initialization_state = InitializationState::Initializing;
+            return;
+        }
+        
         // Transfer any accumulated updates from order_status_cache/order_diff_cache to fetched_snapshot_cache
         while let Some((order_statuses, order_diffs)) = self.pop_cache() {
             #[allow(clippy::unwrap_used)]
@@ -520,10 +572,31 @@ impl OrderBookListener {
     }
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
-        info!("No existing snapshot");
+        info!("Initializing from snapshot at height {height}");
         let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        
+        // Apply only blocks that are newer than snapshot
+        let mut applied_count = 0;
         let mut retry = false;
         while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+            let block_height = order_statuses.block_number();
+            
+            // Skip blocks older than or equal to snapshot
+            if block_height <= height {
+                info!("Skipping block {block_height} (snapshot is at {height})");
+                continue;
+            }
+            
+            // Check for block continuity
+            let expected_height = new_order_book.height() + 1;
+            if block_height > expected_height {
+                info!(
+                    "Block height gap detected: expected {expected_height}, got {block_height}. Discarding accumulated blocks and waiting for next snapshot."
+                );
+                retry = true;
+                break;
+            }
+            
             if new_order_book.apply_updates(order_statuses, order_diffs).is_err() {
                 info!(
                     "Failed to apply updates to this book (likely missing older updates). Waiting for next snapshot."
@@ -531,10 +604,18 @@ impl OrderBookListener {
                 retry = true;
                 break;
             }
+            applied_count += 1;
         }
+        
         if !retry {
+            let final_height = new_order_book.height();
             self.order_book_state = Some(new_order_book);
-            info!("Order book ready at height {height}");
+            self.initialization_state = InitializationState::Initialized;
+            info!("Order book ready at height {} (applied {} cached blocks)", final_height, applied_count);
+        } else {
+            // Clear caches and wait for next snapshot
+            self.order_status_cache = BatchQueue::new();
+            self.order_diff_cache = BatchQueue::new();
         }
     }
 
@@ -594,10 +675,11 @@ impl OrderBookListener {
 
     fn reset_state_for_snapshot(&mut self) {
         self.order_book_state = None;
+        self.initialization_state = InitializationState::Uninitialized;
         self.order_diff_cache = BatchQueue::new();
         self.order_status_cache = BatchQueue::new();
         self.fetched_snapshot_cache = None;
-        self.validation_in_progress = true;
+        self.validation_in_progress = false;
         self.last_sent_height = 0;
         self.request_snapshot();
     }
