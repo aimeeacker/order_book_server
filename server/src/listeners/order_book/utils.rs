@@ -43,7 +43,10 @@ pub(super) async fn process_rmp_file() -> Result<Vec<u8>> {
         .error_for_status()?;
     let bytes = response.bytes().await?;
     if !bytes.is_empty() {
-        return Ok(bytes.to_vec());
+        let first_non_ws = bytes.iter().copied().find(|b| !b.is_ascii_whitespace());
+        if first_non_ws == Some(b'[') {
+            return Ok(bytes.to_vec());
+        }
     }
     let bytes = read(SNAPSHOT_OUT_PATH).await?;
     Ok(bytes)
