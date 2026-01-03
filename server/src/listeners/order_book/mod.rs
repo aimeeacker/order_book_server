@@ -235,7 +235,14 @@ fn fetch_snapshot(
                         listener.lock().await.init_from_snapshot(expected_snapshot, height);
                         Ok(())
                     }
-                    Ok(Err(err)) => Err(err),
+                    Ok(Err(err)) => {
+                        if err.to_string().contains("Not enough cached updates") {
+                            info!("Snapshot validation skipped: not enough cached updates; will retry next snapshot.");
+                            Ok(())
+                        } else {
+                            Err(err)
+                        }
+                    }
                     Err(err) => Err(err.into()),
                 }
             }
@@ -305,7 +312,14 @@ async fn fetch_snapshot_initial(
             listener.lock().await.init_from_snapshot(expected_snapshot, height);
             Ok(())
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            if err.to_string().contains("Not enough cached updates") {
+                info!("Snapshot validation skipped: not enough cached updates; will retry next snapshot.");
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
     }
 }
 
