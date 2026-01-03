@@ -587,6 +587,9 @@ impl OrderBookListener {
             let final_height = new_order_book.height();
             self.order_book_state = Some(new_order_book);
             self.initialization_state = InitializationState::Initialized;
+            // Clear fetched_snapshot_cache since blocks have been applied during initialization
+            // This prevents double-application in finish_validation()
+            self.fetched_snapshot_cache = None;
             info!("Order book ready at height {} (applied {} cached blocks)", final_height, applied_count);
         } else {
             // Clear caches and wait for next snapshot
