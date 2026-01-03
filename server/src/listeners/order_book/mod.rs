@@ -45,7 +45,7 @@ enum SnapshotFetchOutcome {
     Skipped { local_height: u64, snapshot_height: u64 },
 }
 
-const SNAPSHOT_CACHE_DELAY_MS: u64 = 300;
+const SNAPSHOT_CACHE_DELAY_MS: u64 = 100;
 
 fn next_snapshot_instant() -> Instant {
     let now = Utc::now();
@@ -95,9 +95,6 @@ pub(crate) async fn hl_listen(
     watcher.watch(&order_statuses_dir, RecursiveMode::Recursive)?;
     watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
-    if !listener.lock().await.is_ready() {
-        fetch_snapshot_initial(listener.clone(), ignore_spot, active_symbols.clone()).await?;
-    }
     let mut next_snapshot = Box::pin(sleep_until(next_snapshot_instant()));
     loop {
         tokio::select! {
@@ -118,6 +115,9 @@ pub(crate) async fn hl_listen(
                             listener_guard
                                 .process_update(&event, new_path, EventSource::OrderDiffs)
                                 .map_err(|err| format!("Book diff processing error: {err}"))?;
+                        }
+                        if !listener_guard.is_ready() {
+                            listener_guard.request_snapshot();
                         }
                         let snapshot_requested = listener_guard.take_snapshot_request();
                         drop(listener_guard);
@@ -283,105 +283,6 @@ fn fetch_snapshot(
         .await;
         let _unused = tx.send(res);
     });
-}
-
-async fn fetch_snapshot_initial(
-    listener: Arc<Mutex<OrderBookListener>>,
-    ignore_spot: bool,
-    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
-) -> Result<()> {
-    let state = {
-        let mut listener = listener.lock().await;
-        listener.begin_caching();
-        listener.clone_state()
-    };
-    // allow some updates to queue and ensure snapshot is recent
-    sleep(Duration::from_millis(SNAPSHOT_CACHE_DELAY_MS)).await;
-    let snapshot_bytes = process_rmp_file().await?;
-    let cache = {
-        let listener = listener.lock().await;
-        listener.clone_cache()
-    };
-    let active_symbols = {
-        let active_symbols = active_symbols.lock().await;
-        active_symbols.iter().filter(|(_, count)| **count > 0).map(|(coin, _)| coin.clone()).collect::<HashSet<_>>()
-    };
-    let blocking_result = tokio::task::spawn_blocking(move || {
-        let mut snapshot_bytes = snapshot_bytes;
-        let mut cache = cache;
-        let (height, expected_snapshot) =
-            load_snapshots_from_slice::<InnerL4Order, (Address, L4Order)>(&mut snapshot_bytes)?;
-        if let Some(mut state) = state {
-            let local_height = state.height();
-            if local_height >= height {
-                return Ok(SnapshotFetchOutcome::Skipped { local_height, snapshot_height: height });
-            }
-            let full_cache = cache.clone();
-            while state.height() < height {
-                if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                    state.apply_updates(order_statuses, order_diffs)?;
-                } else {
-                    return Err::<SnapshotFetchOutcome, Error>("Not enough cached updates".into());
-                }
-            }
-            let stored_snapshot = state.compute_snapshot().snapshot;
-            if let Err(_err) = validate_snapshot_consistency_with_hashes(
-                &stored_snapshot,
-                expected_snapshot.clone(),
-                &active_symbols,
-                ignore_spot,
-            ) {
-                info!("Snapshot validation failed at height {height}; reinitializing from snapshot.");
-                let mut new_state = OrderBookState::from_snapshot(expected_snapshot, height, 0, true, ignore_spot);
-                let mut full_cache = full_cache;
-                while let Some((order_statuses, order_diffs)) = full_cache.pop_front() {
-                    new_state.apply_updates(order_statuses, order_diffs)?;
-                }
-                return Ok(SnapshotFetchOutcome::Initialize {
-                    height: new_state.height(),
-                    expected_snapshot: new_state.compute_snapshot().snapshot,
-                });
-            }
-            while let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                state.apply_updates(order_statuses, order_diffs)?;
-            }
-            Ok(SnapshotFetchOutcome::Validated { height })
-        } else {
-            Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })
-        }
-    })
-    .await
-    .map_err(|err| format!("Snapshot validation task join error: {err}"))?;
-
-    match blocking_result {
-        Ok(SnapshotFetchOutcome::Validated { height }) => {
-            info!("Snapshot validated at height {height}");
-            listener.lock().await.finish_validation()?;
-            Ok(())
-        }
-        Ok(SnapshotFetchOutcome::Skipped { local_height, snapshot_height }) => {
-            info!(
-                "Snapshot validation skipped: snapshot height {snapshot_height} not newer than local state {local_height}."
-            );
-            listener.lock().await.finish_validation()?;
-            Ok(())
-        }
-        Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot }) => {
-            info!("Initializing from snapshot at height {height}");
-            listener.lock().await.init_from_snapshot(expected_snapshot, height);
-            listener.lock().await.finish_validation()?;
-            listener.lock().await.broadcast_l4_snapshot();
-            Ok(())
-        }
-        Err(err) => {
-            if err.to_string().contains("Not enough cached updates") {
-                info!("Snapshot validation skipped: not enough cached updates; will retry next snapshot.");
-                Ok(())
-            } else {
-                Err(err)
-            }
-        }
-    }
 }
 
 pub(crate) struct OrderBookListener {
