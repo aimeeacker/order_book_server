@@ -229,11 +229,11 @@ fn fetch_snapshot(
                 match blocking_result {
                     Ok(Ok(SnapshotFetchOutcome::Validated { height })) => {
                         info!("Snapshot validated at height {height}");
-                        Ok(())
+                        listener.lock().await.finish_validation().map_err(|err| err.into())
                     }
                     Ok(Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })) => {
                         listener.lock().await.init_from_snapshot(expected_snapshot, height);
-                        Ok(())
+                        listener.lock().await.finish_validation().map_err(|err| err.into())
                     }
                     Ok(Err(err)) => {
                         if err.to_string().contains("Not enough cached updates") {
@@ -306,10 +306,12 @@ async fn fetch_snapshot_initial(
     match blocking_result {
         Ok(SnapshotFetchOutcome::Validated { height }) => {
             info!("Snapshot validated at height {height}");
+            listener.lock().await.finish_validation()?;
             Ok(())
         }
         Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot }) => {
             listener.lock().await.init_from_snapshot(expected_snapshot, height);
+            listener.lock().await.finish_validation()?;
             Ok(())
         }
         Err(err) => {
@@ -345,6 +347,8 @@ pub(crate) struct OrderBookListener {
     last_fill_offset: u64,
     last_order_status_offset: u64,
     last_order_diff_offset: u64,
+    last_sent_height: u64,
+    validation_in_progress: bool,
     snapshot_requested: bool,
 }
 
@@ -370,6 +374,8 @@ impl OrderBookListener {
             last_fill_offset: 0,
             last_order_status_offset: 0,
             last_order_diff_offset: 0,
+            last_sent_height: 0,
+            validation_in_progress: false,
             snapshot_requested: false,
         }
     }
@@ -397,6 +403,15 @@ impl OrderBookListener {
         self.order_status_cache.pop_front().and_then(|t| self.order_diff_cache.pop_front().map(|s| (t, s)))
     }
 
+    fn peek_aligned(&self) -> Option<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
+        let diff = self.order_diff_cache.front()?;
+        let status = self.order_status_cache.front()?;
+        if diff.block_number() != status.block_number() {
+            return None;
+        }
+        Some((status.clone(), diff.clone()))
+    }
+
     fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
         match updates {
             EventBatch::Orders(batch) => {
@@ -419,32 +434,42 @@ impl OrderBookListener {
             }
         }
         if self.is_ready() {
-            if let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                if let Some(state) = &self.order_book_state {
-                    let expected = state.height() + 1;
-                    let height = order_statuses.block_number();
-                    if height > expected {
-                        error!("Order statuses jumped from {expected} to {height}. Waiting for next snapshot.");
-                        self.reset_state_for_snapshot();
-                        return Ok(());
-                    }
-                }
-                self.order_book_state
-                    .as_mut()
-                    .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
-                    .transpose()?;
-                if let Some(cache) = &mut self.fetched_snapshot_cache {
-                    cache.push_back((order_statuses.clone(), order_diffs.clone()));
-                }
-                if let Some(tx) = &self.internal_message_tx {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let updates = Arc::new(InternalMessage::L4BookUpdates {
-                            diff_batch: order_diffs,
-                            status_batch: order_statuses,
+            if let Some((order_statuses, order_diffs)) = self.peek_aligned() {
+                let height = order_statuses.block_number();
+                if height > self.last_sent_height {
+                    if let Some(tx) = &self.internal_message_tx {
+                        let tx = tx.clone();
+                        let order_statuses = order_statuses.clone();
+                        let order_diffs = order_diffs.clone();
+                        tokio::spawn(async move {
+                            let updates = Arc::new(InternalMessage::L4BookUpdates {
+                                diff_batch: order_diffs,
+                                status_batch: order_statuses,
+                            });
+                            let _unused = tx.send(updates);
                         });
-                        let _unused = tx.send(updates);
-                    });
+                    }
+                    self.last_sent_height = height;
+                }
+            }
+            if !self.validation_in_progress {
+                while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+                    if let Some(state) = &self.order_book_state {
+                        let expected = state.height() + 1;
+                        let height = order_statuses.block_number();
+                        if height > expected {
+                            error!("Order statuses jumped from {expected} to {height}. Waiting for next snapshot.");
+                            self.reset_state_for_snapshot();
+                            return Ok(());
+                        }
+                    }
+                    self.order_book_state
+                        .as_mut()
+                        .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
+                        .transpose()?;
+                    if let Some(cache) = &mut self.fetched_snapshot_cache {
+                        cache.push_back((order_statuses.clone(), order_diffs.clone()));
+                    }
                 }
             }
         }
@@ -453,6 +478,18 @@ impl OrderBookListener {
 
     fn begin_caching(&mut self) {
         self.fetched_snapshot_cache = Some(VecDeque::new());
+        self.validation_in_progress = true;
+    }
+
+    fn finish_validation(&mut self) -> Result<()> {
+        self.validation_in_progress = false;
+        if let Some(state) = &self.order_book_state {
+            self.last_sent_height = state.height();
+        }
+        while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+            self.order_book_state.as_mut().map(|book| book.apply_updates(order_statuses, order_diffs)).transpose()?;
+        }
+        Ok(())
     }
 
     // tkae the cached updates and stop collecting updates
@@ -526,6 +563,8 @@ impl OrderBookListener {
         self.order_diff_cache = BatchQueue::new();
         self.order_status_cache = BatchQueue::new();
         self.fetched_snapshot_cache = None;
+        self.validation_in_progress = true;
+        self.last_sent_height = 0;
         self.request_snapshot();
     }
 }
