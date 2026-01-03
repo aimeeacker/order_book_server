@@ -42,7 +42,7 @@ mod utils;
 enum SnapshotFetchOutcome {
     Validated { height: u64 },
     Initialize { height: u64, expected_snapshot: Snapshots<InnerL4Order> },
-    Skipped,
+    Skipped { local_height: u64, snapshot_height: u64 },
 }
 
 fn next_snapshot_instant() -> Instant {
@@ -200,8 +200,9 @@ fn fetch_snapshot(
                     let (height, expected_snapshot) =
                         load_snapshots_from_slice::<InnerL4Order, (Address, L4Order)>(&mut snapshot_bytes)?;
                     if let Some(mut state) = state {
-                        if state.height() >= height {
-                            return Ok(SnapshotFetchOutcome::Skipped);
+                        let local_height = state.height();
+                        if local_height >= height {
+                            return Ok(SnapshotFetchOutcome::Skipped { local_height, snapshot_height: height });
                         }
                         let full_cache = cache.clone();
                         while state.height() < height {
@@ -247,8 +248,10 @@ fn fetch_snapshot(
                         info!("Scheduled snapshot validation succeeded at height {height}");
                         listener.lock().await.finish_validation().map_err(|err| err.into())
                     }
-                    Ok(Ok(SnapshotFetchOutcome::Skipped)) => {
-                        info!("Snapshot validation skipped: snapshot height not newer than local state.");
+                    Ok(Ok(SnapshotFetchOutcome::Skipped { local_height, snapshot_height })) => {
+                        info!(
+                            "Snapshot validation skipped: snapshot height {snapshot_height} not newer than local state {local_height}."
+                        );
                         listener.lock().await.finish_validation().map_err(|err| err.into())
                     }
                     Ok(Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })) => {
@@ -304,8 +307,9 @@ async fn fetch_snapshot_initial(
         let (height, expected_snapshot) =
             load_snapshots_from_slice::<InnerL4Order, (Address, L4Order)>(&mut snapshot_bytes)?;
         if let Some(mut state) = state {
-            if state.height() >= height {
-                return Ok(SnapshotFetchOutcome::Skipped);
+            let local_height = state.height();
+            if local_height >= height {
+                return Ok(SnapshotFetchOutcome::Skipped { local_height, snapshot_height: height });
             }
             let full_cache = cache.clone();
             while state.height() < height {
@@ -350,8 +354,10 @@ async fn fetch_snapshot_initial(
             listener.lock().await.finish_validation()?;
             Ok(())
         }
-        Ok(SnapshotFetchOutcome::Skipped) => {
-            info!("Snapshot validation skipped: snapshot height not newer than local state.");
+        Ok(SnapshotFetchOutcome::Skipped { local_height, snapshot_height }) => {
+            info!(
+                "Snapshot validation skipped: snapshot height {snapshot_height} not newer than local state {local_height}."
+            );
             listener.lock().await.finish_validation()?;
             Ok(())
         }
