@@ -11,6 +11,7 @@ use std::{
 };
 use tokio::fs::read_to_string;
 
+#[derive(Clone)]
 pub(crate) struct Snapshots<O>(HashMap<Coin, Snapshot<O>>);
 
 impl<O> Snapshots<O> {

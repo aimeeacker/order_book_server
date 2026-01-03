@@ -38,9 +38,11 @@ use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consiste
 mod state;
 mod utils;
 
+#[allow(variant_size_differences)]
 enum SnapshotFetchOutcome {
     Validated { height: u64 },
     Initialize { height: u64, expected_snapshot: Snapshots<InnerL4Order> },
+    Skipped,
 }
 
 fn next_snapshot_instant() -> Instant {
@@ -178,12 +180,11 @@ fn fetch_snapshot(
                     listener.begin_caching();
                     listener.clone_state()
                 };
-                info!("Snapshot fetched");
-                // sleep to let some updates build up.
-                sleep(Duration::from_secs(1)).await;
+                // allow some updates to queue and ensure snapshot is recent
+                sleep(Duration::from_millis(200)).await;
                 let cache = {
-                    let mut listener = listener.lock().await;
-                    listener.take_cache()
+                    let listener = listener.lock().await;
+                    listener.clone_cache()
                 };
                 let active_symbols = {
                     let active_symbols = active_symbols.lock().await;
@@ -200,6 +201,10 @@ fn fetch_snapshot(
                     let (height, expected_snapshot) =
                         load_snapshots_from_slice::<InnerL4Order, (Address, L4Order)>(&mut snapshot_bytes)?;
                     if let Some(mut state) = state {
+                        if state.height() >= height {
+                            return Ok(SnapshotFetchOutcome::Skipped);
+                        }
+                        let full_cache = cache.clone();
                         while state.height() < height {
                             if let Some((order_statuses, order_diffs)) = cache.pop_front() {
                                 state.apply_updates(order_statuses, order_diffs)?;
@@ -207,17 +212,28 @@ fn fetch_snapshot(
                                 return Err::<SnapshotFetchOutcome, Error>("Not enough cached updates".into());
                             }
                         }
-                        if state.height() > height {
-                            return Err("Fetched snapshot lagging stored state".into());
-                        }
                         let stored_snapshot = state.compute_snapshot().snapshot;
                         info!("Validating snapshot");
-                        validate_snapshot_consistency_with_hashes(
+                        if let Err(_err) = validate_snapshot_consistency_with_hashes(
                             &stored_snapshot,
-                            expected_snapshot,
+                            expected_snapshot.clone(),
                             &active_symbols,
                             ignore_spot,
-                        )?;
+                        ) {
+                            let mut new_state =
+                                OrderBookState::from_snapshot(expected_snapshot, height, 0, true, ignore_spot);
+                            let mut full_cache = full_cache;
+                            while let Some((order_statuses, order_diffs)) = full_cache.pop_front() {
+                                new_state.apply_updates(order_statuses, order_diffs)?;
+                            }
+                            return Ok(SnapshotFetchOutcome::Initialize {
+                                height: new_state.height(),
+                                expected_snapshot: new_state.compute_snapshot().snapshot,
+                            });
+                        }
+                        while let Some((order_statuses, order_diffs)) = cache.pop_front() {
+                            state.apply_updates(order_statuses, order_diffs)?;
+                        }
                         Ok(SnapshotFetchOutcome::Validated { height })
                     } else {
                         Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })
@@ -229,6 +245,10 @@ fn fetch_snapshot(
                 match blocking_result {
                     Ok(Ok(SnapshotFetchOutcome::Validated { height })) => {
                         info!("Snapshot validated at height {height}");
+                        listener.lock().await.finish_validation().map_err(|err| err.into())
+                    }
+                    Ok(Ok(SnapshotFetchOutcome::Skipped)) => {
+                        info!("Snapshot validation skipped: snapshot height not newer than local state.");
                         listener.lock().await.finish_validation().map_err(|err| err.into())
                     }
                     Ok(Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })) => {
@@ -258,15 +278,17 @@ async fn fetch_snapshot_initial(
     ignore_spot: bool,
     active_symbols: Arc<Mutex<HashMap<String, usize>>>,
 ) -> Result<()> {
-    let snapshot_bytes = process_rmp_file(&dir).await?;
     let state = {
         let mut listener = listener.lock().await;
         listener.begin_caching();
         listener.clone_state()
     };
+    // allow some updates to queue and ensure snapshot is recent
+    sleep(Duration::from_millis(200)).await;
+    let snapshot_bytes = process_rmp_file(&dir).await?;
     let cache = {
-        let mut listener = listener.lock().await;
-        listener.take_cache()
+        let listener = listener.lock().await;
+        listener.clone_cache()
     };
     let active_symbols = {
         let active_symbols = active_symbols.lock().await;
@@ -278,6 +300,10 @@ async fn fetch_snapshot_initial(
         let (height, expected_snapshot) =
             load_snapshots_from_slice::<InnerL4Order, (Address, L4Order)>(&mut snapshot_bytes)?;
         if let Some(mut state) = state {
+            if state.height() >= height {
+                return Ok(SnapshotFetchOutcome::Skipped);
+            }
+            let full_cache = cache.clone();
             while state.height() < height {
                 if let Some((order_statuses, order_diffs)) = cache.pop_front() {
                     state.apply_updates(order_statuses, order_diffs)?;
@@ -285,16 +311,26 @@ async fn fetch_snapshot_initial(
                     return Err::<SnapshotFetchOutcome, Error>("Not enough cached updates".into());
                 }
             }
-            if state.height() > height {
-                return Err("Fetched snapshot lagging stored state".into());
-            }
             let stored_snapshot = state.compute_snapshot().snapshot;
-            validate_snapshot_consistency_with_hashes(
+            if let Err(_err) = validate_snapshot_consistency_with_hashes(
                 &stored_snapshot,
-                expected_snapshot,
+                expected_snapshot.clone(),
                 &active_symbols,
                 ignore_spot,
-            )?;
+            ) {
+                let mut new_state = OrderBookState::from_snapshot(expected_snapshot, height, 0, true, ignore_spot);
+                let mut full_cache = full_cache;
+                while let Some((order_statuses, order_diffs)) = full_cache.pop_front() {
+                    new_state.apply_updates(order_statuses, order_diffs)?;
+                }
+                return Ok(SnapshotFetchOutcome::Initialize {
+                    height: new_state.height(),
+                    expected_snapshot: new_state.compute_snapshot().snapshot,
+                });
+            }
+            while let Some((order_statuses, order_diffs)) = cache.pop_front() {
+                state.apply_updates(order_statuses, order_diffs)?;
+            }
             Ok(SnapshotFetchOutcome::Validated { height })
         } else {
             Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })
@@ -306,6 +342,11 @@ async fn fetch_snapshot_initial(
     match blocking_result {
         Ok(SnapshotFetchOutcome::Validated { height }) => {
             info!("Snapshot validated at height {height}");
+            listener.lock().await.finish_validation()?;
+            Ok(())
+        }
+        Ok(SnapshotFetchOutcome::Skipped) => {
+            info!("Snapshot validation skipped: snapshot height not newer than local state.");
             listener.lock().await.finish_validation()?;
             Ok(())
         }
@@ -485,6 +526,10 @@ impl OrderBookListener {
         self.validation_in_progress = true;
     }
 
+    fn clone_cache(&self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
+        self.fetched_snapshot_cache.clone().unwrap_or_default()
+    }
+
     fn finish_validation(&mut self) -> Result<()> {
         self.validation_in_progress = false;
         let mut queued = self.fetched_snapshot_cache.take().unwrap_or_default();
@@ -492,11 +537,6 @@ impl OrderBookListener {
             self.order_book_state.as_mut().map(|book| book.apply_updates(order_statuses, order_diffs)).transpose()?;
         }
         Ok(())
-    }
-
-    // tkae the cached updates and stop collecting updates
-    fn take_cache(&mut self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
-        self.fetched_snapshot_cache.take().unwrap_or_default()
     }
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
