@@ -486,6 +486,12 @@ impl OrderBookListener {
             self.fetched_snapshot_cache = Some(VecDeque::new());
         }
         self.validation_in_progress = true;
+        // Transfer any accumulated updates from order_status_cache/order_diff_cache to fetched_snapshot_cache
+        while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+            if let Some(cache) = &mut self.fetched_snapshot_cache {
+                cache.push_back((order_statuses, order_diffs));
+            }
+        }
     }
 
     fn clone_cache(&self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
