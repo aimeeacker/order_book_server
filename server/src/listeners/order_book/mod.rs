@@ -45,6 +45,8 @@ enum SnapshotFetchOutcome {
     Skipped { local_height: u64, snapshot_height: u64 },
 }
 
+const SNAPSHOT_CACHE_DELAY_MS: u64 = 300;
+
 fn next_snapshot_instant() -> Instant {
     let now = Utc::now();
     let target = if now.second() < 30 {
@@ -180,7 +182,7 @@ fn fetch_snapshot(
                     listener.clone_state()
                 };
                 // allow some updates to queue and ensure snapshot is recent
-                sleep(Duration::from_millis(200)).await;
+                sleep(Duration::from_millis(SNAPSHOT_CACHE_DELAY_MS)).await;
                 let cache = {
                     let listener = listener.lock().await;
                     listener.clone_cache()
@@ -291,7 +293,7 @@ async fn fetch_snapshot_initial(
         listener.clone_state()
     };
     // allow some updates to queue and ensure snapshot is recent
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(SNAPSHOT_CACHE_DELAY_MS)).await;
     let snapshot_bytes = process_rmp_file().await?;
     let cache = {
         let listener = listener.lock().await;
