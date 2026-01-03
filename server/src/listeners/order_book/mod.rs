@@ -415,9 +415,13 @@ impl OrderBookListener {
 
     // Helper method to cache and broadcast updates
     fn cache_and_broadcast_update(&mut self, order_statuses: Batch<NodeDataOrderStatus>, order_diffs: Batch<NodeDataOrderDiff>) {
-        if let Some(cache) = &mut self.fetched_snapshot_cache {
-            cache.push_back((order_statuses.clone(), order_diffs.clone()));
+        // Ensure cache exists before adding
+        if self.fetched_snapshot_cache.is_none() {
+            self.fetched_snapshot_cache = Some(VecDeque::new());
         }
+        #[allow(clippy::unwrap_used)]
+        self.fetched_snapshot_cache.as_mut().unwrap().push_back((order_statuses.clone(), order_diffs.clone()));
+        
         if let Some(tx) = &self.internal_message_tx {
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -503,7 +507,8 @@ impl OrderBookListener {
         self.validation_in_progress = true;
         
         // For uninitialized state, don't transfer accumulated updates yet
-        // They will be evaluated after snapshot is received
+        // Blocks accumulated during startup may be too new relative to the snapshot we'll receive
+        // They will be evaluated after snapshot is received in init_from_snapshot()
         if self.initialization_state == InitializationState::Uninitialized {
             self.initialization_state = InitializationState::Initializing;
             return;
@@ -585,8 +590,7 @@ impl OrderBookListener {
             info!("Order book ready at height {} (applied {} cached blocks)", final_height, applied_count);
         } else {
             // Clear caches and wait for next snapshot
-            self.order_status_cache = BatchQueue::new();
-            self.order_diff_cache = BatchQueue::new();
+            self.clear_caches();
         }
     }
 
@@ -644,12 +648,18 @@ impl OrderBookListener {
         self.snapshot_fetch_in_progress = false;
     }
 
+    fn clear_caches(&mut self) {
+        self.order_status_cache = BatchQueue::new();
+        self.order_diff_cache = BatchQueue::new();
+    }
+
     fn reset_state_for_snapshot(&mut self) {
         self.order_book_state = None;
         self.initialization_state = InitializationState::Uninitialized;
-        self.order_diff_cache = BatchQueue::new();
-        self.order_status_cache = BatchQueue::new();
+        self.clear_caches();
         self.fetched_snapshot_cache = None;
+        // Keep validation_in_progress as false since we're starting fresh
+        // It will be set to true when begin_caching() is called during next snapshot fetch
         self.validation_in_progress = false;
         self.last_sent_height = 0;
         self.request_snapshot();
