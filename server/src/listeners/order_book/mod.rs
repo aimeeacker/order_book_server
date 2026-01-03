@@ -94,7 +94,7 @@ pub(crate) async fn hl_listen(
     watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     if !listener.lock().await.is_ready() {
-        fetch_snapshot_initial(dir.clone(), listener.clone(), ignore_spot, active_symbols.clone()).await?;
+        fetch_snapshot_initial(listener.clone(), ignore_spot, active_symbols.clone()).await?;
     }
     let mut next_snapshot = Box::pin(sleep_until(next_snapshot_instant()));
     loop {
@@ -123,7 +123,7 @@ pub(crate) async fn hl_listen(
                             let listener = listener.clone();
                             let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                             let active_symbols = active_symbols.clone();
-                            fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
+                            fetch_snapshot(listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
                         }
                     }
                 }
@@ -151,7 +151,7 @@ pub(crate) async fn hl_listen(
                 let listener = listener.clone();
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                 let active_symbols = active_symbols.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
+                fetch_snapshot(listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
                 next_snapshot.as_mut().reset(next_snapshot_instant());
             }
             () = sleep(Duration::from_secs(5)) => {
@@ -165,7 +165,6 @@ pub(crate) async fn hl_listen(
 }
 
 fn fetch_snapshot(
-    dir: PathBuf,
     listener: Arc<Mutex<OrderBookListener>>,
     tx: UnboundedSender<Result<()>>,
     ignore_spot: bool,
@@ -173,7 +172,7 @@ fn fetch_snapshot(
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
-        let res = match process_rmp_file(&dir).await {
+        let res = match process_rmp_file().await {
             Ok(snapshot_bytes) => {
                 let state = {
                     let mut listener = listener.lock().await;
@@ -245,7 +244,7 @@ fn fetch_snapshot(
 
                 match blocking_result {
                     Ok(Ok(SnapshotFetchOutcome::Validated { height })) => {
-                        info!("Snapshot validated at height {height}");
+                        info!("Scheduled snapshot validation succeeded at height {height}");
                         listener.lock().await.finish_validation().map_err(|err| err.into())
                     }
                     Ok(Ok(SnapshotFetchOutcome::Skipped)) => {
@@ -279,7 +278,6 @@ fn fetch_snapshot(
 }
 
 async fn fetch_snapshot_initial(
-    dir: PathBuf,
     listener: Arc<Mutex<OrderBookListener>>,
     ignore_spot: bool,
     active_symbols: Arc<Mutex<HashMap<String, usize>>>,
@@ -291,7 +289,7 @@ async fn fetch_snapshot_initial(
     };
     // allow some updates to queue and ensure snapshot is recent
     sleep(Duration::from_millis(200)).await;
-    let snapshot_bytes = process_rmp_file(&dir).await?;
+    let snapshot_bytes = process_rmp_file().await?;
     let cache = {
         let listener = listener.lock().await;
         listener.clone_cache()

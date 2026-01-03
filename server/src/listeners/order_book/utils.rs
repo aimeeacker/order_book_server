@@ -17,32 +17,24 @@ use reqwest::Client;
 use serde_json::json;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
-use tokio::fs::read;
-
-pub(super) async fn process_rmp_file(_dir: &Path) -> Result<Vec<u8>> {
-    let output_path = _dir.join("out.json");
+pub(super) async fn process_rmp_file() -> Result<Vec<u8>> {
     let payload = json!({
-        "type": "fileSnapshot",
-        "request": {
-            "type": "l4Snapshots",
-            "includeUsers": true,
-            "includeTriggerOrders": false
-        },
-        "outPath": output_path,
+        "type": "l4Snapshots",
+        "includeUsers": true,
+        "includeTriggerOrders": false,
         "includeHeightInOutput": true
     });
 
     let client = Client::new();
-    client
+    let response = client
         .post("http://localhost:3001/info")
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
         .await?
         .error_for_status()?;
-    let bytes = read(_dir.join("out.json")).await?;
-    Ok(bytes)
+    let bytes = response.bytes().await?;
+    Ok(bytes.to_vec())
 }
 
 #[allow(dead_code)]
