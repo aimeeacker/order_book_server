@@ -482,7 +482,9 @@ impl OrderBookListener {
     }
 
     fn begin_caching(&mut self) {
-        self.fetched_snapshot_cache = Some(VecDeque::new());
+        if self.fetched_snapshot_cache.is_none() {
+            self.fetched_snapshot_cache = Some(VecDeque::new());
+        }
         self.validation_in_progress = true;
     }
 
