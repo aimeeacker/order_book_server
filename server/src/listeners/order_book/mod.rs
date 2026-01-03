@@ -39,26 +39,18 @@ mod state;
 mod utils;
 
 enum SnapshotFetchOutcome {
-    Validated,
+    Validated { height: u64 },
     Initialize { height: u64, expected_snapshot: Snapshots<InnerL4Order> },
 }
 
 fn next_snapshot_instant() -> Instant {
     let now = Utc::now();
-    let schedule = [(1, 30), (31, 30)];
-    let mut next = None;
-    for (minute, second) in schedule {
-        if let Some(candidate) = now.with_minute(minute).and_then(|t| t.with_second(second)) {
-            if candidate > now {
-                next = Some(candidate);
-                break;
-            }
-        }
-    }
-    let target = next.unwrap_or_else(|| {
-        let next_hour = now + chrono::Duration::hours(1);
-        next_hour.with_minute(schedule[0].0).and_then(|t| t.with_second(schedule[0].1)).unwrap_or(next_hour)
-    });
+    let target = if now.second() < 30 {
+        now.with_second(30).unwrap_or(now)
+    } else {
+        let next_minute = now + chrono::Duration::minutes(1);
+        next_minute.with_second(30).unwrap_or(next_minute)
+    };
     let duration = target.signed_duration_since(now);
     let wait = duration.to_std().unwrap_or_else(|_| Duration::from_secs(0));
     Instant::now() + wait
@@ -226,7 +218,7 @@ fn fetch_snapshot(
                             &active_symbols,
                             ignore_spot,
                         )?;
-                        Ok(SnapshotFetchOutcome::Validated)
+                        Ok(SnapshotFetchOutcome::Validated { height })
                     } else {
                         Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })
                     }
@@ -235,7 +227,10 @@ fn fetch_snapshot(
                 .map_err(|err| format!("Snapshot validation task join error: {err}"));
 
                 match blocking_result {
-                    Ok(Ok(SnapshotFetchOutcome::Validated)) => Ok(()),
+                    Ok(Ok(SnapshotFetchOutcome::Validated { height })) => {
+                        info!("Snapshot validated at height {height}");
+                        Ok(())
+                    }
                     Ok(Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })) => {
                         listener.lock().await.init_from_snapshot(expected_snapshot, height);
                         Ok(())
@@ -293,7 +288,7 @@ async fn fetch_snapshot_initial(
                 &active_symbols,
                 ignore_spot,
             )?;
-            Ok(SnapshotFetchOutcome::Validated)
+            Ok(SnapshotFetchOutcome::Validated { height })
         } else {
             Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })
         }
@@ -302,7 +297,10 @@ async fn fetch_snapshot_initial(
     .map_err(|err| format!("Snapshot validation task join error: {err}"))?;
 
     match blocking_result {
-        Ok(SnapshotFetchOutcome::Validated) => Ok(()),
+        Ok(SnapshotFetchOutcome::Validated { height }) => {
+            info!("Snapshot validated at height {height}");
+            Ok(())
+        }
         Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot }) => {
             listener.lock().await.init_from_snapshot(expected_snapshot, height);
             Ok(())
@@ -408,6 +406,15 @@ impl OrderBookListener {
         }
         if self.is_ready() {
             if let Some((order_statuses, order_diffs)) = self.pop_cache() {
+                if let Some(state) = &self.order_book_state {
+                    let expected = state.height() + 1;
+                    let height = order_statuses.block_number();
+                    if height > expected {
+                        error!("Order statuses jumped from {expected} to {height}. Waiting for next snapshot.");
+                        self.reset_state_for_snapshot();
+                        return Ok(());
+                    }
+                }
                 self.order_book_state
                     .as_mut()
                     .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
