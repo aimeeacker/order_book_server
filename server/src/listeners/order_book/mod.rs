@@ -220,6 +220,7 @@ fn fetch_snapshot(
                             &active_symbols,
                             ignore_spot,
                         ) {
+                            info!("Snapshot validation failed at height {height}; reinitializing from snapshot.");
                             let mut new_state =
                                 OrderBookState::from_snapshot(expected_snapshot, height, 0, true, ignore_spot);
                             let mut full_cache = full_cache;
@@ -252,6 +253,7 @@ fn fetch_snapshot(
                         listener.lock().await.finish_validation().map_err(|err| err.into())
                     }
                     Ok(Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })) => {
+                        info!("Initializing from snapshot at height {height}");
                         listener.lock().await.init_from_snapshot(expected_snapshot, height);
                         let result = listener.lock().await.finish_validation().map_err(|err| err.into());
                         if result.is_ok() {
@@ -322,6 +324,7 @@ async fn fetch_snapshot_initial(
                 &active_symbols,
                 ignore_spot,
             ) {
+                info!("Snapshot validation failed at height {height}; reinitializing from snapshot.");
                 let mut new_state = OrderBookState::from_snapshot(expected_snapshot, height, 0, true, ignore_spot);
                 let mut full_cache = full_cache;
                 while let Some((order_statuses, order_diffs)) = full_cache.pop_front() {
@@ -355,6 +358,7 @@ async fn fetch_snapshot_initial(
             Ok(())
         }
         Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot }) => {
+            info!("Initializing from snapshot at height {height}");
             listener.lock().await.init_from_snapshot(expected_snapshot, height);
             listener.lock().await.finish_validation()?;
             listener.lock().await.broadcast_l4_snapshot();
@@ -572,7 +576,7 @@ impl OrderBookListener {
         }
         if !retry {
             self.order_book_state = Some(new_order_book);
-            info!("Order book ready");
+            info!("Order book ready at height {height}");
         }
     }
 
