@@ -17,11 +17,11 @@ use reqwest::Client;
 use serde_json::json;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
 use tokio::fs::read;
 
-pub(super) async fn process_rmp_file(dir: &Path) -> Result<Vec<u8>> {
-    let output_path = dir.join("out.json");
+const SNAPSHOT_OUT_PATH: &str = "/dev/shm/snapshot.json";
+
+pub(super) async fn process_rmp_file() -> Result<Vec<u8>> {
     let payload = json!({
         "type": "fileSnapshot",
         "request": {
@@ -29,7 +29,7 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<Vec<u8>> {
             "includeUsers": true,
             "includeTriggerOrders": false
         },
-        "outPath": output_path,
+        "outPath": SNAPSHOT_OUT_PATH,
         "includeHeightInOutput": true
     });
 
@@ -45,7 +45,7 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<Vec<u8>> {
     if !bytes.is_empty() {
         return Ok(bytes.to_vec());
     }
-    let bytes = read(dir.join("out.json")).await?;
+    let bytes = read(SNAPSHOT_OUT_PATH).await?;
     Ok(bytes)
 }
 
