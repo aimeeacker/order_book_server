@@ -403,15 +403,6 @@ impl OrderBookListener {
         self.order_status_cache.pop_front().and_then(|t| self.order_diff_cache.pop_front().map(|s| (t, s)))
     }
 
-    fn peek_aligned(&self) -> Option<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
-        let diff = self.order_diff_cache.front()?;
-        let status = self.order_status_cache.front()?;
-        if diff.block_number() != status.block_number() {
-            return None;
-        }
-        Some((status.clone(), diff.clone()))
-    }
-
     fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
         match updates {
             EventBatch::Orders(batch) => {
@@ -434,13 +425,18 @@ impl OrderBookListener {
             }
         }
         if self.is_ready() {
-            if let Some((order_statuses, order_diffs)) = self.peek_aligned() {
-                let height = order_statuses.block_number();
-                if height > self.last_sent_height {
+            if self.validation_in_progress {
+                while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+                    if let Some(cache) = &mut self.fetched_snapshot_cache {
+                        cache.push_back((order_statuses.clone(), order_diffs.clone()));
+                    } else {
+                        self.fetched_snapshot_cache = Some(VecDeque::new());
+                        if let Some(cache) = &mut self.fetched_snapshot_cache {
+                            cache.push_back((order_statuses.clone(), order_diffs.clone()));
+                        }
+                    }
                     if let Some(tx) = &self.internal_message_tx {
                         let tx = tx.clone();
-                        let order_statuses = order_statuses.clone();
-                        let order_diffs = order_diffs.clone();
                         tokio::spawn(async move {
                             let updates = Arc::new(InternalMessage::L4BookUpdates {
                                 diff_batch: order_diffs,
@@ -449,10 +445,8 @@ impl OrderBookListener {
                             let _unused = tx.send(updates);
                         });
                     }
-                    self.last_sent_height = height;
                 }
-            }
-            if !self.validation_in_progress {
+            } else {
                 while let Some((order_statuses, order_diffs)) = self.pop_cache() {
                     if let Some(state) = &self.order_book_state {
                         let expected = state.height() + 1;
@@ -470,6 +464,16 @@ impl OrderBookListener {
                     if let Some(cache) = &mut self.fetched_snapshot_cache {
                         cache.push_back((order_statuses.clone(), order_diffs.clone()));
                     }
+                    if let Some(tx) = &self.internal_message_tx {
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let updates = Arc::new(InternalMessage::L4BookUpdates {
+                                diff_batch: order_diffs,
+                                status_batch: order_statuses,
+                            });
+                            let _unused = tx.send(updates);
+                        });
+                    }
                 }
             }
         }
@@ -483,10 +487,8 @@ impl OrderBookListener {
 
     fn finish_validation(&mut self) -> Result<()> {
         self.validation_in_progress = false;
-        if let Some(state) = &self.order_book_state {
-            self.last_sent_height = state.height();
-        }
-        while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+        let mut queued = self.fetched_snapshot_cache.take().unwrap_or_default();
+        while let Some((order_statuses, order_diffs)) = queued.pop_front() {
             self.order_book_state.as_mut().map(|book| book.apply_updates(order_statuses, order_diffs)).transpose()?;
         }
         Ok(())
