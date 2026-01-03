@@ -174,7 +174,7 @@ fn fetch_snapshot(
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
-        let res = {
+        let res: Result<()> = (async {
             let state = {
                 let mut listener = listener.lock().await;
                 listener.begin_caching();
@@ -182,7 +182,13 @@ fn fetch_snapshot(
             };
             // allow some updates to queue and ensure snapshot is recent
             sleep(Duration::from_millis(SNAPSHOT_CACHE_DELAY_MS)).await;
-            let snapshot_bytes = process_rmp_file().await?;
+            let snapshot_bytes = process_rmp_file().await.map_err(|err| {
+                let listener = listener.clone();
+                tokio::spawn(async move {
+                    let _unused = listener.lock().await.finish_validation();
+                });
+                err
+            })?;
             let cache = {
                 let listener = listener.lock().await;
                 listener.clone_cache()
@@ -273,7 +279,8 @@ fn fetch_snapshot(
                     }
                 }
             }
-        };
+        })
+        .await;
         let _unused = tx.send(res);
     });
 }
