@@ -253,7 +253,11 @@ fn fetch_snapshot(
                     }
                     Ok(Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })) => {
                         listener.lock().await.init_from_snapshot(expected_snapshot, height);
-                        listener.lock().await.finish_validation().map_err(|err| err.into())
+                        let result = listener.lock().await.finish_validation().map_err(|err| err.into());
+                        if result.is_ok() {
+                            listener.lock().await.broadcast_l4_snapshot();
+                        }
+                        result
                     }
                     Ok(Err(err)) => {
                         if err.to_string().contains("Not enough cached updates") {
@@ -353,6 +357,7 @@ async fn fetch_snapshot_initial(
         Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot }) => {
             listener.lock().await.init_from_snapshot(expected_snapshot, height);
             listener.lock().await.finish_validation()?;
+            listener.lock().await.broadcast_l4_snapshot();
             Ok(())
         }
         Err(err) => {
@@ -537,6 +542,19 @@ impl OrderBookListener {
             self.order_book_state.as_mut().map(|book| book.apply_updates(order_statuses, order_diffs)).transpose()?;
         }
         Ok(())
+    }
+
+    fn broadcast_l4_snapshot(&mut self) {
+        let snapshot = self.compute_snapshot();
+        if let Some(snapshot) = snapshot {
+            if let Some(tx) = &self.internal_message_tx {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let snapshot = Arc::new(InternalMessage::L4Snapshot { snapshot });
+                    let _unused = tx.send(snapshot);
+                });
+            }
+        }
     }
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
@@ -784,6 +802,7 @@ pub(crate) enum InternalMessage {
     Snapshot { l2_snapshots: L2Snapshots, time: u64 },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
+    L4Snapshot { snapshot: TimedSnapshots },
 }
 
 #[derive(Eq, PartialEq, Hash)]

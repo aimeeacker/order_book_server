@@ -10,8 +10,16 @@ pub(crate) const DEFAULT_LEVELS: usize = 20;
 #[serde(tag = "method")]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ClientMessage {
-    Subscribe { subscription: Subscription },
-    Unsubscribe { subscription: Subscription },
+    Subscribe {
+        subscription: Subscription,
+        #[serde(default)]
+        id: Option<u64>,
+    },
+    Unsubscribe {
+        subscription: Subscription,
+        #[serde(default)]
+        id: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]

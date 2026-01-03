@@ -157,6 +157,11 @@ async fn handle_socket(
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
                                 }
                             },
+                            InternalMessage::L4Snapshot { snapshot } => {
+                                for sub in manager.subscriptions() {
+                                    send_ws_data_from_l4_snapshot(&mut socket, sub, snapshot).await;
+                                }
+                            }
                         }
 
                     }
@@ -226,7 +231,9 @@ async fn receive_client_message(
     active_symbols: Arc<Mutex<HashMap<String, usize>>>,
 ) {
     let subscription = match &client_message {
-        ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
+        ClientMessage::Unsubscribe { subscription, .. } | ClientMessage::Subscribe { subscription, .. } => {
+            subscription.clone()
+        }
     };
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
@@ -245,7 +252,7 @@ async fn receive_client_message(
         if let Some(coin) = subscription_coin(&subscription) {
             update_active_symbols(active_symbols, coin, is_subscribe).await;
         }
-        let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
+        let snapshot_msg = if let ClientMessage::Subscribe { subscription, .. } = &client_message {
             let msg = subscription.handle_immediate_snapshot(listener).await;
             match msg {
                 Ok(msg) => msg,
@@ -393,6 +400,29 @@ async fn send_ws_data_from_book_updates(
     if let Subscription::L4Book { coin } = subscription {
         if let Some(updates) = book_updates.remove(coin) {
             let msg = ServerResponse::L4Book(L4Book::Updates(updates));
+            send_socket_message(socket, msg).await;
+        }
+    }
+}
+
+async fn send_ws_data_from_l4_snapshot(socket: &mut WebSocket, subscription: &Subscription, snapshot: &TimedSnapshots) {
+    if let Subscription::L4Book { coin } = subscription {
+        let book = snapshot
+            .snapshot
+            .clone()
+            .value()
+            .into_iter()
+            .filter(|(c, _)| *c == Coin::new(coin))
+            .collect::<Vec<_>>()
+            .pop();
+        if let Some((coin, book)) = book {
+            let levels = book.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
+            let msg = ServerResponse::L4Book(L4Book::Snapshot {
+                coin: coin.value(),
+                time: snapshot.time,
+                height: snapshot.height,
+                levels,
+            });
             send_socket_message(socket, msg).await;
         }
     }
