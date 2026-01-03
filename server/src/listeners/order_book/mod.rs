@@ -20,7 +20,7 @@ use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::thread;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -46,14 +46,23 @@ enum SnapshotFetchOutcome {
 }
 
 const SNAPSHOT_CACHE_DELAY_MS: u64 = 100;
+const NEW_FILE_WINDOW_MS: i64 = 60_000;
 
 fn next_snapshot_instant() -> Instant {
     let now = Utc::now();
-    let target = if now.second() < 30 {
-        now.with_second(30).unwrap_or(now)
+    let base = now.with_second(30).unwrap_or(now);
+    let at_half_hour = base.with_minute(30).unwrap_or(base);
+    let at_hour = base.with_minute(0).unwrap_or(base);
+    let target = if now <= at_hour {
+        at_hour
+    } else if now <= at_half_hour {
+        at_half_hour
     } else {
-        let next_minute = now + chrono::Duration::minutes(1);
-        next_minute.with_second(30).unwrap_or(next_minute)
+        let next_hour = now + chrono::Duration::hours(1);
+        next_hour
+            .with_minute(0)
+            .and_then(|next| next.with_second(30))
+            .unwrap_or(next_hour)
     };
     let duration = target.signed_duration_since(now);
     let wait = duration.to_std().unwrap_or_else(|_| Duration::from_secs(0));
@@ -96,6 +105,7 @@ pub(crate) async fn hl_listen(
     watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let mut next_snapshot = Box::pin(sleep_until(next_snapshot_instant()));
+    let mut startup_snapshot = Some(Box::pin(sleep(Duration::from_secs(59))));
     loop {
         tokio::select! {
             event = fs_event_rx.recv() =>  match event {
@@ -163,6 +173,23 @@ pub(crate) async fn hl_listen(
                 }
                 next_snapshot.as_mut().reset(next_snapshot_instant());
             }
+            () = async {
+                if let Some(timer) = &mut startup_snapshot {
+                    timer.as_mut().await;
+                }
+            }, if startup_snapshot.is_some() => {
+                let should_fetch = {
+                    let mut listener_guard = listener.lock().await;
+                    listener_guard.begin_snapshot_fetch()
+                };
+                if should_fetch {
+                    let listener = listener.clone();
+                    let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
+                    let active_symbols = active_symbols.clone();
+                    fetch_snapshot(listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
+                }
+                startup_snapshot = None;
+            }
             () = sleep(Duration::from_secs(5)) => {
                 let listener = listener.lock().await;
                 if listener.is_ready() {
@@ -200,6 +227,7 @@ fn fetch_snapshot(
                 let listener = listener.lock().await;
                 listener.clone_cache()
             };
+            // let cache_len = cache.len();
             let active_symbols = {
                 let active_symbols = active_symbols.lock().await;
                 active_symbols
@@ -208,12 +236,15 @@ fn fetch_snapshot(
                     .map(|(coin, _)| coin.clone())
                     .collect::<HashSet<_>>()
             };
-            info!("Cache has {} elements", cache.len());
+            // info!("Cache has {} elements", cache.len());
             let blocking_result = tokio::task::spawn_blocking(move || {
                 let mut snapshot_bytes = snapshot_bytes;
                 let mut cache = cache;
                 let (height, expected_snapshot) =
                     load_snapshots_from_slice::<InnerL4Order, (Address, L4Order)>(&mut snapshot_bytes)?;
+                info!("Snapshot height received: {height}");
+                let cache_len = cache.len();
+                info!("Cache has {} elements", cache_len);
                 if let Some(mut state) = state {
                     let local_height = state.height();
                     if local_height >= height {
@@ -563,13 +594,51 @@ impl OrderBookListener {
         self.last_sent_height = 0;
         self.request_snapshot();
     }
+
+    fn should_read_from_start(&self, new_path: &PathBuf, event_source: EventSource) -> bool {
+        let file = match File::open(new_path) {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        for _ in 0..10 {
+            line.clear();
+            if reader.read_line(&mut line).ok().is_none() {
+                return false;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let block_time = match event_source {
+                EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(trimmed)
+                    .map(|batch| batch.block_time())
+                    .ok(),
+                EventSource::OrderStatuses => serde_json::from_str::<Batch<NodeDataOrderStatus>>(trimmed)
+                    .map(|batch| batch.block_time())
+                    .ok(),
+                EventSource::OrderDiffs => serde_json::from_str::<Batch<NodeDataOrderDiff>>(trimmed)
+                    .map(|batch| batch.block_time())
+                    .ok(),
+            };
+            if let Some(block_time) = block_time {
+                let now = Utc::now().timestamp_millis();
+                let diff = now - block_time as i64;
+                return diff.abs() <= NEW_FILE_WINDOW_MS;
+            }
+            return false;
+        }
+        false
+    }
 }
 
 impl OrderBookListener {
     fn process_update(&mut self, event: &Event, new_path: &PathBuf, event_source: EventSource) -> Result<()> {
         if event.kind.is_create() {
             info!("-- Event: {} created --", new_path.display());
-            self.on_file_creation(new_path.clone(), event_source)?;
+            let read_from_start = self.should_read_from_start(new_path, event_source);
+            self.on_file_creation(new_path.clone(), event_source, read_from_start)?;
         }
         // Check for `Modify` event (only if the file is already initialized)
         else {
@@ -594,8 +663,17 @@ impl OrderBookListener {
                 self.on_file_modification(event_source)?;
             } else {
                 info!("-- Event: {} modified, tracking it now --", new_path.display());
+                let read_from_start = self.should_read_from_start(new_path, event_source);
                 let mut new_file = File::open(new_path)?;
-                new_file.seek(SeekFrom::End(0))?;
+                if read_from_start {
+                    let mut buf = String::new();
+                    new_file.read_to_string(&mut buf)?;
+                    if !buf.is_empty() {
+                        self.process_data(buf, event_source)?;
+                    }
+                } else {
+                    new_file.seek(SeekFrom::End(0))?;
+                }
                 if let Ok(metadata) = new_path.metadata() {
                     *self.last_len_mut(event_source) = metadata.len();
                     *self.last_offset_mut(event_source) = metadata.len();
@@ -625,7 +703,7 @@ impl DirectoryListener for OrderBookListener {
         }
     }
 
-    fn on_file_creation(&mut self, new_file: PathBuf, event_source: EventSource) -> Result<()> {
+    fn on_file_creation(&mut self, new_file: PathBuf, event_source: EventSource, read_from_start: bool) -> Result<()> {
         if let Some(file) = self.file_mut(event_source).as_mut() {
             let mut buf = String::new();
             file.read_to_string(&mut buf)?;
@@ -633,8 +711,19 @@ impl DirectoryListener for OrderBookListener {
                 self.process_data(buf, event_source)?;
             }
         }
-        *self.file_mut(event_source) = Some(File::open(new_file)?);
-        *self.last_offset_mut(event_source) = 0;
+        let mut file = File::open(new_file)?;
+        if read_from_start {
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)?;
+            if !buf.is_empty() {
+                self.process_data(buf, event_source)?;
+            }
+        } else {
+            file.seek(SeekFrom::End(0))?;
+        }
+        let new_offset = file.seek(SeekFrom::Current(0))?;
+        *self.file_mut(event_source) = Some(file);
+        *self.last_offset_mut(event_source) = new_offset;
         Ok(())
     }
 

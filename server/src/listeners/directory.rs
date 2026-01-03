@@ -11,7 +11,12 @@ pub(crate) trait DirectoryListener {
     // get file that we are tracking
     fn file_mut(&mut self, event_source: EventSource) -> &mut Option<File>;
     // when file is created what do we do?
-    fn on_file_creation(&mut self, new_file: PathBuf, event_source: EventSource) -> Result<()>;
+    fn on_file_creation(
+        &mut self,
+        new_file: PathBuf,
+        event_source: EventSource,
+        read_from_start: bool,
+    ) -> Result<()>;
     // how do we want to process data that we just processed?
     fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()>;
 
@@ -94,7 +99,7 @@ mod tests {
                         let new_path = &event.paths[0];
                         if new_path.is_file() {
                             info!("-- Event: {} created --", new_path.display());
-                            listener.on_file_creation(new_path.clone(), event_source)?;
+                            listener.on_file_creation(new_path.clone(), event_source, true)?;
                         }
                     }
                     // Check for `Modify` event (only if the file is already initialized)
@@ -189,7 +194,12 @@ mod tests {
             &mut self.file
         }
 
-        fn on_file_creation(&mut self, new_file: PathBuf, _event_source: EventSource) -> Result<()> {
+        fn on_file_creation(
+            &mut self,
+            new_file: PathBuf,
+            _event_source: EventSource,
+            _read_from_start: bool,
+        ) -> Result<()> {
             let file = File::open(new_file)?;
             self.file = Some(file);
             Ok(())

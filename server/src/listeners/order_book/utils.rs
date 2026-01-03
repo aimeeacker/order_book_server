@@ -93,42 +93,85 @@ pub(super) fn validate_snapshot_consistency_with_hashes(
     active_symbols: &HashSet<String>,
     ignore_spot: bool,
 ) -> Result<()> {
-    let mut expected_map: HashMap<_, _> =
+    let expected_map: HashMap<_, _> =
         expected.value().into_iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
+    let snapshot_map = snapshot.as_ref();
 
-    for (coin, book) in snapshot.as_ref() {
+    for (coin, book) in snapshot_map {
         if ignore_spot && coin.is_spot() {
             continue;
         }
-        let book1 = book.as_ref();
-        if let Some(book2) = expected_map.remove(coin) {
-            let coin_value = coin.value();
-            if active_symbols.contains(&coin_value) {
-                for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
-                    for (order1, order2) in orders1.iter().zip(orders2.iter()) {
-                        if *order1 != *order2 {
-                            return Err(format!(
-                                "Orders do not match, expected: {:?} received: {:?}",
-                                *order2, *order1
-                            )
-                            .into());
-                        }
-                    }
-                }
-            } else {
-                let stored_hash = hash_snapshot(book);
-                let expected_hash = hash_snapshot(&book2);
-                if stored_hash != expected_hash {
-                    return Err(format!("Snapshot hash mismatch for {}", coin_value).into());
-                }
-            }
-        } else if !book1[0].is_empty() || !book1[1].is_empty() {
+        if !expected_map.contains_key(coin) && (!book.as_ref()[0].is_empty() || !book.as_ref()[1].is_empty()) {
             return Err(format!("Missing {} book", coin.value()).into());
         }
     }
-    if !expected_map.is_empty() {
+
+    let mut snapshot_coins = HashSet::new();
+    for coin in snapshot_map.keys() {
+        if ignore_spot && coin.is_spot() {
+            continue;
+        }
+        snapshot_coins.insert(coin.clone());
+    }
+    let mut expected_coins = HashSet::new();
+    for coin in expected_map.keys() {
+        if ignore_spot && coin.is_spot() {
+            continue;
+        }
+        expected_coins.insert(coin.clone());
+    }
+    if expected_coins != snapshot_coins {
         return Err("Extra orderbooks detected".to_string().into());
     }
+
+    let mut active_coins = Vec::new();
+    let mut inactive_coins = Vec::new();
+    for coin in snapshot_map.keys() {
+        if ignore_spot && coin.is_spot() {
+            continue;
+        }
+        if active_symbols.contains(&coin.value()) {
+            active_coins.push(coin.clone());
+        } else {
+            inactive_coins.push(coin.clone());
+        }
+    }
+
+    active_coins.par_iter().try_for_each(|coin| -> Result<()> {
+        let book1 = snapshot_map
+            .get(coin)
+            .ok_or_else(|| format!("Missing {} book", coin.value()))?;
+        let book2 = expected_map
+            .get(coin)
+            .ok_or_else(|| format!("Missing {} book", coin.value()))?;
+        for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
+            for (order1, order2) in orders1.iter().zip(orders2.iter()) {
+                if *order1 != *order2 {
+                    return Err(format!(
+                        "Orders do not match, expected: {:?} received: {:?}",
+                        *order2, *order1
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    })?;
+
+    for coin in inactive_coins {
+        let book1 = snapshot_map
+            .get(&coin)
+            .ok_or_else(|| format!("Missing {} book", coin.value()))?;
+        let book2 = expected_map
+            .get(&coin)
+            .ok_or_else(|| format!("Missing {} book", coin.value()))?;
+        let stored_hash = hash_snapshot(book1);
+        let expected_hash = hash_snapshot(book2);
+        if stored_hash != expected_hash {
+            return Err(format!("Snapshot hash mismatch for {}", coin.value()).into());
+        }
+    }
+
     Ok(())
 }
 
