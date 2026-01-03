@@ -231,15 +231,30 @@ async fn receive_client_message(
     active_symbols: Arc<Mutex<HashMap<String, usize>>>,
 ) {
     let subscription = match &client_message {
-        ClientMessage::Unsubscribe { subscription, .. } | ClientMessage::Subscribe { subscription, .. } => {
-            subscription.clone()
-        }
+        ClientMessage::Unsubscribe { subscription, .. }
+        | ClientMessage::Subscribe { subscription, .. }
+        | ClientMessage::GetSnapshot { subscription, .. } => subscription.clone(),
     };
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
     if !subscription.validate(universe) {
         let msg = ServerResponse::Error(format!("Invalid subscription: {sub}"));
         send_socket_message(socket, msg).await;
+        return;
+    }
+    if let ClientMessage::GetSnapshot { id, .. } = &client_message {
+        let snapshot_msg = subscription.handle_immediate_snapshot(listener, *id).await;
+        match snapshot_msg {
+            Ok(Some(msg)) => send_socket_message(socket, msg).await,
+            Ok(None) => {
+                let msg = ServerResponse::Error("Snapshot Failed".to_string());
+                send_socket_message(socket, msg).await;
+            }
+            Err(err) => {
+                let msg = ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"));
+                send_socket_message(socket, msg).await;
+            }
+        }
         return;
     }
     let is_subscribe = matches!(client_message, ClientMessage::Subscribe { .. });
@@ -253,7 +268,7 @@ async fn receive_client_message(
             update_active_symbols(active_symbols, coin, is_subscribe).await;
         }
         let snapshot_msg = if let ClientMessage::Subscribe { subscription, .. } = &client_message {
-            let msg = subscription.handle_immediate_snapshot(listener).await;
+            let msg = subscription.handle_immediate_snapshot(listener, None).await;
             match msg {
                 Ok(msg) => msg,
                 Err(err) => {
@@ -422,6 +437,7 @@ async fn send_ws_data_from_l4_snapshot(socket: &mut WebSocket, subscription: &Su
                 time: snapshot.time,
                 height: snapshot.height,
                 levels,
+                id: None,
             });
             send_socket_message(socket, msg).await;
         }
@@ -446,6 +462,7 @@ impl Subscription {
     async fn handle_immediate_snapshot(
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
+        id: Option<u64>,
     ) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
             let snapshot = listener.lock().await.compute_snapshot();
@@ -460,6 +477,7 @@ impl Subscription {
                         time,
                         height,
                         levels: snapshot,
+                        id,
                     })));
                 }
             }

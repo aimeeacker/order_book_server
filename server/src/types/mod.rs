@@ -46,7 +46,7 @@ pub(crate) struct L2Book {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum L4Book {
-    Snapshot { coin: String, time: u64, height: u64, levels: [Vec<L4Order>; 2] },
+    Snapshot { coin: String, time: u64, height: u64, levels: [Vec<L4Order>; 2], id: Option<u64> },
     Updates(L4BookUpdates),
 }
 

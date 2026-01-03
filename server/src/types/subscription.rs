@@ -20,6 +20,11 @@ pub(crate) enum ClientMessage {
         #[serde(default)]
         id: Option<u64>,
     },
+    GetSnapshot {
+        subscription: Subscription,
+        #[serde(default)]
+        id: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
