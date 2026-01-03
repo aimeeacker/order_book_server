@@ -120,8 +120,9 @@ pub(crate) async fn hl_listen(
                             listener_guard.request_snapshot();
                         }
                         let snapshot_requested = listener_guard.take_snapshot_request();
+                        let should_fetch = snapshot_requested && listener_guard.begin_snapshot_fetch();
                         drop(listener_guard);
-                        if snapshot_requested {
+                        if should_fetch {
                             let listener = listener.clone();
                             let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                             let active_symbols = active_symbols.clone();
@@ -150,10 +151,16 @@ pub(crate) async fn hl_listen(
                 }
             }
             () = &mut next_snapshot => {
-                let listener = listener.clone();
-                let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                let active_symbols = active_symbols.clone();
-                fetch_snapshot(listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
+                let should_fetch = {
+                    let mut listener_guard = listener.lock().await;
+                    listener_guard.begin_snapshot_fetch()
+                };
+                if should_fetch {
+                    let listener = listener.clone();
+                    let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
+                    let active_symbols = active_symbols.clone();
+                    fetch_snapshot(listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
+                }
                 next_snapshot.as_mut().reset(next_snapshot_instant());
             }
             () = sleep(Duration::from_secs(5)) => {
@@ -281,6 +288,7 @@ fn fetch_snapshot(
             }
         })
         .await;
+        listener.lock().await.finish_snapshot_fetch();
         let _unused = tx.send(res);
     });
 }
@@ -310,6 +318,7 @@ pub(crate) struct OrderBookListener {
     last_sent_height: u64,
     validation_in_progress: bool,
     snapshot_requested: bool,
+    snapshot_fetch_in_progress: bool,
 }
 
 impl OrderBookListener {
@@ -337,6 +346,7 @@ impl OrderBookListener {
             last_sent_height: 0,
             validation_in_progress: false,
             snapshot_requested: false,
+            snapshot_fetch_in_progress: false,
         }
     }
 
@@ -530,6 +540,18 @@ impl OrderBookListener {
 
     fn take_snapshot_request(&mut self) -> bool {
         std::mem::take(&mut self.snapshot_requested)
+    }
+
+    fn begin_snapshot_fetch(&mut self) -> bool {
+        if self.snapshot_fetch_in_progress {
+            return false;
+        }
+        self.snapshot_fetch_in_progress = true;
+        true
+    }
+
+    fn finish_snapshot_fetch(&mut self) {
+        self.snapshot_fetch_in_progress = false;
     }
 
     fn reset_state_for_snapshot(&mut self) {
