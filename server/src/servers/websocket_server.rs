@@ -282,7 +282,7 @@ async fn receive_client_message(
         }
         let snapshot_msg = subscription.handle_immediate_snapshot(listener, *id).await;
         match snapshot_msg {
-            Ok(Some(msg)) => send_socket_message(socket, msg).await,
+            Ok(Some(msg)) => send_snapshot_response(socket, msg, *id).await,
             Ok(None) => {
                 let msg = ServerResponse::Error("Snapshot Failed".to_string());
                 send_socket_message(socket, msg).await;
@@ -308,17 +308,7 @@ async fn receive_client_message(
             ClientMessage::Subscribe { id, .. } | ClientMessage::Unsubscribe { id, .. } => *id,
             ClientMessage::GetSnapshot { .. } => None,
         };
-        if matches!(subscription, Subscription::L4BookLite { .. }) {
-            let response = ChannelResponse {
-                channel: "subscriptionResponse".to_string(),
-                id,
-                data: client_message.clone(),
-            };
-            send_channel_response(socket, response).await;
-        } else {
-            let msg = ServerResponse::SubscriptionResponse(client_message.clone());
-            send_socket_message(socket, msg).await;
-        }
+        send_subscription_response(socket, client_message.clone(), id).await;
         if let ClientMessage::Subscribe { subscription, .. } = &client_message {
             match subscription {
                 Subscription::L4BookLite { coin } => {
@@ -329,7 +319,7 @@ async fn receive_client_message(
                 _ => {
                     let msg = subscription.handle_immediate_snapshot(listener, None).await;
                     match msg {
-                        Ok(Some(msg)) => send_socket_message(socket, msg).await,
+                        Ok(Some(msg)) => send_snapshot_response(socket, msg, id).await,
                         Ok(None) => {}
                         Err(err) => {
                             manager.unsubscribe(subscription.clone());
@@ -399,6 +389,31 @@ async fn send_channel_response<T: Serialize>(socket: &mut WebSocket, response: C
         Err(err) => {
             error!("Server response serialization error: {err}");
         }
+    }
+}
+
+async fn send_subscription_response(socket: &mut WebSocket, msg: ClientMessage, id: Option<u64>) {
+    let response = ChannelResponse { channel: "subscriptionResponse".to_string(), id, data: msg };
+    send_channel_response(socket, response).await;
+}
+
+async fn send_snapshot_response(socket: &mut WebSocket, msg: ServerResponse, id: Option<u64>) {
+    match msg {
+        ServerResponse::L2Book(book) => {
+            let response = ChannelResponse { channel: "l2Book".to_string(), id, data: book };
+            send_channel_response(socket, response).await;
+        }
+        ServerResponse::L4Book(book) => {
+            let book = match book {
+                L4Book::Snapshot { coin, time, height, levels, id: _ } => {
+                    L4Book::Snapshot { coin, time, height, levels, id: None }
+                }
+                updates => updates,
+            };
+            let response = ChannelResponse { channel: "l4Book".to_string(), id, data: book };
+            send_channel_response(socket, response).await;
+        }
+        other => send_socket_message(socket, other).await,
     }
 }
 
