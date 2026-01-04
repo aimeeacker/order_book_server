@@ -683,14 +683,20 @@ impl OrderBookListener {
                         });
                     }
                 }
-                let lite_updates = self.build_l4_book_lite_trade_updates(&batch);
-                for updates in lite_updates {
-                    if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let update = Arc::new(InternalMessage::L4BookLiteUpdates { updates });
-                            let _unused = tx.send(update);
-                        });
+                // Only send l4BookLite trade updates if we have a baseline state.
+                // This ensures consistency with add/remove updates which also require baseline state.
+                // During Uninitialized state, we don't send any l4BookLite updates.
+                // During Initializing/Initialized states, we send both trade and add/remove updates.
+                if self.initialization_state != InitializationState::Uninitialized {
+                    let lite_updates = self.build_l4_book_lite_trade_updates(&batch);
+                    for updates in lite_updates {
+                        if let Some(tx) = &self.internal_message_tx {
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let update = Arc::new(InternalMessage::L4BookLiteUpdates { updates });
+                                let _unused = tx.send(update);
+                            });
+                        }
                     }
                 }
             }
