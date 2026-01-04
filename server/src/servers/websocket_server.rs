@@ -8,7 +8,7 @@ use crate::{
         L2Book, L4Book, L4BookLiteSnapshot, L4BookLiteUpdates, L4BookUpdates, L4Order, Trade,
         inner::InnerLevel,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
-        subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
+        subscription::{ChannelResponse, ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
     },
 };
 use axum::{Router, response::IntoResponse, routing::get};
@@ -31,12 +31,10 @@ use tokio::{
 use yawc::{FrameView, OpCode, WebSocket};
 
 #[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ChannelResponse<T> {
-    channel: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<u64>,
-    data: T,
+#[serde(tag = "method", rename_all = "camelCase")]
+enum SubscriptionResponseData {
+    Subscribe { subscription: Subscription },
+    Unsubscribe { subscription: Subscription },
 }
 
 pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_level: u32) -> Result<()> {
@@ -250,46 +248,47 @@ async fn receive_client_message(
         | ClientMessage::Subscribe { subscription, .. }
         | ClientMessage::GetSnapshot { subscription, .. } => subscription.clone(),
     };
+    let req_id = client_message.req_id();
     // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
     let sub = serde_json::to_string(&subscription).unwrap_or_default();
     if !subscription.validate(universe) {
         let msg = ServerResponse::Error(format!("Invalid subscription: {sub}"));
-        send_socket_message(socket, msg).await;
+        send_error_response(socket, req_id, msg).await;
         return;
     }
-    if let ClientMessage::GetSnapshot { id, .. } = &client_message {
+    if let ClientMessage::GetSnapshot { .. } = &client_message {
         if let Subscription::L4Book { coin } = &subscription {
             if !Subscription::is_l4_snapshot_coin(coin) {
                 let msg = ServerResponse::Error(format!("Invalid subscription: L4 snapshot disabled for {coin}"));
-                send_socket_message(socket, msg).await;
+                send_error_response(socket, req_id, msg).await;
                 return;
             }
         }
         if let Subscription::L4BookLite { coin } = &subscription {
             if !Subscription::is_l4_snapshot_coin(coin) {
                 let msg = ServerResponse::Error(format!("Invalid subscription: L4 book lite snapshot disabled for {coin}"));
-                send_socket_message(socket, msg).await;
+                send_error_response(socket, req_id, msg).await;
                 return;
             }
             let snapshot = listener.lock().await.l4_book_lite_snapshot(coin.clone());
             if let Some(snapshot) = snapshot {
-                send_ws_data_from_l4_book_lite_snapshot(socket, &subscription, &snapshot, *id).await;
+                send_snapshot_data_for_get_snapshot(socket, snapshot, req_id).await;
             } else {
                 let msg = ServerResponse::Error("Snapshot Failed".to_string());
-                send_socket_message(socket, msg).await;
+                send_error_response(socket, req_id, msg).await;
             }
             return;
         }
-        let snapshot_msg = subscription.handle_immediate_snapshot(listener, *id).await;
+        let snapshot_msg = subscription.handle_immediate_snapshot(listener).await;
         match snapshot_msg {
-            Ok(Some(msg)) => send_snapshot_response(socket, msg, *id).await,
+            Ok(Some(msg)) => send_get_snapshot_response(socket, msg, req_id).await,
             Ok(None) => {
                 let msg = ServerResponse::Error("Snapshot Failed".to_string());
-                send_socket_message(socket, msg).await;
+                send_error_response(socket, req_id, msg).await;
             }
             Err(err) => {
                 let msg = ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"));
-                send_socket_message(socket, msg).await;
+                send_error_response(socket, req_id, msg).await;
             }
         }
         return;
@@ -304,7 +303,7 @@ async fn receive_client_message(
         if let Some(coin) = subscription_coin(&subscription) {
             update_active_symbols(active_symbols, coin, is_subscribe).await;
         }
-        send_subscription_response(socket, client_message.clone()).await;
+        send_subscription_response(socket, &client_message).await;
         if let ClientMessage::Subscribe { subscription, .. } = &client_message {
             match subscription {
                 Subscription::L4BookLite { coin } => {
@@ -313,14 +312,14 @@ async fn receive_client_message(
                     }
                 }
                 _ => {
-                    let msg = subscription.handle_immediate_snapshot(listener, None).await;
+                    let msg = subscription.handle_immediate_snapshot(listener).await;
                     match msg {
                         Ok(Some(msg)) => send_snapshot_response(socket, msg, None).await,
                         Ok(None) => {}
                         Err(err) => {
                             manager.unsubscribe(subscription.clone());
                             let msg = ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"));
-                            send_socket_message(socket, msg).await;
+                            send_error_response(socket, req_id, msg).await;
                             return;
                         }
                     }
@@ -329,7 +328,7 @@ async fn receive_client_message(
         }
     } else {
         let msg = ServerResponse::Error(format!("Already {word}subscribed: {sub}"));
-        send_socket_message(socket, msg).await;
+        send_error_response(socket, req_id, msg).await;
     }
 }
 
@@ -388,23 +387,47 @@ async fn send_channel_response<T: Serialize>(socket: &mut WebSocket, response: C
     }
 }
 
-async fn send_subscription_response(socket: &mut WebSocket, msg: ClientMessage) {
-    let response = ChannelResponse { channel: "subscriptionResponse".to_string(), id: None, data: msg };
+async fn send_subscription_response(socket: &mut WebSocket, msg: &ClientMessage) {
+    let data = SubscriptionResponseData::from_client_message(msg);
+    let response = ChannelResponse { channel: "subscriptionResponse".to_string(), req_id: msg.req_id(), data };
     send_channel_response(socket, response).await;
 }
 
-async fn send_snapshot_response(socket: &mut WebSocket, msg: ServerResponse, id: Option<u64>) {
+async fn send_snapshot_response(socket: &mut WebSocket, msg: ServerResponse, req_id: Option<u64>) {
     match msg {
         ServerResponse::L2Book(book) => {
-            let response = ChannelResponse { channel: "l2Book".to_string(), id, data: book };
+            let response = ChannelResponse { channel: "l2Book".to_string(), req_id, data: book };
             send_channel_response(socket, response).await;
         }
         ServerResponse::L4Book(book) => {
-            let response = ChannelResponse { channel: "l4Book".to_string(), id, data: book };
+            let response = ChannelResponse { channel: "l4Book".to_string(), req_id, data: book };
             send_channel_response(socket, response).await;
         }
         other => send_socket_message(socket, other).await,
     }
+}
+
+async fn send_get_snapshot_response(socket: &mut WebSocket, msg: ServerResponse, req_id: Option<u64>) {
+    match msg {
+        ServerResponse::L2Book(book) => {
+            let response = ChannelResponse { channel: "snapshot".to_string(), req_id, data: book };
+            send_channel_response(socket, response).await;
+        }
+        ServerResponse::L4Book(book) => {
+            let response = ChannelResponse { channel: "snapshot".to_string(), req_id, data: book };
+            send_channel_response(socket, response).await;
+        }
+        other => send_socket_message(socket, other).await,
+    }
+}
+
+async fn send_snapshot_data_for_get_snapshot(
+    socket: &mut WebSocket,
+    snapshot: L4BookLiteSnapshot,
+    req_id: Option<u64>,
+) {
+    let response = ChannelResponse { channel: "snapshot".to_string(), req_id, data: snapshot };
+    send_channel_response(socket, response).await;
 }
 
 // derive it from l2_snapshots because thats convenient
@@ -522,11 +545,11 @@ async fn send_ws_data_from_l4_book_lite_snapshot(
     socket: &mut WebSocket,
     subscription: &Subscription,
     snapshot: &L4BookLiteSnapshot,
-    id: Option<u64>,
+    req_id: Option<u64>,
 ) {
     if let Subscription::L4BookLite { coin } = subscription {
         if coin == &snapshot.coin {
-            let response = ChannelResponse { channel: "l4BookLite".to_string(), id, data: snapshot.clone() };
+            let response = ChannelResponse { channel: "l4BookLite".to_string(), req_id, data: snapshot.clone() };
             send_channel_response(socket, response).await;
         }
     }
@@ -552,7 +575,7 @@ async fn send_ws_data_from_l4_book_lite_updates(
 ) {
     if let Subscription::L4BookLite { coin } = subscription {
         if coin == &updates.coin {
-            let response = ChannelResponse { channel: "l4BookLite".to_string(), id: None, data: updates.clone() };
+            let response = ChannelResponse { channel: "l4BookLite".to_string(), req_id: None, data: updates.clone() };
             send_channel_response(socket, response).await;
         }
     }
@@ -560,11 +583,7 @@ async fn send_ws_data_from_l4_book_lite_updates(
 
 impl Subscription {
     // snapshots that begin a stream
-    async fn handle_immediate_snapshot(
-        &self,
-        listener: Arc<Mutex<OrderBookListener>>,
-        _id: Option<u64>,
-    ) -> Result<Option<ServerResponse>> {
+    async fn handle_immediate_snapshot(&self, listener: Arc<Mutex<OrderBookListener>>) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
             if !Self::is_l4_snapshot_coin(coin) {
                 return Ok(None);
@@ -587,5 +606,36 @@ impl Subscription {
             return Err("Snapshot Failed".into());
         }
         Ok(None)
+    }
+}
+
+async fn send_error_response(socket: &mut WebSocket, req_id: Option<u64>, msg: ServerResponse) {
+    if let ServerResponse::Error(message) = msg {
+        let response = ChannelResponse { channel: "error".to_string(), req_id, data: message };
+        send_channel_response(socket, response).await;
+    } else {
+        send_socket_message(socket, msg).await;
+    }
+}
+
+impl SubscriptionResponseData {
+    fn from_client_message(msg: &ClientMessage) -> Self {
+        match msg {
+            ClientMessage::Subscribe { subscription, .. } => Self::Subscribe { subscription: subscription.clone() },
+            ClientMessage::Unsubscribe { subscription, .. } => Self::Unsubscribe { subscription: subscription.clone() },
+            ClientMessage::GetSnapshot { .. } => {
+                unreachable!("subscription responses are only sent for subscribe/unsubscribe requests")
+            }
+        }
+    }
+}
+
+impl ClientMessage {
+    fn req_id(&self) -> Option<u64> {
+        match self {
+            Self::Subscribe { req_id, .. } | Self::Unsubscribe { req_id, .. } | Self::GetSnapshot { req_id, .. } => {
+                *req_id
+            }
+        }
     }
 }

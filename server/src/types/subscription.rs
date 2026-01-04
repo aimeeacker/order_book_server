@@ -13,18 +13,18 @@ const ENABLE_L2_SNAPSHOTS: bool = false;
 pub(crate) enum ClientMessage {
     Subscribe {
         subscription: Subscription,
-        #[serde(default)]
-        id: Option<u64>,
+        #[serde(default, rename = "req_id")]
+        req_id: Option<u64>,
     },
     Unsubscribe {
         subscription: Subscription,
-        #[serde(default)]
-        id: Option<u64>,
+        #[serde(default, rename = "req_id")]
+        req_id: Option<u64>,
     },
     GetSnapshot {
         subscription: Subscription,
-        #[serde(default)]
-        id: Option<u64>,
+        #[serde(default, rename = "req_id")]
+        req_id: Option<u64>,
     },
 }
 
@@ -117,6 +117,15 @@ pub(crate) enum ServerResponse {
     Error(String),
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChannelResponse<T> {
+    pub(crate) channel: String,
+    #[serde(rename = "req_id")]
+    pub(crate) req_id: Option<u64>,
+    pub(crate) data: T,
+}
+
 #[derive(Default)]
 pub(crate) struct SubscriptionManager {
     subscriptions: HashSet<Subscription>,
@@ -145,10 +154,10 @@ mod test {
     #[test]
     fn test_message_deserialization_subscription_response() {
         let message = r#"
-            {"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","nSigFigs":null,"mantissa":null}}}
+            {"channel":"subscriptionResponse","req_id":42,"data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","nSigFigs":null,"mantissa":null}}}
         "#;
-        let msg = serde_json::from_str(message).unwrap();
-        assert!(matches!(msg, ServerResponse::SubscriptionResponse(_)));
+        let msg: super::ChannelResponse<ClientMessage> = serde_json::from_str(message).unwrap();
+        assert!(matches!(msg, super::ChannelResponse { .. }));
     }
 
     #[test]
@@ -179,7 +188,7 @@ mod test {
             msg,
             ClientMessage::Subscribe {
                 subscription: Subscription::L2Book { n_sig_figs: None, n_levels: None, mantissa: None, .. },
-                id: None
+                req_id: None
             }
         ));
     }
