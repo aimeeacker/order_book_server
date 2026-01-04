@@ -327,7 +327,11 @@ fn fetch_snapshot(
             match blocking_result {
                 Ok(SnapshotFetchOutcome::Validated { height }) => {
                     info!("Scheduled snapshot validation succeeded at height {height}");
-                    listener.lock().await.finish_validation().map_err(|err| err.into())
+                    let result = listener.lock().await.finish_validation().map_err(|err| err.into());
+                    if result.is_ok() {
+                        listener.lock().await.broadcast_l4_snapshot();
+                    }
+                    result
                 }
                 Ok(SnapshotFetchOutcome::Skipped { local_height, snapshot_height }) => {
                     info!(
