@@ -304,22 +304,18 @@ async fn receive_client_message(
         if let Some(coin) = subscription_coin(&subscription) {
             update_active_symbols(active_symbols, coin, is_subscribe).await;
         }
-        let id = match &client_message {
-            ClientMessage::Subscribe { id, .. } | ClientMessage::Unsubscribe { id, .. } => *id,
-            ClientMessage::GetSnapshot { .. } => None,
-        };
-        send_subscription_response(socket, client_message.clone(), id).await;
+        send_subscription_response(socket, client_message.clone()).await;
         if let ClientMessage::Subscribe { subscription, .. } = &client_message {
             match subscription {
                 Subscription::L4BookLite { coin } => {
                     if let Some(snapshot) = listener.lock().await.l4_book_lite_snapshot(coin.clone()) {
-                        send_ws_data_from_l4_book_lite_snapshot(socket, subscription, &snapshot, id).await;
+                        send_ws_data_from_l4_book_lite_snapshot(socket, subscription, &snapshot, None).await;
                     }
                 }
                 _ => {
                     let msg = subscription.handle_immediate_snapshot(listener, None).await;
                     match msg {
-                        Ok(Some(msg)) => send_snapshot_response(socket, msg, id).await,
+                        Ok(Some(msg)) => send_snapshot_response(socket, msg, None).await,
                         Ok(None) => {}
                         Err(err) => {
                             manager.unsubscribe(subscription.clone());
@@ -392,8 +388,8 @@ async fn send_channel_response<T: Serialize>(socket: &mut WebSocket, response: C
     }
 }
 
-async fn send_subscription_response(socket: &mut WebSocket, msg: ClientMessage, id: Option<u64>) {
-    let response = ChannelResponse { channel: "subscriptionResponse".to_string(), id, data: msg };
+async fn send_subscription_response(socket: &mut WebSocket, msg: ClientMessage) {
+    let response = ChannelResponse { channel: "subscriptionResponse".to_string(), id: None, data: msg };
     send_channel_response(socket, response).await;
 }
 
