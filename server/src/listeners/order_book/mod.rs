@@ -327,11 +327,7 @@ fn fetch_snapshot(
             match blocking_result {
                 Ok(SnapshotFetchOutcome::Validated { height }) => {
                     info!("Scheduled snapshot validation succeeded at height {height}");
-                    let result = listener.lock().await.finish_validation().map_err(|err| err.into());
-                    if result.is_ok() {
-                        listener.lock().await.broadcast_l4_snapshot();
-                    }
-                    result
+                    listener.lock().await.finish_validation().map_err(|err| err.into())
                 }
                 Ok(SnapshotFetchOutcome::Skipped { local_height, snapshot_height }) => {
                     info!(
@@ -494,12 +490,12 @@ impl OrderBookListener {
     pub(crate) fn l4_book_lite_snapshot(&self, coin: String) -> Option<L4BookLiteSnapshot> {
         let state = self.order_book_state.as_ref()?;
         let levels = self.l4_book_lite.get(&Coin::new(&coin))?;
-        // BTreeMap iterates in ascending order by price (stored as keys)
+        // Sort bids in ascending order by price
         let bids = levels[0]
             .iter()
             .map(|(px, sz)| [px.to_str(), sz.to_str()])
             .collect();
-        // BTreeMap iterates in ascending order by price (stored as keys)
+        // Sort asks in ascending order by price
         let asks = levels[1]
             .iter()
             .map(|(px, sz)| [px.to_str(), sz.to_str()])

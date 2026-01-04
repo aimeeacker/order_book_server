@@ -400,12 +400,6 @@ async fn send_snapshot_response(socket: &mut WebSocket, msg: ServerResponse, id:
             send_channel_response(socket, response).await;
         }
         ServerResponse::L4Book(book) => {
-            let book = match book {
-                L4Book::Snapshot { coin, time, height, levels, id: _ } => {
-                    L4Book::Snapshot { coin, time, height, levels, id: None }
-                }
-                updates => updates,
-            };
             let response = ChannelResponse { channel: "l4Book".to_string(), id, data: book };
             send_channel_response(socket, response).await;
         }
@@ -518,7 +512,6 @@ async fn send_ws_data_from_l4_snapshot(socket: &mut WebSocket, subscription: &Su
                 time: snapshot.time,
                 height: snapshot.height,
                 levels,
-                id: None,
             });
             send_socket_message(socket, msg).await;
         }
@@ -570,7 +563,7 @@ impl Subscription {
     async fn handle_immediate_snapshot(
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
-        id: Option<u64>,
+        _id: Option<u64>,
     ) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
             if !Self::is_l4_snapshot_coin(coin) {
@@ -588,7 +581,6 @@ impl Subscription {
                         time,
                         height,
                         levels: snapshot,
-                        id,
                     })));
                 }
             }
