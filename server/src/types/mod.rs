@@ -115,6 +115,48 @@ pub(crate) struct L4Order {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct L4BookLiteLevel {
+    pub px: String,
+    pub sz: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum L4BookLiteAction {
+    Add,
+    Remove,
+    Trade,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct L4BookLiteUpdate {
+    pub px: String,
+    pub sz: String,
+    pub side: Side,
+    pub action: L4BookLiteAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct L4BookLiteSnapshot {
+    pub coin: String,
+    pub time: u64,
+    pub height: u64,
+    pub levels: [Vec<L4BookLiteLevel>; 2],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct L4BookLiteUpdates {
+    pub coin: String,
+    pub time: u64,
+    pub height: u64,
+    pub updates: Vec<L4BookLiteUpdate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum OrderDiff {
     #[serde(rename_all = "camelCase")]
     New {

@@ -14,7 +14,7 @@ pub(crate) enum Side {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Oid(u64);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Px(u64);
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

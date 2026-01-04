@@ -42,6 +42,10 @@ impl OrderBookState {
         self.height
     }
 
+    pub(super) const fn time(&self) -> u64 {
+        self.time
+    }
+
     // forcibly take snapshot - (time, height, snapshot)
     pub(super) fn compute_snapshot(&self) -> TimedSnapshots {
         TimedSnapshots { time: self.time, height: self.height, snapshot: self.order_book.to_snapshots_par() }

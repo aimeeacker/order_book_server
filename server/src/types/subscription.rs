@@ -7,7 +7,7 @@ const MAX_LEVELS: usize = 100;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
 const ENABLE_L2_SNAPSHOTS: bool = false;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method")]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ClientMessage {
@@ -38,6 +38,8 @@ pub(crate) enum Subscription {
     L2Book { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
     #[serde(rename_all = "camelCase")]
     L4Book { coin: String },
+    #[serde(rename_all = "camelCase")]
+    L4BookLite { coin: String },
 }
 
 impl Subscription {
@@ -85,6 +87,14 @@ impl Subscription {
                 true
             }
             Self::L4Book { coin } => {
+                if !universe.contains(coin) || coin.starts_with('@') {
+                    info!("Invalid subscription: coin not found");
+                    return false;
+                }
+                info!("Valid subscription");
+                true
+            }
+            Self::L4BookLite { coin } => {
                 if !universe.contains(coin) || coin.starts_with('@') {
                     info!("Invalid subscription: coin not found");
                     return false;
