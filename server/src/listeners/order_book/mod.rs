@@ -494,12 +494,12 @@ impl OrderBookListener {
     pub(crate) fn l4_book_lite_snapshot(&self, coin: String) -> Option<L4BookLiteSnapshot> {
         let state = self.order_book_state.as_ref()?;
         let levels = self.l4_book_lite.get(&Coin::new(&coin))?;
-        // Sort bids in ascending order by price
+        // BTreeMap iterates in ascending order by price (stored as keys)
         let bids = levels[0]
             .iter()
             .map(|(px, sz)| [px.to_str(), sz.to_str()])
             .collect();
-        // Sort asks in ascending order by price
+        // BTreeMap iterates in ascending order by price (stored as keys)
         let asks = levels[1]
             .iter()
             .map(|(px, sz)| [px.to_str(), sz.to_str()])
