@@ -7,7 +7,7 @@ use crate::{
     },
     prelude::*,
     types::{
-        L4BookLiteAction, L4BookLiteLevel, L4BookLiteSnapshot, L4BookLiteUpdate, L4BookLiteUpdates, L4Order,
+        L4BookLiteAction, L4BookLiteSnapshot, L4BookLiteUpdate, L4BookLiteUpdates, L4Order,
         inner::{InnerL4Order, InnerLevel, InnerOrderDiff},
         node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::Subscription,
@@ -490,16 +490,17 @@ impl OrderBookListener {
     pub(crate) fn l4_book_lite_snapshot(&self, coin: String) -> Option<L4BookLiteSnapshot> {
         let state = self.order_book_state.as_ref()?;
         let levels = self.l4_book_lite.get(&Coin::new(&coin))?;
+        // Sort bids in ascending order by price
         let bids = levels[0]
             .iter()
-            .rev()
-            .map(|(px, sz)| L4BookLiteLevel { px: px.to_str(), sz: sz.to_str() })
+            .map(|(px, sz)| [px.to_str(), sz.to_str()])
             .collect();
+        // Sort asks in ascending order by price
         let asks = levels[1]
             .iter()
-            .map(|(px, sz)| L4BookLiteLevel { px: px.to_str(), sz: sz.to_str() })
+            .map(|(px, sz)| [px.to_str(), sz.to_str()])
             .collect();
-        Some(L4BookLiteSnapshot { coin, time: state.time(), height: state.height(), levels: [bids, asks] })
+        Some(L4BookLiteSnapshot { coin, time: state.time(), height: state.height(), bids, asks })
     }
 
     fn apply_l4_book_lite_order(
@@ -682,14 +683,20 @@ impl OrderBookListener {
                         });
                     }
                 }
-                let lite_updates = self.build_l4_book_lite_trade_updates(&batch);
-                for updates in lite_updates {
-                    if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let update = Arc::new(InternalMessage::L4BookLiteUpdates { updates });
-                            let _unused = tx.send(update);
-                        });
+                // Only send l4BookLite trade updates if we have a baseline state.
+                // This ensures consistency with add/remove updates which also require baseline state.
+                // During Uninitialized state, we don't send any l4BookLite updates.
+                // During Initializing/Initialized states, we send both trade and add/remove updates.
+                if self.initialization_state != InitializationState::Uninitialized {
+                    let lite_updates = self.build_l4_book_lite_trade_updates(&batch);
+                    for updates in lite_updates {
+                        if let Some(tx) = &self.internal_message_tx {
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let update = Arc::new(InternalMessage::L4BookLiteUpdates { updates });
+                                let _unused = tx.send(update);
+                            });
+                        }
                     }
                 }
             }

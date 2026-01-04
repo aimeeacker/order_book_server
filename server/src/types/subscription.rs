@@ -179,6 +179,7 @@ mod test {
             msg,
             ClientMessage::Subscribe {
                 subscription: Subscription::L2Book { n_sig_figs: None, n_levels: None, mantissa: None, .. },
+                id: None
             }
         ));
     }

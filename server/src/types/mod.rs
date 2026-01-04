@@ -46,7 +46,7 @@ pub(crate) struct L2Book {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) enum L4Book {
-    Snapshot { coin: String, time: u64, height: u64, levels: [Vec<L4Order>; 2], id: Option<u64> },
+    Snapshot { coin: String, time: u64, height: u64, levels: [Vec<L4Order>; 2] },
     Updates(L4BookUpdates),
 }
 
@@ -113,13 +113,6 @@ pub(crate) struct L4Order {
     pub cloid: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct L4BookLiteLevel {
-    pub px: String,
-    pub sz: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum L4BookLiteAction {
@@ -143,7 +136,8 @@ pub(crate) struct L4BookLiteSnapshot {
     pub coin: String,
     pub time: u64,
     pub height: u64,
-    pub levels: [Vec<L4BookLiteLevel>; 2],
+    pub bids: Vec<[String; 2]>,
+    pub asks: Vec<[String; 2]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

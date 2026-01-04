@@ -304,22 +304,18 @@ async fn receive_client_message(
         if let Some(coin) = subscription_coin(&subscription) {
             update_active_symbols(active_symbols, coin, is_subscribe).await;
         }
-        let id = match &client_message {
-            ClientMessage::Subscribe { id, .. } | ClientMessage::Unsubscribe { id, .. } => *id,
-            ClientMessage::GetSnapshot { .. } => None,
-        };
-        send_subscription_response(socket, client_message.clone(), id).await;
+        send_subscription_response(socket, client_message.clone()).await;
         if let ClientMessage::Subscribe { subscription, .. } = &client_message {
             match subscription {
                 Subscription::L4BookLite { coin } => {
                     if let Some(snapshot) = listener.lock().await.l4_book_lite_snapshot(coin.clone()) {
-                        send_ws_data_from_l4_book_lite_snapshot(socket, subscription, &snapshot, id).await;
+                        send_ws_data_from_l4_book_lite_snapshot(socket, subscription, &snapshot, None).await;
                     }
                 }
                 _ => {
                     let msg = subscription.handle_immediate_snapshot(listener, None).await;
                     match msg {
-                        Ok(Some(msg)) => send_snapshot_response(socket, msg, id).await,
+                        Ok(Some(msg)) => send_snapshot_response(socket, msg, None).await,
                         Ok(None) => {}
                         Err(err) => {
                             manager.unsubscribe(subscription.clone());
@@ -392,8 +388,8 @@ async fn send_channel_response<T: Serialize>(socket: &mut WebSocket, response: C
     }
 }
 
-async fn send_subscription_response(socket: &mut WebSocket, msg: ClientMessage, id: Option<u64>) {
-    let response = ChannelResponse { channel: "subscriptionResponse".to_string(), id, data: msg };
+async fn send_subscription_response(socket: &mut WebSocket, msg: ClientMessage) {
+    let response = ChannelResponse { channel: "subscriptionResponse".to_string(), id: None, data: msg };
     send_channel_response(socket, response).await;
 }
 
@@ -404,12 +400,6 @@ async fn send_snapshot_response(socket: &mut WebSocket, msg: ServerResponse, id:
             send_channel_response(socket, response).await;
         }
         ServerResponse::L4Book(book) => {
-            let book = match book {
-                L4Book::Snapshot { coin, time, height, levels, id: _ } => {
-                    L4Book::Snapshot { coin, time, height, levels, id: None }
-                }
-                updates => updates,
-            };
             let response = ChannelResponse { channel: "l4Book".to_string(), id, data: book };
             send_channel_response(socket, response).await;
         }
@@ -522,7 +512,6 @@ async fn send_ws_data_from_l4_snapshot(socket: &mut WebSocket, subscription: &Su
                 time: snapshot.time,
                 height: snapshot.height,
                 levels,
-                id: None,
             });
             send_socket_message(socket, msg).await;
         }
@@ -574,7 +563,7 @@ impl Subscription {
     async fn handle_immediate_snapshot(
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
-        id: Option<u64>,
+        _id: Option<u64>,
     ) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
             if !Self::is_l4_snapshot_coin(coin) {
@@ -592,7 +581,6 @@ impl Subscription {
                         time,
                         height,
                         levels: snapshot,
-                        id,
                     })));
                 }
             }
