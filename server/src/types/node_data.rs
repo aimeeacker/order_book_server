@@ -49,6 +49,31 @@ impl NodeDataOrderStatus {
     }
 }
 
+impl Batch<NodeDataOrderStatus> {
+    pub(crate) fn filter_by_coin<F>(&self, mut allow: F) -> Self
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let events = self
+            .events
+            .iter()
+            .filter(|event| allow(&event.order.coin))
+            .cloned()
+            .collect();
+        Self { local_time: self.local_time, block_time: self.block_time, block_number: self.block_number, events }
+    }
+}
+
+impl Batch<NodeDataOrderDiff> {
+    pub(crate) fn filter_by_coin<F>(&self, mut allow: F) -> Self
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let events = self.events.iter().filter(|event| allow(&event.coin)).cloned().collect();
+        Self { local_time: self.local_time, block_time: self.block_time, block_number: self.block_number, events }
+    }
+}
+
 #[derive(Clone, Copy, strum_macros::Display)]
 pub(crate) enum EventSource {
     Fills,

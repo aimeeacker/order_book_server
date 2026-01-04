@@ -243,6 +243,13 @@ async fn receive_client_message(
         return;
     }
     if let ClientMessage::GetSnapshot { id, .. } = &client_message {
+        if let Subscription::L4Book { coin } = &subscription {
+            if !Subscription::is_l4_snapshot_coin(coin) {
+                let msg = ServerResponse::Error(format!("Invalid subscription: L4 snapshot disabled for {coin}"));
+                send_socket_message(socket, msg).await;
+                return;
+            }
+        }
         let snapshot_msg = subscription.handle_immediate_snapshot(listener, *id).await;
         match snapshot_msg {
             Ok(Some(msg)) => send_socket_message(socket, msg).await,
@@ -465,6 +472,9 @@ impl Subscription {
         id: Option<u64>,
     ) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
+            if !Self::is_l4_snapshot_coin(coin) {
+                return Ok(None);
+            }
             let snapshot = listener.lock().await.compute_snapshot();
             if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
                 let snapshot =

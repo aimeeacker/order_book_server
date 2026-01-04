@@ -10,17 +10,20 @@ use crate::{
         L4Order,
         inner::{InnerL4Order, InnerLevel},
         node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        subscription::Subscription,
     },
 };
 use alloy::primitives::Address;
 use chrono::{Timelike, Utc};
 use fs::File;
-use log::{error, info};
+use log::{debug, error, info, warn};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::thread;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    fs::OpenOptions,
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
+    os::unix::{fs::MetadataExt, io::AsRawFd},
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -47,6 +50,12 @@ enum SnapshotFetchOutcome {
 
 const SNAPSHOT_CACHE_DELAY_MS: u64 = 100;
 const NEW_FILE_WINDOW_MS: i64 = 60_000;
+const FETCHED_SNAPSHOT_CACHE_LIMIT: usize = 2048;
+const FILE_PUNCH_TRIGGER_BYTES: u64 = 511 * 1024 * 1024;
+const FILE_PUNCH_KEEP_BYTES: u64 = 15 * 1024 * 1024;
+const FILE_PUNCH_ALIGNMENT_BYTES: u64 = 4096;
+const FILE_PUNCH_MIN_BYTES: u64 = 32 * 1024 * 1024;
+const ENABLE_L2_SNAPSHOTS: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitializationState {
@@ -58,22 +67,33 @@ enum InitializationState {
 fn next_snapshot_instant() -> Instant {
     let now = Utc::now();
     let base = now.with_second(30).unwrap_or(now);
-    let at_half_hour = base.with_minute(30).unwrap_or(base);
     let at_hour = base.with_minute(0).unwrap_or(base);
-    let target = if now <= at_hour {
-        at_hour
-    } else if now <= at_half_hour {
-        at_half_hour
-    } else {
-        let next_hour = now + chrono::Duration::hours(1);
-        next_hour
-            .with_minute(0)
-            .and_then(|next| next.with_second(30))
-            .unwrap_or(next_hour)
-    };
+    let at_half_hour = base.with_minute(30).unwrap_or(base);
+    let at_last_minute = base.with_minute(59).unwrap_or(base);
+    let target = [at_hour, at_half_hour, at_last_minute]
+        .into_iter()
+        .filter(|candidate| *candidate >= now)
+        .min()
+        .unwrap_or_else(|| {
+            let next_hour = now + chrono::Duration::hours(1);
+            next_hour
+                .with_minute(0)
+                .and_then(|next| next.with_second(30))
+                .unwrap_or(next_hour)
+        });
     let duration = target.signed_duration_since(now);
     let wait = duration.to_std().unwrap_or_else(|_| Duration::from_secs(0));
     Instant::now() + wait
+}
+
+fn filter_l4_snapshot(snapshot: Snapshots<InnerL4Order>) -> Snapshots<InnerL4Order> {
+    Snapshots::new(
+        snapshot
+            .value()
+            .into_iter()
+            .filter(|(coin, _)| Subscription::is_l4_snapshot_coin(&coin.value()))
+            .collect(),
+    )
 }
 
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
@@ -249,6 +269,7 @@ fn fetch_snapshot(
                 let mut cache = cache;
                 let (height, expected_snapshot) =
                     load_snapshots_from_slice::<InnerL4Order, (Address, L4Order)>(&mut snapshot_bytes)?;
+                let expected_snapshot = filter_l4_snapshot(expected_snapshot);
                 info!("Snapshot height received: {height}");
                 let cache_len = cache.len();
                 info!("Cache has {} elements", cache_len);
@@ -354,6 +375,9 @@ pub(crate) struct OrderBookListener {
     last_fill_offset: u64,
     last_order_status_offset: u64,
     last_order_diff_offset: u64,
+    last_fill_punch_offset: u64,
+    last_order_status_punch_offset: u64,
+    last_order_diff_punch_offset: u64,
     last_sent_height: u64,
     validation_in_progress: bool,
     snapshot_requested: bool,
@@ -383,6 +407,9 @@ impl OrderBookListener {
             last_fill_offset: 0,
             last_order_status_offset: 0,
             last_order_diff_offset: 0,
+            last_fill_punch_offset: 0,
+            last_order_status_punch_offset: 0,
+            last_order_diff_punch_offset: 0,
             last_sent_height: 0,
             validation_in_progress: false,
             snapshot_requested: false,
@@ -413,15 +440,18 @@ impl OrderBookListener {
         self.order_status_cache.pop_front().and_then(|t| self.order_diff_cache.pop_front().map(|s| (t, s)))
     }
 
-    // Helper method to cache and broadcast updates
-    fn cache_and_broadcast_update(&mut self, order_statuses: Batch<NodeDataOrderStatus>, order_diffs: Batch<NodeDataOrderDiff>) {
-        // Ensure cache exists before adding
-        if self.fetched_snapshot_cache.is_none() {
-            self.fetched_snapshot_cache = Some(VecDeque::new());
+    fn cache_update(&mut self, order_statuses: Batch<NodeDataOrderStatus>, order_diffs: Batch<NodeDataOrderDiff>) {
+        if !self.validation_in_progress {
+            return;
         }
-        #[allow(clippy::unwrap_used)]
-        self.fetched_snapshot_cache.as_mut().unwrap().push_back((order_statuses.clone(), order_diffs.clone()));
-        
+        let cache = self.fetched_snapshot_cache.get_or_insert_with(VecDeque::new);
+        cache.push_back((order_statuses, order_diffs));
+        while cache.len() > FETCHED_SNAPSHOT_CACHE_LIMIT {
+            cache.pop_front();
+        }
+    }
+
+    fn broadcast_update(&self, order_statuses: Batch<NodeDataOrderStatus>, order_diffs: Batch<NodeDataOrderDiff>) {
         if let Some(tx) = &self.internal_message_tx {
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -463,7 +493,12 @@ impl OrderBookListener {
                 // During initialization, accumulate updates in fetched_snapshot_cache if validation is in progress
                 if self.validation_in_progress {
                     while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                        self.cache_and_broadcast_update(order_statuses, order_diffs);
+                        let filtered_statuses =
+                            order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+                        let filtered_diffs =
+                            order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+                        self.cache_update(filtered_statuses, filtered_diffs);
+                        self.broadcast_update(order_statuses, order_diffs);
                     }
                 }
                 return Ok(());
@@ -476,7 +511,12 @@ impl OrderBookListener {
         // Initialized state processing
         if self.validation_in_progress {
             while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                self.cache_and_broadcast_update(order_statuses, order_diffs);
+                let filtered_statuses =
+                    order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+                let filtered_diffs =
+                    order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+                self.cache_update(filtered_statuses, filtered_diffs);
+                self.broadcast_update(order_statuses, order_diffs);
             }
         } else {
             while let Some((order_statuses, order_diffs)) = self.pop_cache() {
@@ -490,20 +530,22 @@ impl OrderBookListener {
                         return Ok(());
                     }
                 }
+                let filtered_statuses =
+                    order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+                let filtered_diffs =
+                    order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
                 self.order_book_state
                     .as_mut()
-                    .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
+                    .map(|book| book.apply_updates(filtered_statuses, filtered_diffs))
                     .transpose()?;
-                self.cache_and_broadcast_update(order_statuses, order_diffs);
+                self.broadcast_update(order_statuses, order_diffs);
             }
         }
         Ok(())
     }
 
     fn begin_caching(&mut self) {
-        if self.fetched_snapshot_cache.is_none() {
-            self.fetched_snapshot_cache = Some(VecDeque::new());
-        }
+        self.fetched_snapshot_cache = Some(VecDeque::new());
         self.validation_in_progress = true;
         
         // For uninitialized state, don't transfer accumulated updates yet
@@ -516,6 +558,9 @@ impl OrderBookListener {
         
         // Transfer any accumulated updates from order_status_cache/order_diff_cache to fetched_snapshot_cache
         while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+            let order_statuses =
+                order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+            let order_diffs = order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
             #[allow(clippy::unwrap_used)]
             self.fetched_snapshot_cache.as_mut().unwrap().push_back((order_statuses, order_diffs));
         }
@@ -549,12 +594,16 @@ impl OrderBookListener {
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("Initializing from snapshot at height {height}");
+        let snapshot = filter_l4_snapshot(snapshot);
         let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
         
         // Apply only blocks that are newer than snapshot
         let mut applied_count = 0;
         let mut retry = false;
         while let Some((order_statuses, order_diffs)) = self.pop_cache() {
+            let order_statuses =
+                order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+            let order_diffs = order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
             let block_height = order_statuses.block_number();
             
             // Skip blocks older than or equal to snapshot
@@ -626,6 +675,86 @@ impl OrderBookListener {
             EventSource::OrderStatuses => &mut self.last_order_status_offset,
             EventSource::OrderDiffs => &mut self.last_order_diff_offset,
         }
+    }
+
+    fn last_offset(&self, event_source: EventSource) -> u64 {
+        match event_source {
+            EventSource::Fills => self.last_fill_offset,
+            EventSource::OrderStatuses => self.last_order_status_offset,
+            EventSource::OrderDiffs => self.last_order_diff_offset,
+        }
+    }
+
+    fn last_punch_offset_mut(&mut self, event_source: EventSource) -> &mut u64 {
+        match event_source {
+            EventSource::Fills => &mut self.last_fill_punch_offset,
+            EventSource::OrderStatuses => &mut self.last_order_status_punch_offset,
+            EventSource::OrderDiffs => &mut self.last_order_diff_punch_offset,
+        }
+    }
+
+    fn last_punch_offset(&self, event_source: EventSource) -> u64 {
+        match event_source {
+            EventSource::Fills => self.last_fill_punch_offset,
+            EventSource::OrderStatuses => self.last_order_status_punch_offset,
+            EventSource::OrderDiffs => self.last_order_diff_punch_offset,
+        }
+    }
+
+    fn align_down(value: u64, alignment: u64) -> u64 {
+        if alignment == 0 {
+            return value;
+        }
+        value - (value % alignment)
+    }
+
+    fn punch_file_if_needed(
+        &mut self,
+        event_source: EventSource,
+        fd: i32,
+        file_len: u64,
+        allocated_bytes: u64,
+    ) {
+        if allocated_bytes <= FILE_PUNCH_TRIGGER_BYTES {
+            return;
+        }
+        let desired_end = file_len.saturating_sub(FILE_PUNCH_KEEP_BYTES);
+        let last_offset = self.last_offset(event_source);
+        if last_offset < desired_end {
+            return;
+        }
+        let last_punch_offset = self.last_punch_offset(event_source);
+        if last_punch_offset >= desired_end {
+            return;
+        }
+        let start = Self::align_down(last_punch_offset, FILE_PUNCH_ALIGNMENT_BYTES);
+        let end = Self::align_down(desired_end, FILE_PUNCH_ALIGNMENT_BYTES);
+        if end <= start {
+            return;
+        }
+        let len = end - start;
+        if len < FILE_PUNCH_MIN_BYTES {
+            return;
+        }
+        #[allow(unsafe_code)]
+        let result = unsafe {
+            libc::fallocate(
+                fd,
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                start as libc::off_t,
+                len as libc::off_t,
+            )
+        };
+        if result != 0 {
+            let err = io::Error::last_os_error();
+            warn!("Failed to punch hole for {event_source} file: {err}");
+            return;
+        }
+        *self.last_punch_offset_mut(event_source) = end;
+        info!(
+            "Punched {event_source} file from {} to {} (file len {})",
+            start, end, file_len
+        );
     }
 
     fn request_snapshot(&mut self) {
@@ -727,6 +856,7 @@ impl OrderBookListener {
                             file.seek(SeekFrom::Start(0))?;
                         }
                         *self.last_offset_mut(event_source) = 0;
+                        *self.last_punch_offset_mut(event_source) = 0;
                     }
                     *self.last_len_mut(event_source) = size;
                 }
@@ -734,7 +864,7 @@ impl OrderBookListener {
             } else {
                 info!("-- Event: {} modified, tracking it now --", new_path.display());
                 let read_from_start = self.should_read_from_start(new_path, event_source);
-                let mut new_file = File::open(new_path)?;
+                let mut new_file = OpenOptions::new().read(true).write(true).open(new_path)?;
                 if read_from_start {
                     let mut buf = String::new();
                     new_file.read_to_string(&mut buf)?;
@@ -748,6 +878,7 @@ impl OrderBookListener {
                     *self.last_len_mut(event_source) = metadata.len();
                     *self.last_offset_mut(event_source) = metadata.len();
                 }
+                *self.last_punch_offset_mut(event_source) = 0;
                 *self.pending_line_mut(event_source) = String::new();
                 *self.file_mut(event_source) = Some(new_file);
             }
@@ -781,7 +912,7 @@ impl DirectoryListener for OrderBookListener {
                 self.process_data(buf, event_source)?;
             }
         }
-        let mut file = File::open(new_file)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(new_file)?;
         if read_from_start {
             let mut buf = String::new();
             file.read_to_string(&mut buf)?;
@@ -794,17 +925,27 @@ impl DirectoryListener for OrderBookListener {
         let new_offset = file.seek(SeekFrom::Current(0))?;
         *self.file_mut(event_source) = Some(file);
         *self.last_offset_mut(event_source) = new_offset;
+        *self.last_punch_offset_mut(event_source) = 0;
         Ok(())
     }
 
     fn on_file_modification(&mut self, event_source: EventSource) -> Result<()> {
         let mut buf = String::new();
         let last_offset = *self.last_offset_mut(event_source);
-        let file = self.file_mut(event_source).as_mut().ok_or("No file being tracked")?;
-        file.seek(SeekFrom::Start(last_offset))?;
-        file.read_to_string(&mut buf)?;
-        let new_offset = file.seek(SeekFrom::Current(0))?;
+        let (new_offset, file_len, allocated_bytes, fd) = {
+            let file = self.file_mut(event_source).as_mut().ok_or("No file being tracked")?;
+            file.seek(SeekFrom::Start(last_offset))?;
+            file.read_to_string(&mut buf)?;
+            let new_offset = file.seek(SeekFrom::Current(0))?;
+            let metadata = file.metadata().ok();
+            let file_len = metadata.as_ref().map(|meta| meta.len());
+            let allocated_bytes = metadata.as_ref().map(|meta| meta.blocks() * 512);
+            (new_offset, file_len, allocated_bytes, file.as_raw_fd())
+        };
         *self.last_offset_mut(event_source) = new_offset;
+        if let (Some(file_len), Some(allocated_bytes)) = (file_len, allocated_bytes) {
+            self.punch_file_if_needed(event_source, fd, file_len, allocated_bytes);
+        }
         self.process_data(buf, event_source)?;
         Ok(())
     }
@@ -849,7 +990,7 @@ impl DirectoryListener for OrderBookListener {
                 }
             };
             if height % 100 == 0 {
-                info!("{event_source} block: {height}");
+                debug!("{event_source} block: {height}");
             }
             if let Err(err) = self.receive_batch(event_batch) {
                 error!("{event_source} update error: {err}. Waiting for next snapshot.");
@@ -857,14 +998,16 @@ impl DirectoryListener for OrderBookListener {
                 return Ok(());
             }
         }
-        let snapshot = self.l2_snapshots(true);
-        if let Some(snapshot) = snapshot {
-            if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                    let _unused = tx.send(snapshot);
-                });
+        if ENABLE_L2_SNAPSHOTS {
+            let snapshot = self.l2_snapshots(true);
+            if let Some(snapshot) = snapshot {
+                if let Some(tx) = &self.internal_message_tx {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                        let _unused = tx.send(snapshot);
+                    });
+                }
             }
         }
         Ok(())

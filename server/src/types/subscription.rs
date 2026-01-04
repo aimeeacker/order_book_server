@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 const MAX_LEVELS: usize = 100;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
+const ENABLE_L2_SNAPSHOTS: bool = false;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method")]
@@ -40,10 +41,19 @@ pub(crate) enum Subscription {
 }
 
 impl Subscription {
+    pub(crate) fn is_l4_snapshot_coin(coin: &str) -> bool {
+        matches!(coin, "BTC" | "ETH")
+    }
+
     pub(crate) fn validate(&self, universe: &HashSet<String>) -> bool {
         match self {
             Self::Trades { coin } => universe.contains(coin),
             Self::L2Book { coin, n_sig_figs, n_levels, mantissa } => {
+                // L2 snapshots are currently disabled by default.
+                if !ENABLE_L2_SNAPSHOTS {
+                    info!("Invalid subscription: L2 snapshots are currently disabled");
+                    return false;
+                }
                 if !universe.contains(coin) || coin.starts_with('@') {
                     info!("Invalid subscription: coin not found");
                     return false;
