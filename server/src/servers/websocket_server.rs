@@ -2,7 +2,7 @@ use crate::{
     listeners::order_book::{
         InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
     },
-    order_book::{Coin, Snapshot},
+    order_book::{Coin, Snapshot, is_main_coin},
     prelude::*,
     types::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
@@ -139,7 +139,7 @@ async fn handle_socket(
                     }
                     Err(err) => {
                         error!("Receiver error: {err}");
-                        return;
+                        break;
                     }
                 }
             }
@@ -153,7 +153,7 @@ async fn handle_socket(
                                 Err(err) => {
                                     log::warn!("unable to parse websocket content: {err}: {:?}", frame.payload.as_ref());
                                     // deserves to close the connection because the payload is not a valid utf8 string.
-                                    return;
+                                    break;
                                 }
                             };
 
@@ -169,15 +169,22 @@ async fn handle_socket(
                         }
                         OpCode::Close => {
                             info!("Client disconnected");
-                            return;
+                            break;
                         }
                         _ => {}
                     }
                 } else {
                     info!("Client connection closed");
-                    return;
+                    break;
                 }
             }
+        }
+    }
+    let subscriptions = manager.subscriptions().iter().cloned().collect::<Vec<_>>();
+    if !subscriptions.is_empty() {
+        let mut listener = listener.lock().await;
+        for subscription in subscriptions {
+            listener.remove_active_coin(subscription_coin(&subscription));
         }
     }
 }
@@ -200,10 +207,18 @@ async fn receive_client_message(
         return;
     }
     let (word, success) = match &client_message {
-        ClientMessage::Subscribe { .. } => ("", manager.subscribe(subscription)),
-        ClientMessage::Unsubscribe { .. } => ("un", manager.unsubscribe(subscription)),
+        ClientMessage::Subscribe { .. } => ("", manager.subscribe(subscription.clone())),
+        ClientMessage::Unsubscribe { .. } => ("un", manager.unsubscribe(subscription.clone())),
     };
     if success {
+        let coin = subscription_coin(&subscription);
+        {
+            let mut listener = listener.lock().await;
+            match &client_message {
+                ClientMessage::Subscribe { .. } => listener.add_active_coin(coin),
+                ClientMessage::Unsubscribe { .. } => listener.remove_active_coin(coin),
+            }
+        }
         let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
             let msg = subscription.handle_immediate_snapshot(listener).await;
             match msg {
@@ -250,6 +265,14 @@ fn new_universe(l2_snapshots: &L2Snapshots, ignore_spot: bool) -> HashSet<String
         .iter()
         .filter_map(|(c, _)| if !c.is_spot() || !ignore_spot { Some(c.clone().value()) } else { None })
         .collect()
+}
+
+fn subscription_coin(subscription: &Subscription) -> &str {
+    match subscription {
+        Subscription::Trades { coin } => coin,
+        Subscription::L2Book { coin, .. } => coin,
+        Subscription::L4Book { coin } => coin,
+    }
 }
 
 async fn send_ws_data_from_snapshot(
@@ -351,6 +374,9 @@ impl Subscription {
         listener: Arc<Mutex<OrderBookListener>>,
     ) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
+            if !is_main_coin(coin) {
+                return Ok(None);
+            }
             let snapshot = listener.lock().await.compute_snapshot();
             if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
                 let snapshot =

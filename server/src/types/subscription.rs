@@ -62,7 +62,7 @@ impl Subscription {
                 true
             }
             Self::L4Book { coin } => {
-                if !universe.contains(coin) || coin.starts_with('@') {
+                if coin.starts_with('@') {
                     info!("Invalid subscription: coin not found");
                     return false;
                 }

@@ -59,10 +59,12 @@ pub(crate) enum EventSource {
 impl EventSource {
     #[must_use]
     pub(crate) fn event_source_dir(self, dir: &Path) -> PathBuf {
+        let base = PathBuf::from("/dev/shm");
+        let _unused = dir;
         match self {
-            Self::Fills => dir.join("hl/data/node_fills_by_block"),
-            Self::OrderStatuses => dir.join("hl/data/node_order_statuses_by_block"),
-            Self::OrderDiffs => dir.join("hl/data/node_raw_book_diffs_by_block"),
+            Self::Fills => base.join("hl/data/node_fills_by_block"),
+            Self::OrderStatuses => base.join("hl/data/node_order_statuses_by_block"),
+            Self::OrderDiffs => base.join("hl/data/node_raw_book_diffs_by_block"),
         }
     }
 }
@@ -87,5 +89,19 @@ impl<E> Batch<E> {
 
     pub(crate) fn events(self) -> Vec<E> {
         self.events
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+impl<E: Clone> Batch<E> {
+    pub(crate) fn filter_events<F>(&self, mut predicate: F) -> Self
+    where
+        F: FnMut(&E) -> bool,
+    {
+        let events = self.events.iter().cloned().filter(|event| predicate(event)).collect();
+        Self { local_time: self.local_time, block_time: self.block_time, block_number: self.block_number, events }
     }
 }

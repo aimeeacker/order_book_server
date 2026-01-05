@@ -21,7 +21,8 @@ use std::{
 };
 
 pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
-    let output_path = dir.join("out.json");
+    let _unused = dir;
+    let output_path = PathBuf::from("/dev/shm/snapshot.json");
     let payload = json!({
         "type": "fileSnapshot",
         "request": {

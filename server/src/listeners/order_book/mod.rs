@@ -2,7 +2,7 @@ use crate::{
     HL_NODE,
     listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
     order_book::{
-        Coin, Snapshot,
+        Coin, Snapshot, is_main_coin,
         multi_book::{Snapshots, load_snapshots_from_json},
     },
     prelude::*,
@@ -14,7 +14,8 @@ use crate::{
 };
 use alloy::primitives::Address;
 use fs::File;
-use log::{error, info};
+use chrono::{Timelike, Utc};
+use log::{error, info, warn};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
@@ -36,6 +37,28 @@ use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consiste
 
 mod state;
 mod utils;
+
+const ENABLE_L2_BOOK: bool = false;
+
+fn next_validation_instant() -> Instant {
+    let now = Utc::now();
+    let target = if now.second() < 30 {
+        now.with_second(30).and_then(|t| t.with_nanosecond(0)).unwrap_or(now)
+    } else {
+        (now + chrono::Duration::minutes(1)).with_second(30).and_then(|t| t.with_nanosecond(0)).unwrap_or(now)
+    };
+    let duration = target.signed_duration_since(now).to_std().unwrap_or(Duration::from_secs(0));
+    Instant::now() + duration
+}
+
+fn filter_snapshots_to_main(snapshot: Snapshots<InnerL4Order>) -> Snapshots<InnerL4Order> {
+    let filtered = snapshot
+        .value()
+        .into_iter()
+        .filter(|(coin, _)| is_main_coin(&coin.value()))
+        .collect::<HashMap<_, _>>();
+    Snapshots::new(filtered)
+}
 
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
@@ -70,6 +93,8 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(10));
+    let validation_start = next_validation_instant();
+    let mut validation_ticker = interval_at(validation_start, Duration::from_secs(60));
     loop {
         tokio::select! {
             event = fs_event_rx.recv() =>  match event {
@@ -122,6 +147,10 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                 fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
             }
+            _ = validation_ticker.tick() => {
+                let listener = listener.clone();
+                validate_snapshot(dir.clone(), listener, ignore_spot);
+            }
             () = sleep(Duration::from_secs(5)) => {
                 let listener = listener.lock().await;
                 if listener.is_ready() {
@@ -158,6 +187,7 @@ fn fetch_snapshot(
                 info!("Cache has {} elements", cache.len());
                 match snapshot {
                     Ok((height, expected_snapshot)) => {
+                        let expected_snapshot = filter_snapshots_to_main(expected_snapshot);
                         if let Some(mut state) = state {
                             while state.height() < height {
                                 if let Some((order_statuses, order_diffs)) = cache.pop_front() {
@@ -169,7 +199,7 @@ fn fetch_snapshot(
                             if state.height() > height {
                                 return Err("Fetched snapshot lagging stored state".into());
                             }
-                            let stored_snapshot = state.compute_snapshot().snapshot;
+                            let stored_snapshot = filter_snapshots_to_main(state.compute_snapshot().snapshot);
                             info!("Validating snapshot");
                             validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
                         } else {
@@ -187,11 +217,42 @@ fn fetch_snapshot(
     });
 }
 
+fn validate_snapshot(dir: PathBuf, listener: Arc<Mutex<OrderBookListener>>, ignore_spot: bool) {
+    tokio::spawn(async move {
+        let res = match process_rmp_file(&dir).await {
+            Ok(output_fln) => {
+                let snapshot = load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&output_fln).await;
+                match snapshot {
+                    Ok((_height, expected_snapshot)) => {
+                        let expected_snapshot = filter_snapshots_to_main(expected_snapshot);
+                        let stored_snapshot = listener.lock().await.compute_snapshot();
+                        match stored_snapshot {
+                            Some(TimedSnapshots { snapshot, .. }) => {
+                                let stored_snapshot = filter_snapshots_to_main(snapshot);
+                                validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
+                            }
+                            None => Err("No snapshot available for validation".into()),
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Err(err) => Err(err),
+        };
+        match res {
+            Ok(()) => info!("Snapshot validation succeeded"),
+            Err(err) => warn!("Snapshot validation failed: {err}"),
+        }
+        Ok::<(), Error>(())
+    });
+}
+
 pub(crate) struct OrderBookListener {
     ignore_spot: bool,
     fill_status_file: Option<File>,
     order_status_file: Option<File>,
     order_diff_file: Option<File>,
+    active_coin_counts: HashMap<String, usize>,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
     last_fill: Option<u64>,
@@ -203,12 +264,13 @@ pub(crate) struct OrderBookListener {
 }
 
 impl OrderBookListener {
-    pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
         Self {
             ignore_spot,
             fill_status_file: None,
             order_status_file: None,
             order_diff_file: None,
+            active_coin_counts: HashMap::new(),
             order_book_state: None,
             last_fill: None,
             fetched_snapshot_cache: None,
@@ -228,6 +290,24 @@ impl OrderBookListener {
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
         self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
+    }
+
+    pub(crate) fn add_active_coin(&mut self, coin: &str) {
+        *self.active_coin_counts.entry(coin.to_string()).or_insert(0) += 1;
+    }
+
+    pub(crate) fn remove_active_coin(&mut self, coin: &str) {
+        if let Some(count) = self.active_coin_counts.get_mut(coin) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                self.active_coin_counts.remove(coin);
+            }
+        }
+    }
+
+    fn active_coins(&self) -> HashSet<String> {
+        self.active_coin_counts.keys().cloned().collect()
     }
 
     #[allow(clippy::type_complexity)]
@@ -258,20 +338,32 @@ impl OrderBookListener {
     }
 
     fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
+        let active_coins = self.active_coins();
         match updates {
             EventBatch::Orders(batch) => {
-                self.order_status_cache.push(batch);
+                let filtered = batch.filter_events(|status| {
+                    is_main_coin(&status.order.coin) || active_coins.contains(&status.order.coin)
+                });
+                self.order_status_cache.push(filtered);
             }
             EventBatch::BookDiffs(batch) => {
-                self.order_diff_cache.push(batch);
+                let filtered = batch.filter_events(|diff| {
+                    let coin = diff.coin().value();
+                    is_main_coin(&coin) || active_coins.contains(&coin)
+                });
+                self.order_diff_cache.push(filtered);
             }
             EventBatch::Fills(batch) => {
-                if self.last_fill.is_none_or(|height| height < batch.block_number()) {
+                let filtered = batch.filter_events(|fill| is_main_coin(&fill.1.coin));
+                if filtered.is_empty() {
+                    return Ok(());
+                }
+                if self.last_fill.is_none_or(|height| height < filtered.block_number()) {
                     // send fill updates if we received a new update
                     if let Some(tx) = &self.internal_message_tx {
                         let tx = tx.clone();
                         tokio::spawn(async move {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch });
+                            let snapshot = Arc::new(InternalMessage::Fills { batch: filtered });
                             let _unused = tx.send(snapshot);
                         });
                     }
@@ -280,22 +372,29 @@ impl OrderBookListener {
         }
         if self.is_ready() {
             if let Some((order_statuses, order_diffs)) = self.pop_cache() {
+                let active_statuses =
+                    order_statuses.filter_events(|status| active_coins.contains(&status.order.coin));
+                let active_diffs = order_diffs.filter_events(|diff| active_coins.contains(&diff.coin().value()));
+                let main_statuses = order_statuses.filter_events(|status| is_main_coin(&status.order.coin));
+                let main_diffs = order_diffs.filter_events(|diff| is_main_coin(&diff.coin().value()));
                 self.order_book_state
                     .as_mut()
-                    .map(|book| book.apply_updates(order_statuses.clone(), order_diffs.clone()))
+                    .map(|book| book.apply_updates(main_statuses.clone(), main_diffs.clone()))
                     .transpose()?;
                 if let Some(cache) = &mut self.fetched_snapshot_cache {
-                    cache.push_back((order_statuses.clone(), order_diffs.clone()));
+                    cache.push_back((main_statuses.clone(), main_diffs.clone()));
                 }
                 if let Some(tx) = &self.internal_message_tx {
-                    let tx = tx.clone();
-                    tokio::spawn(async move {
-                        let updates = Arc::new(InternalMessage::L4BookUpdates {
-                            diff_batch: order_diffs,
-                            status_batch: order_statuses,
+                    if !active_statuses.is_empty() || !active_diffs.is_empty() {
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            let updates = Arc::new(InternalMessage::L4BookUpdates {
+                                diff_batch: active_diffs,
+                                status_batch: active_statuses,
+                            });
+                            let _unused = tx.send(updates);
                         });
-                        let _unused = tx.send(updates);
-                    });
+                    }
                 }
             }
         }
@@ -416,11 +515,14 @@ impl DirectoryListener for OrderBookListener {
                 Ok(data) => data,
                 Err(err) => {
                     // if we run into a serialization error (hitting EOF), just return to last line.
-                    error!(
-                        "{event_source} serialization error {err}, height: {:?}, line: {:?}",
-                        self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
-                    );
+                    if !err.is_eof() {
+                        let preview = &line[..line.len().min(100)];
+                        error!(
+                            "{event_source} serialization error {err}, height: {:?}, line: {:?}",
+                            self.order_book_state.as_ref().map(OrderBookState::height),
+                            preview,
+                        );
+                    }
                     #[allow(clippy::unwrap_used)]
                     let total_len: i64 = total_len.try_into().unwrap();
                     self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
@@ -435,14 +537,16 @@ impl DirectoryListener for OrderBookListener {
                 return Err(err);
             }
         }
-        let snapshot = self.l2_snapshots(true);
-        if let Some(snapshot) = snapshot {
-            if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                    let _unused = tx.send(snapshot);
-                });
+        if ENABLE_L2_BOOK {
+            let snapshot = self.l2_snapshots(true);
+            if let Some(snapshot) = snapshot {
+                if let Some(tx) = &self.internal_message_tx {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                        let _unused = tx.send(snapshot);
+                    });
+                }
             }
         }
         Ok(())

@@ -10,6 +10,12 @@ pub(crate) mod types;
 
 pub(crate) use types::{Coin, InnerOrder, Oid, Px, Side, Sz};
 
+pub(crate) const MAIN_COINS: [&str; 2] = ["BTC", "ETH"];
+
+pub(crate) fn is_main_coin(coin: &str) -> bool {
+    MAIN_COINS.iter().any(|main_coin| main_coin == &coin)
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct OrderBook<O> {
     oid_to_side_px: HashMap<Oid, (Side, Px)>,
