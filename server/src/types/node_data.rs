@@ -74,6 +74,21 @@ impl Batch<NodeDataOrderDiff> {
     }
 }
 
+impl Batch<NodeDataFill> {
+    pub(crate) fn filter_by_coin<F>(&self, mut allow: F) -> Self
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let events = self
+            .events
+            .iter()
+            .filter(|event| allow(&event.1.coin))
+            .cloned()
+            .collect();
+        Self { local_time: self.local_time, block_time: self.block_time, block_number: self.block_number, events }
+    }
+}
+
 #[derive(Clone, Copy, strum_macros::Display)]
 pub(crate) enum EventSource {
     Fills,
@@ -112,5 +127,13 @@ impl<E> Batch<E> {
 
     pub(crate) fn events(self) -> Vec<E> {
         self.events
+    }
+
+    pub(crate) const fn events_ref(&self) -> &Vec<E> {
+        &self.events
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.events.is_empty()
     }
 }

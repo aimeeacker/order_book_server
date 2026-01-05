@@ -5,7 +5,7 @@ use crate::{
     order_book::{Coin, Snapshot},
     prelude::*,
     types::{
-        L2Book, L4Book, L4BookLiteSnapshot, L4BookLiteUpdates, L4BookUpdates, L4Order, Trade,
+        L2Book, L4Book, L4BookLiteDepthUpdate, L4BookLiteSnapshot, L4BookLiteUpdates, L4BookUpdates, L4Order, Trade,
         inner::InnerLevel,
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ChannelResponse, ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
@@ -45,14 +45,13 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
     let home_dir = home_dir().ok_or("Could not find home directory")?;
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
-        OrderBookListener::new(Some(internal_message_tx), ignore_spot)
+        OrderBookListener::new(Some(internal_message_tx), ignore_spot, active_symbols.clone())
     };
     let listener = Arc::new(Mutex::new(listener));
     {
         let listener = listener.clone();
-        let active_symbols = active_symbols.clone();
         tokio::spawn(async move {
-            if let Err(err) = hl_listen(listener, home_dir, active_symbols).await {
+            if let Err(err) = hl_listen(listener, home_dir).await {
                 error!("Listener fatal error: {err}");
                 std::process::exit(1);
             }
@@ -173,6 +172,11 @@ async fn handle_socket(
                             InternalMessage::L4BookLiteUpdates { updates } => {
                                 for sub in manager.subscriptions() {
                                     send_ws_data_from_l4_book_lite_updates(&mut socket, sub, updates).await;
+                                }
+                            }
+                            InternalMessage::L4BookLiteDepthUpdates { updates } => {
+                                for sub in manager.subscriptions() {
+                                    send_ws_data_from_l4_book_lite_depth_updates(&mut socket, sub, updates).await;
                                 }
                             }
                         }
@@ -353,6 +357,7 @@ async fn prune_active_symbols(manager: &mut SubscriptionManager, active_symbols:
 
 fn subscription_coin(subscription: &Subscription) -> Option<String> {
     match subscription {
+        Subscription::Trades { coin } => Some(coin.clone()),
         Subscription::L4Book { coin } => Some(coin.clone()),
         Subscription::L4BookLite { coin } => Some(coin.clone()),
         _ => None,
@@ -581,6 +586,19 @@ async fn send_ws_data_from_l4_book_lite_updates(
     }
 }
 
+async fn send_ws_data_from_l4_book_lite_depth_updates(
+    socket: &mut WebSocket,
+    subscription: &Subscription,
+    updates: &L4BookLiteDepthUpdate,
+) {
+    if let Subscription::L4BookLite { coin } = subscription {
+        if coin == &updates.coin {
+            let response = ChannelResponse { channel: "l4BookLiteDepth".to_string(), req_id: None, data: updates.clone() };
+            send_channel_response(socket, response).await;
+        }
+    }
+}
+
 impl Subscription {
     // snapshots that begin a stream
     async fn handle_immediate_snapshot(&self, listener: Arc<Mutex<OrderBookListener>>) -> Result<Option<ServerResponse>> {
@@ -588,7 +606,7 @@ impl Subscription {
             if !Self::is_l4_snapshot_coin(coin) {
                 return Ok(None);
             }
-            let snapshot = listener.lock().await.compute_snapshot();
+            let snapshot = listener.lock().await.l4_snapshot_for_coin(coin);
             if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
                 let snapshot =
                     snapshot.value().into_iter().filter(|(c, _)| *c == Coin::new(coin)).collect::<Vec<_>>().pop();

@@ -7,7 +7,8 @@ use crate::{
     },
     prelude::*,
     types::{
-        L4BookLiteAction, L4BookLiteSnapshot, L4BookLiteUpdate, L4BookLiteUpdates, L4Order,
+        L4BookLiteAction, L4BookLiteDepthLevel, L4BookLiteDepthUpdate, L4BookLiteSnapshot, L4BookLiteUpdate,
+        L4BookLiteUpdates, L4Order,
         inner::{InnerL4Order, InnerLevel, InnerOrderDiff},
         node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::Subscription,
@@ -32,21 +33,14 @@ use tokio::{
     sync::{
         Mutex,
         broadcast::Sender,
-        mpsc::{UnboundedSender, unbounded_channel},
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     },
     time::{Instant, sleep, sleep_until},
 };
-use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency_with_hashes};
+use utils::{BatchQueue, EventBatch, process_rmp_file};
 
 mod state;
 mod utils;
-
-#[allow(variant_size_differences)]
-enum SnapshotFetchOutcome {
-    Validated { height: u64 },
-    Initialize { height: u64, expected_snapshot: Snapshots<InnerL4Order> },
-    Skipped { local_height: u64, snapshot_height: u64 },
-}
 
 const SNAPSHOT_CACHE_DELAY_MS: u64 = 100;
 const NEW_FILE_WINDOW_MS: i64 = 60_000;
@@ -65,11 +59,362 @@ enum InitializationState {
 }
 
 #[derive(Clone, Debug)]
-struct LiteOrderInfo {
+struct OrderInfo {
     coin: Coin,
     side: Side,
     px: Px,
     sz: Sz,
+}
+
+#[derive(Clone, Debug)]
+struct LevelState {
+    sum_sz: Sz,
+    shadow_sum: Sz,
+    orders: HashMap<Oid, Sz>,
+}
+
+impl Default for LevelState {
+    fn default() -> Self {
+        Self { sum_sz: Sz::new(0), shadow_sum: Sz::new(0), orders: HashMap::new() }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BookState {
+    bids: BTreeMap<Px, LevelState>,
+    asks: BTreeMap<Px, LevelState>,
+    oid_index: HashMap<Oid, OrderInfo>,
+    dirty_levels: HashSet<(Side, Px)>,
+}
+
+impl Default for BookState {
+    fn default() -> Self {
+        Self { bids: BTreeMap::new(), asks: BTreeMap::new(), oid_index: HashMap::new(), dirty_levels: HashSet::new() }
+    }
+}
+
+impl BookState {
+    fn from_snapshot(snapshot: &Snapshot<InnerL4Order>) -> Self {
+        let mut state = Self::default();
+        for orders in snapshot.as_ref().iter() {
+            for order in orders {
+                let side = order.side;
+                let px = order.limit_px;
+                let sz = order.sz;
+                let level = state.level_mut(side, px);
+                level.sum_sz = level.sum_sz + sz;
+                level.orders.insert(Oid::new(order.oid), sz);
+                state.oid_index.insert(
+                    Oid::new(order.oid),
+                    OrderInfo { coin: order.coin.clone(), side, px, sz },
+                );
+            }
+        }
+        state
+    }
+
+    fn level_mut(&mut self, side: Side, px: Px) -> &mut LevelState {
+        let book_side = match side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        book_side.entry(px).or_insert_with(LevelState::default)
+    }
+
+    fn level(&self, side: Side, px: Px) -> Option<&LevelState> {
+        match side {
+            Side::Bid => self.bids.get(&px),
+            Side::Ask => self.asks.get(&px),
+        }
+    }
+
+    fn mark_dirty(&mut self, side: Side, px: Px) {
+        self.dirty_levels.insert((side, px));
+        let _unused = self.level_mut(side, px);
+    }
+
+    fn apply_new(&mut self, oid: Oid, info: OrderInfo, updates: &mut HashMap<(Side, Px, L4BookLiteAction), Sz>) {
+        let level = self.level_mut(info.side, info.px);
+        level.sum_sz = level.sum_sz + info.sz;
+        level.orders.insert(oid.clone(), info.sz);
+        self.oid_index.insert(oid, info.clone());
+        self.mark_dirty(info.side, info.px);
+        let key = (info.side, info.px, L4BookLiteAction::Add);
+        let agg = updates.get(&key).copied().unwrap_or_else(|| Sz::new(0)) + info.sz;
+        updates.insert(key, agg);
+    }
+
+    fn apply_update(
+        &mut self,
+        oid: Oid,
+        new_sz: Sz,
+        updates: &mut HashMap<(Side, Px, L4BookLiteAction), Sz>,
+    ) {
+        if let Some(mut info) = self.oid_index.get(&oid).cloned() {
+            let orig_sz = info.sz;
+            if new_sz.value() >= orig_sz.value() {
+                let delta = Sz::new(new_sz.value() - orig_sz.value());
+                if delta.value() > 0 {
+                    let level = self.level_mut(info.side, info.px);
+                    level.sum_sz = level.sum_sz + delta;
+                    if let Some(order_sz) = level.orders.get_mut(&oid) {
+                        *order_sz = new_sz;
+                    } else {
+                        level.orders.insert(oid.clone(), new_sz);
+                    }
+                    let key = (info.side, info.px, L4BookLiteAction::Add);
+                    let agg = updates.get(&key).copied().unwrap_or_else(|| Sz::new(0)) + delta;
+                    updates.insert(key, agg);
+                }
+            } else {
+                let delta = Sz::new(orig_sz.value() - new_sz.value());
+                if delta.value() > 0 {
+                    let level = self.level_mut(info.side, info.px);
+                    level.sum_sz = Sz::new(level.sum_sz.value().saturating_sub(delta.value()));
+                    if new_sz.value() == 0 {
+                        level.orders.remove(&oid);
+                    } else {
+                        level.orders.insert(oid.clone(), new_sz);
+                    }
+                    let key = (info.side, info.px, L4BookLiteAction::Remove);
+                    let agg = updates.get(&key).copied().unwrap_or_else(|| Sz::new(0)) + delta;
+                    updates.insert(key, agg);
+                }
+            }
+            info.sz = new_sz;
+            self.oid_index.insert(oid, info.clone());
+            self.mark_dirty(info.side, info.px);
+        }
+    }
+
+    fn apply_remove(&mut self, oid: Oid, updates: &mut HashMap<(Side, Px, L4BookLiteAction), Sz>) {
+        if let Some(info) = self.oid_index.remove(&oid) {
+            let level = self.level_mut(info.side, info.px);
+            level.sum_sz = Sz::new(level.sum_sz.value().saturating_sub(info.sz.value()));
+            level.orders.remove(&oid);
+            self.mark_dirty(info.side, info.px);
+            let key = (info.side, info.px, L4BookLiteAction::Remove);
+            let agg = updates.get(&key).copied().unwrap_or_else(|| Sz::new(0)) + info.sz;
+            updates.insert(key, agg);
+        }
+    }
+
+    fn snapshot(&self, coin: &Coin, time: u64, height: u64) -> L4BookLiteSnapshot {
+        let bids = self
+            .bids
+            .iter()
+            .map(|(px, level)| [px.to_str(), level.sum_sz.to_str()])
+            .collect();
+        let asks = self
+            .asks
+            .iter()
+            .map(|(px, level)| [px.to_str(), level.sum_sz.to_str()])
+            .collect();
+        L4BookLiteSnapshot { coin: coin.value(), time, height, bids, asks }
+    }
+
+    fn depth_update(
+        &mut self,
+        coin: &Coin,
+        time: u64,
+        height: u64,
+        trade_levels: &HashSet<(Side, Px)>,
+    ) -> L4BookLiteDepthUpdate {
+        let mut updates = Vec::new();
+        let mut levels: HashSet<(Side, Px)> = self.dirty_levels.drain().collect();
+        levels.extend(trade_levels.iter().copied());
+        for (side, px) in levels {
+            let level = self.level_mut(side, px);
+            let should_emit = level.sum_sz.value() != level.shadow_sum.value() || trade_levels.contains(&(side, px));
+            if should_emit {
+                updates.push(L4BookLiteDepthLevel { px: px.to_str(), sz: level.sum_sz.to_str(), side });
+                level.shadow_sum = level.sum_sz;
+            }
+        }
+        self.cleanup_empty_levels();
+        L4BookLiteDepthUpdate { coin: coin.value(), time, height, updates }
+    }
+
+    fn cleanup_empty_levels(&mut self) {
+        self.bids.retain(|_, level| !(level.sum_sz.value() == 0 && level.shadow_sum.value() == 0 && level.orders.is_empty()));
+        self.asks.retain(|_, level| !(level.sum_sz.value() == 0 && level.shadow_sum.value() == 0 && level.orders.is_empty()));
+    }
+}
+
+enum CoinWorkerCommand {
+    InitSnapshot { snapshot: Snapshot<InnerL4Order>, height: u64, time: u64 },
+    Block {
+        order_statuses: Batch<NodeDataOrderStatus>,
+        order_diffs: Batch<NodeDataOrderDiff>,
+        fills: Batch<NodeDataFill>,
+    },
+}
+
+struct CoinWorkerState {
+    coin: Coin,
+    ignore_spot: bool,
+    order_book_state: Option<OrderBookState>,
+    lite_state: BookState,
+}
+
+impl CoinWorkerState {
+    fn new(coin: Coin, ignore_spot: bool) -> Self {
+        Self { coin, ignore_spot, order_book_state: None, lite_state: BookState::default() }
+    }
+
+    fn init_from_snapshot(&mut self, snapshot: Snapshot<InnerL4Order>, height: u64, time: u64) {
+        let mut map = HashMap::new();
+        map.insert(self.coin.clone(), snapshot.clone());
+        let snapshots = Snapshots::new(map);
+        self.order_book_state = Some(OrderBookState::from_snapshot(snapshots, height, time, true, self.ignore_spot));
+        self.lite_state = BookState::from_snapshot(&snapshot);
+    }
+
+    fn l4_snapshot(&self) -> Option<TimedSnapshots> {
+        self.order_book_state.as_ref().map(OrderBookState::compute_snapshot)
+    }
+
+    fn l4_book_lite_snapshot(&self) -> Option<L4BookLiteSnapshot> {
+        self.order_book_state
+            .as_ref()
+            .map(|state| self.lite_state.snapshot(&self.coin, state.time(), state.height()))
+    }
+
+    fn apply_block(
+        &mut self,
+        order_statuses: Batch<NodeDataOrderStatus>,
+        order_diffs: Batch<NodeDataOrderDiff>,
+        fills: Batch<NodeDataFill>,
+    ) -> Result<(L4BookLiteDepthUpdate, L4BookLiteUpdates)> {
+        let time = order_statuses.block_time();
+        let height = order_statuses.block_number();
+        let mut order_map = order_statuses
+            .clone()
+            .events()
+            .into_iter()
+            .filter_map(|order_status| {
+                if order_status.is_inserted_into_book() {
+                    Some((Oid::new(order_status.order.oid), order_status))
+                } else {
+                    None
+                }
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut updates = HashMap::new();
+        for diff in order_diffs.clone().events() {
+            let oid = diff.oid();
+            let coin = diff.coin();
+            if coin.is_spot() && self.ignore_spot {
+                continue;
+            }
+            let inner_diff = match diff.diff().try_into() {
+                Ok(inner) => inner,
+                Err(_) => continue,
+            };
+            match inner_diff {
+                InnerOrderDiff::New { sz } => {
+                    if let Some(order_status) = order_map.remove(&oid) {
+                        let mut order: InnerL4Order = match order_status.try_into() {
+                            Ok(order) => order,
+                            Err(_) => continue,
+                        };
+                        order.modify_sz(sz);
+                        let info = OrderInfo { coin: order.coin.clone(), side: order.side, px: order.limit_px, sz: order.sz };
+                        self.lite_state.apply_new(oid, info, &mut updates);
+                    }
+                }
+                InnerOrderDiff::Update { new_sz, .. } => {
+                    self.lite_state.apply_update(oid, new_sz, &mut updates);
+                }
+                InnerOrderDiff::Remove => {
+                    self.lite_state.apply_remove(oid, &mut updates);
+                }
+            }
+        }
+
+        let mut trade_levels = HashSet::new();
+        for fill in fills.clone().events() {
+            let order = fill.1;
+            let px = match Px::parse_from_str(&order.px) {
+                Ok(px) => px,
+                Err(_) => continue,
+            };
+            let sz = match Sz::parse_from_str(&order.sz) {
+                Ok(sz) => sz,
+                Err(_) => continue,
+            };
+            let key = (order.side, px, L4BookLiteAction::Trade);
+            let agg = updates.get(&key).copied().unwrap_or_else(|| Sz::new(0)) + sz;
+            updates.insert(key, agg);
+            trade_levels.insert((order.side, px));
+        }
+
+        let l4_updates = {
+            let updates = updates
+                .into_iter()
+                .map(|((side, px, action), sz)| L4BookLiteUpdate { px: px.to_str(), sz: sz.to_str(), side, action })
+                .collect();
+            L4BookLiteUpdates { coin: self.coin.value(), time, height, updates }
+        };
+        let depth_update = self.lite_state.depth_update(&self.coin, time, height, &trade_levels);
+
+        if let Some(book) = self.order_book_state.as_mut() {
+            book.apply_updates(order_statuses, order_diffs)?;
+        }
+        Ok((depth_update, l4_updates))
+    }
+}
+
+struct CoinWorker {
+    coin: Coin,
+    state: Arc<Mutex<CoinWorkerState>>,
+    tx: UnboundedSender<CoinWorkerCommand>,
+}
+
+impl CoinWorker {
+    fn new(coin: Coin, ignore_spot: bool, internal_message_tx: Sender<Arc<InternalMessage>>) -> Self {
+        let (tx, rx) = unbounded_channel();
+        let state = Arc::new(Mutex::new(CoinWorkerState::new(coin.clone(), ignore_spot)));
+        Self::spawn_worker(coin.clone(), state.clone(), internal_message_tx, rx);
+        Self { coin, state, tx }
+    }
+
+    fn spawn_worker(
+        coin: Coin,
+        state: Arc<Mutex<CoinWorkerState>>,
+        internal_message_tx: Sender<Arc<InternalMessage>>,
+        mut rx: UnboundedReceiver<CoinWorkerCommand>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    CoinWorkerCommand::InitSnapshot { snapshot, height, time } => {
+                        let mut state = state.lock().await;
+                        state.init_from_snapshot(snapshot, height, time);
+                        if let Some(snapshot) = state.l4_snapshot() {
+                            let snapshot = Arc::new(InternalMessage::L4Snapshot { snapshot });
+                            let _unused = internal_message_tx.send(snapshot);
+                        }
+                    }
+                    CoinWorkerCommand::Block { order_statuses, order_diffs, fills } => {
+                        let mut state = state.lock().await;
+                        match state.apply_block(order_statuses, order_diffs, fills) {
+                            Ok((depth_update, updates)) => {
+                                let depth_update = Arc::new(InternalMessage::L4BookLiteDepthUpdates { updates: depth_update });
+                                let _unused = internal_message_tx.send(depth_update);
+                                let updates = Arc::new(InternalMessage::L4BookLiteUpdates { updates });
+                                let _unused = internal_message_tx.send(updates);
+                            }
+                            Err(err) => {
+                                warn!("Worker failed to apply block for {}: {err}", coin.value());
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
 
 fn next_snapshot_instant() -> Instant {
@@ -109,7 +454,6 @@ fn filter_l4_snapshot(snapshot: Snapshots<InnerL4Order>) -> Snapshots<InnerL4Ord
 pub(crate) async fn hl_listen(
     listener: Arc<Mutex<OrderBookListener>>,
     dir: PathBuf,
-    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
 ) -> Result<()> {
     let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
     let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
@@ -126,11 +470,6 @@ pub(crate) async fn hl_listen(
             error!("Error sending fs event to processor via channel: {err}");
         }
     })?;
-
-    let ignore_spot = {
-        let listener = listener.lock().await;
-        listener.ignore_spot
-    };
 
     // every so often, we fetch a new snapshot and the snapshot_fetch_task starts running.
     // Result is sent back along this channel (if error, we want to return to top level)
@@ -170,8 +509,7 @@ pub(crate) async fn hl_listen(
                         if should_fetch {
                             let listener = listener.clone();
                             let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                            let active_symbols = active_symbols.clone();
-                            fetch_snapshot(listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
+                            fetch_snapshot(listener, snapshot_fetch_task_tx);
                         }
                     }
                 }
@@ -203,8 +541,7 @@ pub(crate) async fn hl_listen(
                 if should_fetch {
                     let listener = listener.clone();
                     let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                    let active_symbols = active_symbols.clone();
-                    fetch_snapshot(listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
+                    fetch_snapshot(listener, snapshot_fetch_task_tx);
                 }
                 next_snapshot.as_mut().reset(next_snapshot_instant());
             }
@@ -220,8 +557,7 @@ pub(crate) async fn hl_listen(
                 if should_fetch {
                     let listener = listener.clone();
                     let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                    let active_symbols = active_symbols.clone();
-                    fetch_snapshot(listener, snapshot_fetch_task_tx, ignore_spot, active_symbols);
+                    fetch_snapshot(listener, snapshot_fetch_task_tx);
                 }
                 startup_snapshot = None;
             }
@@ -238,17 +574,13 @@ pub(crate) async fn hl_listen(
 fn fetch_snapshot(
     listener: Arc<Mutex<OrderBookListener>>,
     tx: UnboundedSender<Result<()>>,
-    ignore_spot: bool,
-    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
         let res: Result<()> = (async {
-            let state = {
-                let mut listener = listener.lock().await;
-                listener.begin_caching();
-                listener.clone_state()
-            };
+            let mut listener_guard = listener.lock().await;
+            listener_guard.begin_caching();
+            drop(listener_guard);
             // allow some updates to queue and ensure snapshot is recent
             sleep(Duration::from_millis(SNAPSHOT_CACHE_DELAY_MS)).await;
             let snapshot_bytes = process_rmp_file().await.map_err(|err| {
@@ -258,84 +590,19 @@ fn fetch_snapshot(
                 });
                 err
             })?;
-            let cache = {
-                let listener = listener.lock().await;
-                listener.clone_cache()
-            };
-            // let cache_len = cache.len();
-            let active_symbols = {
-                let active_symbols = active_symbols.lock().await;
-                active_symbols
-                    .iter()
-                    .filter(|(_, count)| **count > 0)
-                    .map(|(coin, _)| coin.clone())
-                    .collect::<HashSet<_>>()
-            };
-            // info!("Cache has {} elements", cache.len());
             let blocking_result = tokio::task::spawn_blocking(move || {
                 let mut snapshot_bytes = snapshot_bytes;
-                let mut cache = cache;
                 let (height, expected_snapshot) =
                     load_snapshots_from_slice::<InnerL4Order, (Address, L4Order)>(&mut snapshot_bytes)?;
                 let expected_snapshot = filter_l4_snapshot(expected_snapshot);
                 info!("Snapshot height received: {height}");
-                let cache_len = cache.len();
-                info!("Cache has {} elements", cache_len);
-                if let Some(mut state) = state {
-                    let local_height = state.height();
-                    if local_height >= height {
-                        return Ok(SnapshotFetchOutcome::Skipped { local_height, snapshot_height: height });
-                    }
-                    let full_cache = cache.clone();
-                    while state.height() < height {
-                        if let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                            state.apply_updates(order_statuses, order_diffs)?;
-                        } else {
-                            return Err::<SnapshotFetchOutcome, Error>("Not enough cached updates".into());
-                        }
-                    }
-                    let stored_snapshot = state.compute_snapshot().snapshot;
-                    info!("Validating snapshot");
-                    if let Err(_err) = validate_snapshot_consistency_with_hashes(
-                        &stored_snapshot,
-                        expected_snapshot.clone(),
-                        &active_symbols,
-                        ignore_spot,
-                    ) {
-                        info!("Snapshot validation failed at height {height}; reinitializing from snapshot.");
-                        let mut new_state = OrderBookState::from_snapshot(expected_snapshot, height, 0, true, ignore_spot);
-                        let mut full_cache = full_cache;
-                        while let Some((order_statuses, order_diffs)) = full_cache.pop_front() {
-                            new_state.apply_updates(order_statuses, order_diffs)?;
-                        }
-                        return Ok(SnapshotFetchOutcome::Initialize {
-                            height: new_state.height(),
-                            expected_snapshot: new_state.compute_snapshot().snapshot,
-                        });
-                    }
-                    while let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                        state.apply_updates(order_statuses, order_diffs)?;
-                    }
-                    Ok(SnapshotFetchOutcome::Validated { height })
-                } else {
-                    Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot })
-                }
+                Ok::<_, Error>((height, expected_snapshot))
             })
             .await
-            .map_err(|err| format!("Snapshot validation task join error: {err}"))?;
+            .map_err(|err| format!("Snapshot load task join error: {err}"))?;
 
             match blocking_result {
-                Ok(SnapshotFetchOutcome::Validated { height }) => {
-                    info!("Scheduled snapshot validation succeeded at height {height}");
-                    listener.lock().await.finish_validation().map_err(|err| err.into())
-                }
-                Ok(SnapshotFetchOutcome::Skipped { local_height, snapshot_height }) => {
-                    info!(
-                        "Snapshot validation skipped: snapshot height {snapshot_height} not newer than local state {local_height}."
-                    );
-                    listener.lock().await.finish_validation().map_err(|err| err.into())
-                }
-                Ok(SnapshotFetchOutcome::Initialize { height, expected_snapshot }) => {
+                Ok((height, expected_snapshot)) => {
                     info!("Initializing from snapshot at height {height}");
                     listener.lock().await.init_from_snapshot(expected_snapshot, height);
                     let result = listener.lock().await.finish_validation().map_err(|err| err.into());
@@ -344,14 +611,7 @@ fn fetch_snapshot(
                     }
                     result
                 }
-                Err(err) => {
-                    if err.to_string().contains("Not enough cached updates") {
-                        info!("Snapshot validation skipped: not enough cached updates; will retry next snapshot.");
-                        Ok(())
-                    } else {
-                        Err(err)
-                    }
-                }
+                Err(err) => Err(err),
             }
         })
         .await;
@@ -365,14 +625,11 @@ pub(crate) struct OrderBookListener {
     fill_status_file: Option<File>,
     order_status_file: Option<File>,
     order_diff_file: Option<File>,
-    // None if we haven't seen a valid snapshot yet
-    order_book_state: Option<OrderBookState>,
-    initialization_state: InitializationState,
-    last_fill: Option<u64>,
     order_diff_cache: BatchQueue<NodeDataOrderDiff>,
     order_status_cache: BatchQueue<NodeDataOrderStatus>,
+    fill_cache: BatchQueue<NodeDataFill>,
     // Only Some when we want it to collect updates
-    fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
+    fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>, Batch<NodeDataFill>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
     pending_fill_line: String,
     pending_order_status_line: String,
@@ -386,28 +643,38 @@ pub(crate) struct OrderBookListener {
     last_fill_punch_offset: u64,
     last_order_status_punch_offset: u64,
     last_order_diff_punch_offset: u64,
-    l4_book_lite: HashMap<Coin, [BTreeMap<Px, Sz>; 2]>,
-    l4_order_index: HashMap<Oid, LiteOrderInfo>,
-    last_sent_height: u64,
     validation_in_progress: bool,
     snapshot_requested: bool,
     snapshot_fetch_in_progress: bool,
+    workers: HashMap<Coin, CoinWorker>,
+    initialization_state: InitializationState,
+    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
+    known_universe: HashSet<Coin>,
 }
 
 impl OrderBookListener {
-    pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(
+        internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+        ignore_spot: bool,
+        active_symbols: Arc<Mutex<HashMap<String, usize>>>,
+    ) -> Self {
+        let mut workers = HashMap::new();
+        if let Some(tx) = &internal_message_tx {
+            let btc = Coin::new("BTC");
+            let eth = Coin::new("ETH");
+            workers.insert(btc.clone(), CoinWorker::new(btc, ignore_spot, tx.clone()));
+            workers.insert(eth.clone(), CoinWorker::new(eth, ignore_spot, tx.clone()));
+        }
         Self {
             ignore_spot,
             fill_status_file: None,
             order_status_file: None,
             order_diff_file: None,
-            order_book_state: None,
-            initialization_state: InitializationState::Uninitialized,
-            last_fill: None,
             fetched_snapshot_cache: None,
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
+            fill_cache: BatchQueue::new(),
             pending_fill_line: String::new(),
             pending_order_status_line: String::new(),
             pending_order_diff_line: String::new(),
@@ -420,234 +687,68 @@ impl OrderBookListener {
             last_fill_punch_offset: 0,
             last_order_status_punch_offset: 0,
             last_order_diff_punch_offset: 0,
-            l4_book_lite: HashMap::new(),
-            l4_order_index: HashMap::new(),
-            last_sent_height: 0,
             validation_in_progress: false,
             snapshot_requested: false,
             snapshot_fetch_in_progress: false,
+            workers,
+            initialization_state: InitializationState::Uninitialized,
+            active_symbols,
+            known_universe: HashSet::new(),
         }
     }
 
-    fn clone_state(&self) -> Option<OrderBookState> {
-        self.order_book_state.clone()
-    }
-
-    pub(crate) const fn is_ready(&self) -> bool {
-        self.order_book_state.is_some()
+    pub(crate) fn is_ready(&self) -> bool {
+        self.workers
+            .values()
+            .all(|worker| worker.state.blocking_lock().order_book_state.is_some())
     }
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
-        self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
+        self.known_universe.clone()
     }
 
     #[allow(clippy::type_complexity)]
-    // pops earliest pair of cached updates that have the same timestamp if possible
-    fn pop_cache(&mut self) -> Option<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
+    // pops earliest set of cached updates that have the same height if possible
+    fn pop_cache(
+        &mut self,
+    ) -> Option<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>, Batch<NodeDataFill>)> {
         let diff = self.order_diff_cache.front()?;
         let status = self.order_status_cache.front()?;
-        if diff.block_number() != status.block_number() {
+        let fills = self.fill_cache.front()?;
+        if diff.block_number() != status.block_number() || status.block_number() != fills.block_number() {
             return None;
         }
-        self.order_status_cache.pop_front().and_then(|t| self.order_diff_cache.pop_front().map(|s| (t, s)))
+        let statuses = self.order_status_cache.pop_front()?;
+        let diffs = self.order_diff_cache.pop_front()?;
+        let fills = self.fill_cache.pop_front()?;
+        Some((statuses, diffs, fills))
     }
 
-    fn cache_update(&mut self, order_statuses: Batch<NodeDataOrderStatus>, order_diffs: Batch<NodeDataOrderDiff>) {
+    fn cache_update(
+        &mut self,
+        order_statuses: Batch<NodeDataOrderStatus>,
+        order_diffs: Batch<NodeDataOrderDiff>,
+        fills: Batch<NodeDataFill>,
+    ) {
         if !self.validation_in_progress {
             return;
         }
         let cache = self.fetched_snapshot_cache.get_or_insert_with(VecDeque::new);
-        cache.push_back((order_statuses, order_diffs));
+        cache.push_back((order_statuses, order_diffs, fills));
         while cache.len() > FETCHED_SNAPSHOT_CACHE_LIMIT {
             cache.pop_front();
         }
     }
-
-    fn rebuild_l4_book_lite(&mut self, snapshot: &Snapshots<InnerL4Order>) {
-        self.l4_book_lite.clear();
-        self.l4_order_index.clear();
-        for (coin, book) in snapshot.as_ref() {
-            let entry = self
-                .l4_book_lite
-                .entry(coin.clone())
-                .or_insert_with(|| [BTreeMap::new(), BTreeMap::new()]);
-            for (side_idx, orders) in book.as_ref().iter().enumerate() {
-                for order in orders {
-                    let px = order.limit_px;
-                    let sz = order.sz;
-                    let book_side = &mut entry[side_idx];
-                    let new_sz = book_side.get(&px).copied().unwrap_or_else(|| Sz::new(0)) + sz;
-                    book_side.insert(px, new_sz);
-                    self.l4_order_index.insert(
-                        Oid::new(order.oid),
-                        LiteOrderInfo { coin: coin.clone(), side: order.side, px, sz },
-                    );
-                }
-            }
-        }
-    }
-
     pub(crate) fn l4_book_lite_snapshot(&self, coin: String) -> Option<L4BookLiteSnapshot> {
-        let state = self.order_book_state.as_ref()?;
-        let levels = self.l4_book_lite.get(&Coin::new(&coin))?;
-        // Sort bids in ascending order by price
-        let bids = levels[0]
-            .iter()
-            .map(|(px, sz)| [px.to_str(), sz.to_str()])
-            .collect();
-        // Sort asks in ascending order by price
-        let asks = levels[1]
-            .iter()
-            .map(|(px, sz)| [px.to_str(), sz.to_str()])
-            .collect();
-        Some(L4BookLiteSnapshot { coin, time: state.time(), height: state.height(), bids, asks })
+        let coin = Coin::new(&coin);
+        let worker = self.workers.get(&coin)?;
+        worker.state.blocking_lock().l4_book_lite_snapshot()
     }
 
-    fn apply_l4_book_lite_order(
-        &mut self,
-        info: &LiteOrderInfo,
-        sz: Sz,
-        action: L4BookLiteAction,
-        updates: &mut HashMap<(Coin, Side, Px, L4BookLiteAction), Sz>,
-    ) {
-        let entry = self
-            .l4_book_lite
-            .entry(info.coin.clone())
-            .or_insert_with(|| [BTreeMap::new(), BTreeMap::new()]);
-        let side_idx = match info.side {
-            Side::Bid => 0,
-            Side::Ask => 1,
-        };
-        let book_side = &mut entry[side_idx];
-        let current = book_side.get(&info.px).copied().unwrap_or_else(|| Sz::new(0));
-        let new_sz = if matches!(action, L4BookLiteAction::Add) {
-            current + sz
-        } else {
-            Sz::new(current.value().saturating_sub(sz.value()))
-        };
-        if new_sz.value() == 0 {
-            book_side.remove(&info.px);
-        } else {
-            book_side.insert(info.px, new_sz);
-        }
-        let key = (info.coin.clone(), info.side, info.px, action);
-        let agg = updates.get(&key).copied().unwrap_or_else(|| Sz::new(0)) + sz;
-        updates.insert(key, agg);
-    }
-
-    fn build_l4_book_lite_updates(
-        &mut self,
-        order_statuses: &Batch<NodeDataOrderStatus>,
-        order_diffs: &Batch<NodeDataOrderDiff>,
-    ) -> Vec<L4BookLiteUpdates> {
-        let mut order_map = order_statuses
-            .clone()
-            .events()
-            .into_iter()
-            .filter_map(|order_status| {
-                if order_status.is_inserted_into_book() {
-                    Some((Oid::new(order_status.order.oid), order_status))
-                } else {
-                    None
-                }
-            })
-            .collect::<HashMap<_, _>>();
-
-        let mut updates = HashMap::new();
-        let diffs = order_diffs.clone().events();
-        for diff in diffs {
-            let oid = diff.oid();
-            let coin = diff.coin();
-            if coin.is_spot() && self.ignore_spot {
-                continue;
-            }
-            let inner_diff = match diff.diff().try_into() {
-                Ok(inner) => inner,
-                Err(_) => continue,
-            };
-            match inner_diff {
-                InnerOrderDiff::New { sz } => {
-                    if let Some(order_status) = order_map.remove(&oid) {
-                        let mut order: InnerL4Order = match order_status.try_into() {
-                            Ok(order) => order,
-                            Err(_) => continue,
-                        };
-                        order.modify_sz(sz);
-                        let info = LiteOrderInfo { coin: order.coin.clone(), side: order.side, px: order.limit_px, sz: order.sz };
-                        self.l4_order_index.insert(oid, info.clone());
-                        self.apply_l4_book_lite_order(&info, info.sz, L4BookLiteAction::Add, &mut updates);
-                    }
-                }
-                InnerOrderDiff::Update { orig_sz, new_sz } => {
-                    if let Some(mut info) = self.l4_order_index.get(&oid).cloned() {
-                        if new_sz.value() >= orig_sz.value() {
-                            let delta = Sz::new(new_sz.value() - orig_sz.value());
-                            if delta.value() > 0 {
-                                self.apply_l4_book_lite_order(&info, delta, L4BookLiteAction::Add, &mut updates);
-                            }
-                        } else {
-                            let delta = Sz::new(orig_sz.value() - new_sz.value());
-                            if delta.value() > 0 {
-                                self.apply_l4_book_lite_order(&info, delta, L4BookLiteAction::Remove, &mut updates);
-                            }
-                        }
-                        info.sz = new_sz;
-                        self.l4_order_index.insert(oid, info);
-                    }
-                }
-                InnerOrderDiff::Remove => {
-                    if let Some(info) = self.l4_order_index.remove(&oid) {
-                        self.apply_l4_book_lite_order(&info, info.sz, L4BookLiteAction::Remove, &mut updates);
-                    }
-                }
-            }
-        }
-
-        let mut by_coin: HashMap<Coin, Vec<L4BookLiteUpdate>> = HashMap::new();
-        for ((coin, side, px, action), sz) in updates {
-            by_coin
-                .entry(coin)
-                .or_insert_with(Vec::new)
-                .push(L4BookLiteUpdate { px: px.to_str(), sz: sz.to_str(), side, action });
-        }
-        let time = order_statuses.block_time();
-        let height = order_statuses.block_number();
-        by_coin
-            .into_iter()
-            .map(|(coin, updates)| L4BookLiteUpdates { coin: coin.value(), time, height, updates })
-            .collect()
-    }
-
-    fn build_l4_book_lite_trade_updates(&self, batch: &Batch<NodeDataFill>) -> Vec<L4BookLiteUpdates> {
-        let mut by_coin: HashMap<Coin, HashMap<(Side, Px, L4BookLiteAction), Sz>> = HashMap::new();
-        for fill in batch.clone().events() {
-            let order = fill.1;
-            let px = match Px::parse_from_str(&order.px) {
-                Ok(px) => px,
-                Err(_) => continue,
-            };
-            let sz = match Sz::parse_from_str(&order.sz) {
-                Ok(sz) => sz,
-                Err(_) => continue,
-            };
-            let coin = Coin::new(&order.coin);
-            let entry = by_coin.entry(coin).or_insert_with(HashMap::new);
-            let key = (order.side, px, L4BookLiteAction::Trade);
-            let agg = entry.get(&key).copied().unwrap_or_else(|| Sz::new(0)) + sz;
-            entry.insert(key, agg);
-        }
-        let time = batch.block_time();
-        let height = batch.block_number();
-        by_coin
-            .into_iter()
-            .map(|(coin, updates)| {
-                let updates = updates
-                    .into_iter()
-                    .map(|((side, px, action), sz)| L4BookLiteUpdate { px: px.to_str(), sz: sz.to_str(), side, action })
-                    .collect();
-                L4BookLiteUpdates { coin: coin.value(), time, height, updates }
-            })
-            .collect()
+    pub(crate) fn l4_snapshot_for_coin(&self, coin: &str) -> Option<TimedSnapshots> {
+        let coin = Coin::new(coin);
+        let worker = self.workers.get(&coin)?;
+        worker.state.blocking_lock().l4_snapshot()
     }
 
     fn broadcast_update(&self, order_statuses: Batch<NodeDataOrderStatus>, order_diffs: Batch<NodeDataOrderDiff>) {
@@ -663,127 +764,75 @@ impl OrderBookListener {
         }
     }
 
+    fn broadcast_fills(&self, fills: Batch<NodeDataFill>) {
+        if let Some(tx) = &self.internal_message_tx {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let snapshot = Arc::new(InternalMessage::Fills { batch: fills });
+                let _unused = tx.send(snapshot);
+            });
+        }
+    }
+
     fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
         match updates {
             EventBatch::Orders(batch) => {
+                for order in batch.events_ref() {
+                    self.known_universe.insert(Coin::new(&order.order.coin));
+                }
                 self.order_status_cache.push(batch);
             }
             EventBatch::BookDiffs(batch) => {
+                for diff in batch.events_ref() {
+                    self.known_universe.insert(diff.coin());
+                }
                 self.order_diff_cache.push(batch);
             }
             EventBatch::Fills(batch) => {
-                if self.last_fill.is_none_or(|height| height < batch.block_number()) {
-                    // send fill updates if we received a new update
-                    if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        let batch = batch.clone();
-                        tokio::spawn(async move {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch });
-                            let _unused = tx.send(snapshot);
-                        });
-                    }
+                for fill in batch.events_ref() {
+                    self.known_universe.insert(Coin::new(&fill.1.coin));
                 }
-                // Only send l4BookLite trade updates if we have a baseline state.
-                // This ensures consistency with add/remove updates which also require baseline state.
-                // During Uninitialized state, we don't send any l4BookLite updates.
-                // During Initializing/Initialized states, we send both trade and add/remove updates.
-                if self.initialization_state != InitializationState::Uninitialized {
-                    let lite_updates = self.build_l4_book_lite_trade_updates(&batch);
-                    for updates in lite_updates {
-                        if let Some(tx) = &self.internal_message_tx {
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                let update = Arc::new(InternalMessage::L4BookLiteUpdates { updates });
-                                let _unused = tx.send(update);
-                            });
-                        }
-                    }
-                }
+                self.fill_cache.push(batch);
             }
         }
-        
-        // Hot path optimization: early return for uninitialized/initializing states
-        match self.initialization_state {
-            InitializationState::Uninitialized => return Ok(()),
-            InitializationState::Initializing => {
-                // During initialization, accumulate updates in fetched_snapshot_cache if validation is in progress
-                if self.validation_in_progress {
-                    while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                        let filtered_statuses =
-                            order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
-                        let filtered_diffs =
-                            order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
-                        let lite_updates = self.build_l4_book_lite_updates(&filtered_statuses, &filtered_diffs);
-                        self.cache_update(filtered_statuses, filtered_diffs);
-                        self.broadcast_update(order_statuses, order_diffs);
-                        for updates in lite_updates {
-                            if let Some(tx) = &self.internal_message_tx {
-                                let tx = tx.clone();
-                                tokio::spawn(async move {
-                                    let update = Arc::new(InternalMessage::L4BookLiteUpdates { updates });
-                                    let _unused = tx.send(update);
-                                });
-                            }
-                        }
-                    }
-                }
-                return Ok(());
+        while let Some((order_statuses, order_diffs, fills)) = self.pop_cache() {
+            let active_coins: HashSet<String> = self
+                .active_symbols
+                .blocking_lock()
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(coin, _)| coin.clone())
+                .collect();
+
+            let filtered_statuses = order_statuses.filter_by_coin(|coin| active_coins.contains(coin));
+            let filtered_diffs = order_diffs.filter_by_coin(|coin| active_coins.contains(coin));
+            let filtered_fills = fills.filter_by_coin(|coin| active_coins.contains(coin));
+            if !filtered_statuses.is_empty() || !filtered_diffs.is_empty() {
+                self.broadcast_update(filtered_statuses, filtered_diffs);
             }
-            InitializationState::Initialized => {
-                // Fast path: process updates normally
+            if !filtered_fills.is_empty() {
+                self.broadcast_fills(filtered_fills);
             }
-        }
-        
-        // Initialized state processing
-        if self.validation_in_progress {
-            while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                let filtered_statuses =
+
+            if self.validation_in_progress {
+                let cached_statuses =
                     order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
-                let filtered_diffs =
-                    order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
-                let lite_updates = self.build_l4_book_lite_updates(&filtered_statuses, &filtered_diffs);
-                self.cache_update(filtered_statuses, filtered_diffs);
-                self.broadcast_update(order_statuses, order_diffs);
-                for updates in lite_updates {
-                    if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let update = Arc::new(InternalMessage::L4BookLiteUpdates { updates });
-                            let _unused = tx.send(update);
-                        });
-                    }
-                }
+                let cached_diffs = order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+                let cached_fills = fills.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+                self.cache_update(cached_statuses, cached_diffs, cached_fills);
+                continue;
             }
-        } else {
-            while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-                // Block continuity detection
-                if let Some(state) = &self.order_book_state {
-                    let expected = state.height() + 1;
-                    let height = order_statuses.block_number();
-                    if height > expected {
-                        error!("Block height gap detected: expected {expected}, got {height}. Triggering full update.");
-                        self.reset_state_for_snapshot();
-                        return Ok(());
-                    }
-                }
-                let filtered_statuses =
-                    order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
-                let filtered_diffs =
-                    order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
-                let lite_updates = self.build_l4_book_lite_updates(&filtered_statuses, &filtered_diffs);
-                self.order_book_state
-                    .as_mut()
-                    .map(|book| book.apply_updates(filtered_statuses, filtered_diffs))
-                    .transpose()?;
-                self.broadcast_update(order_statuses, order_diffs);
-                for updates in lite_updates {
-                    if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let update = Arc::new(InternalMessage::L4BookLiteUpdates { updates });
-                            let _unused = tx.send(update);
-                        });
-                    }
+
+            if self.initialization_state != InitializationState::Initialized {
+                continue;
+            }
+
+            for coin in [Coin::new("BTC"), Coin::new("ETH")] {
+                if let Some(worker) = self.workers.get(&coin) {
+                    let statuses = order_statuses.filter_by_coin(|c| c == coin.value());
+                    let diffs = order_diffs.filter_by_coin(|c| c == coin.value());
+                    let fills = fills.filter_by_coin(|c| c == coin.value());
+                    let _unused = worker.tx.send(CoinWorkerCommand::Block { order_statuses: statuses, order_diffs: diffs, fills });
                 }
             }
         }
@@ -802,38 +851,41 @@ impl OrderBookListener {
             return;
         }
         
-        // Transfer any accumulated updates from order_status_cache/order_diff_cache to fetched_snapshot_cache
-        while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-            let order_statuses =
-                order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+        // Transfer any accumulated updates from order_status_cache/order_diff_cache/fill_cache to fetched_snapshot_cache
+        while let Some((order_statuses, order_diffs, fills)) = self.pop_cache() {
+            let order_statuses = order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
             let order_diffs = order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
+            let fills = fills.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
             #[allow(clippy::unwrap_used)]
-            self.fetched_snapshot_cache.as_mut().unwrap().push_back((order_statuses, order_diffs));
+            self.fetched_snapshot_cache.as_mut().unwrap().push_back((order_statuses, order_diffs, fills));
         }
-    }
-
-    fn clone_cache(&self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
-        self.fetched_snapshot_cache.clone().unwrap_or_default()
     }
 
     fn finish_validation(&mut self) -> Result<()> {
         self.validation_in_progress = false;
         let mut queued = self.fetched_snapshot_cache.take().unwrap_or_default();
-        while let Some((order_statuses, order_diffs)) = queued.pop_front() {
-            self.order_book_state.as_mut().map(|book| book.apply_updates(order_statuses, order_diffs)).transpose()?;
+        while let Some((order_statuses, order_diffs, fills)) = queued.pop_front() {
+            for coin in [Coin::new("BTC"), Coin::new("ETH")] {
+                if let Some(worker) = self.workers.get(&coin) {
+                    let statuses = order_statuses.filter_by_coin(|c| c == coin.value());
+                    let diffs = order_diffs.filter_by_coin(|c| c == coin.value());
+                    let fills = fills.filter_by_coin(|c| c == coin.value());
+                    if !(statuses.is_empty() && diffs.is_empty() && fills.is_empty()) {
+                        let _unused = worker.tx.send(CoinWorkerCommand::Block { order_statuses: statuses, order_diffs: diffs, fills });
+                    }
+                }
+            }
         }
         Ok(())
     }
 
     fn broadcast_l4_snapshot(&mut self) {
-        let snapshot = self.compute_snapshot();
-        if let Some(snapshot) = snapshot {
-            if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
+        if let Some(tx) = &self.internal_message_tx {
+            for worker in self.workers.values() {
+                if let Some(snapshot) = worker.state.blocking_lock().l4_snapshot() {
                     let snapshot = Arc::new(InternalMessage::L4Snapshot { snapshot });
                     let _unused = tx.send(snapshot);
-                });
+                }
             }
         }
     }
@@ -841,64 +893,22 @@ impl OrderBookListener {
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) {
         info!("Initializing from snapshot at height {height}");
         let snapshot = filter_l4_snapshot(snapshot);
-        self.rebuild_l4_book_lite(&snapshot);
-        let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
-        
-        // Apply only blocks that are newer than snapshot
-        let mut applied_count = 0;
-        let mut retry = false;
-        while let Some((order_statuses, order_diffs)) = self.pop_cache() {
-            let order_statuses =
-                order_statuses.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
-            let order_diffs = order_diffs.filter_by_coin(|coin| Subscription::is_l4_snapshot_coin(coin));
-            let _unused = self.build_l4_book_lite_updates(&order_statuses, &order_diffs);
-            let block_height = order_statuses.block_number();
-            
-            // Skip blocks older than or equal to snapshot
-            if block_height <= height {
-                info!("Skipping block {block_height} (snapshot is at {height})");
-                continue;
+        for (coin, book) in snapshot.as_ref() {
+            if let Some(worker) = self.workers.get(coin) {
+                let _unused = worker.tx.send(CoinWorkerCommand::InitSnapshot {
+                    snapshot: book.clone(),
+                    height,
+                    time: 0,
+                });
             }
-            
-            // Check for block continuity
-            let expected_height = new_order_book.height() + 1;
-            if block_height > expected_height {
-                info!(
-                    "Block height gap detected: expected {expected_height}, got {block_height}. Discarding accumulated blocks and waiting for next snapshot."
-                );
-                retry = true;
-                break;
-            }
-            
-            if new_order_book.apply_updates(order_statuses, order_diffs).is_err() {
-                info!(
-                    "Failed to apply updates to this book (likely missing older updates). Waiting for next snapshot."
-                );
-                retry = true;
-                break;
-            }
-            applied_count += 1;
         }
-        
-        if !retry {
-            let final_height = new_order_book.height();
-            self.order_book_state = Some(new_order_book);
-            self.initialization_state = InitializationState::Initialized;
-            info!("Order book ready at height {} (applied {} cached blocks)", final_height, applied_count);
-        } else {
-            // Clear caches and wait for next snapshot
-            self.clear_caches();
-        }
-    }
-
-    // forcibly grab current snapshot
-    pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
-        self.order_book_state.as_mut().map(|o| o.compute_snapshot())
+        self.initialization_state = InitializationState::Initialized;
+        info!("Order book ready at height {height}");
     }
 
     // prevent snapshotting mutiple times at the same height
-    fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
-        self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
+    fn l2_snapshots(&mut self, _prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
+        None
     }
 
     fn pending_line_mut(&mut self, event_source: EventSource) -> &mut String {
@@ -1028,19 +1038,21 @@ impl OrderBookListener {
     fn clear_caches(&mut self) {
         self.order_status_cache = BatchQueue::new();
         self.order_diff_cache = BatchQueue::new();
+        self.fill_cache = BatchQueue::new();
     }
 
     fn reset_state_for_snapshot(&mut self) {
-        self.order_book_state = None;
         self.initialization_state = InitializationState::Uninitialized;
         self.clear_caches();
         self.fetched_snapshot_cache = None;
-        self.l4_book_lite.clear();
-        self.l4_order_index.clear();
+        for worker in self.workers.values() {
+            let mut state = worker.state.blocking_lock();
+            state.order_book_state = None;
+            state.lite_state = BookState::default();
+        }
         // Keep validation_in_progress as false since we're starting fresh
         // It will be set to true when begin_caching() is called during next snapshot fetch
         self.validation_in_progress = false;
-        self.last_sent_height = 0;
         self.request_snapshot();
     }
 
@@ -1232,7 +1244,9 @@ impl DirectoryListener for OrderBookListener {
                     // if we run into a serialization error (hitting EOF), just return to last line.
                     error!(
                         "{event_source} serialization error {err}, height: {:?}, line: {:?}",
-                        self.order_book_state.as_ref().map(OrderBookState::height),
+                        self.workers
+                            .get(&Coin::new("BTC"))
+                            .and_then(|worker| worker.state.blocking_lock().order_book_state.as_ref().map(OrderBookState::height)),
                         line.chars().take(100).collect::<String>(),
                     );
                     *self.pending_line_mut(event_source) = line.to_string();
@@ -1292,6 +1306,7 @@ pub(crate) enum InternalMessage {
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
     L4Snapshot { snapshot: TimedSnapshots },
     L4BookLiteUpdates { updates: L4BookLiteUpdates },
+    L4BookLiteDepthUpdates { updates: L4BookLiteDepthUpdate },
 }
 
 #[derive(Eq, PartialEq, Hash)]

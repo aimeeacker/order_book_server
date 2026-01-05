@@ -132,6 +132,23 @@ pub(crate) struct L4BookLiteUpdate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct L4BookLiteDepthLevel {
+    pub px: String,
+    pub sz: String,
+    pub side: Side,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct L4BookLiteDepthUpdate {
+    pub coin: String,
+    pub time: u64,
+    pub height: u64,
+    pub updates: Vec<L4BookLiteDepthLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct L4BookLiteSnapshot {
     pub coin: String,
     pub time: u64,

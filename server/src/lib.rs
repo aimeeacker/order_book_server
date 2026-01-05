@@ -1,4 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![allow(dead_code)]
 mod listeners;
 mod order_book;
 mod prelude;
