@@ -684,6 +684,7 @@ pub(crate) struct OrderBookListener {
     initialization_state: InitializationState,
     active_symbols: Arc<StdMutex<HashMap<String, usize>>>,
     known_universe: HashSet<Coin>,
+    last_cache_log: Option<String>,
 }
 
 impl OrderBookListener {
@@ -730,6 +731,7 @@ impl OrderBookListener {
             initialization_state: InitializationState::Uninitialized,
             active_symbols,
             known_universe: HashSet::new(),
+            last_cache_log: None,
         }
     }
 
@@ -862,6 +864,7 @@ impl OrderBookListener {
                 self.fill_cache.insert(height, batch);
             }
         }
+        self.log_cache_state();
         while let Some((order_statuses, order_diffs, fills)) = self.pop_cache() {
             let height = order_statuses.block_number();
             let active_coins: HashSet<String> = self
@@ -907,6 +910,27 @@ impl OrderBookListener {
             self.track_processed_height(height);
         }
         Ok(())
+    }
+
+    fn log_cache_state(&mut self) {
+        let status = self.order_status_cache.front().map(|batch| batch.block_number());
+        let diff = self.order_diff_cache.front().map(|batch| batch.block_number());
+        let message = match (status, diff) {
+            (Some(status), Some(diff)) if status != diff => {
+                Some(format!("Cache mismatch: order_statuses height {status} vs order_diffs height {diff}"))
+            }
+            (Some(status), None) => Some(format!("Cache waiting for order_diffs at height {status}")),
+            (None, Some(diff)) => Some(format!("Cache waiting for order_statuses at height {diff}")),
+            _ => None,
+        };
+        if let Some(message) = message {
+            if self.last_cache_log.as_ref() != Some(&message) {
+                debug!("{message}");
+                self.last_cache_log = Some(message);
+            }
+        } else {
+            self.last_cache_log = None;
+        }
     }
 
     fn begin_caching(&mut self) {
