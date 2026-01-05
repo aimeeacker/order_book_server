@@ -129,6 +129,15 @@ impl<E> Batch<E> {
         self.events
     }
 
+    pub(crate) fn empty_like<T>(other: &Batch<T>) -> Self {
+        Self {
+            local_time: other.local_time,
+            block_time: other.block_time,
+            block_number: other.block_number,
+            events: Vec::new(),
+        }
+    }
+
     pub(crate) const fn events_ref(&self) -> &Vec<E> {
         &self.events
     }

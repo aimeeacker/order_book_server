@@ -50,6 +50,7 @@ const FILE_PUNCH_KEEP_BYTES: u64 = 15 * 1024 * 1024;
 const FILE_PUNCH_ALIGNMENT_BYTES: u64 = 4096;
 const FILE_PUNCH_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const ENABLE_L2_SNAPSHOTS: bool = false;
+const PROCESSED_HEIGHT_LIMIT: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitializationState {
@@ -248,6 +249,7 @@ enum CoinWorkerCommand {
         order_diffs: Batch<NodeDataOrderDiff>,
         fills: Batch<NodeDataFill>,
     },
+    TradeBatch { fills: Batch<NodeDataFill> },
 }
 
 struct CoinWorkerState {
@@ -333,6 +335,28 @@ impl CoinWorkerState {
             }
         }
 
+        let (trade_levels, updates) = self.apply_trade_updates(fills, updates);
+
+        let l4_updates = {
+            let updates = updates
+                .into_iter()
+                .map(|((side, px, action), sz)| L4BookLiteUpdate { px: px.to_str(), sz: sz.to_str(), side, action })
+                .collect();
+            L4BookLiteUpdates { coin: self.coin.value(), time, height, updates }
+        };
+        let depth_update = self.lite_state.depth_update(&self.coin, time, height, &trade_levels);
+
+        if let Some(book) = self.order_book_state.as_mut() {
+            book.apply_updates(order_statuses, order_diffs)?;
+        }
+        Ok((depth_update, l4_updates))
+    }
+
+    fn apply_trade_updates(
+        &mut self,
+        fills: Batch<NodeDataFill>,
+        mut updates: HashMap<(Side, Px, L4BookLiteAction), Sz>,
+    ) -> (HashSet<(Side, Px)>, HashMap<(Side, Px, L4BookLiteAction), Sz>) {
         let mut trade_levels = HashSet::new();
         for fill in fills.clone().events() {
             let order = fill.1;
@@ -349,20 +373,20 @@ impl CoinWorkerState {
             updates.insert(key, agg);
             trade_levels.insert((order.side, px));
         }
+        (trade_levels, updates)
+    }
 
-        let l4_updates = {
-            let updates = updates
-                .into_iter()
-                .map(|((side, px, action), sz)| L4BookLiteUpdate { px: px.to_str(), sz: sz.to_str(), side, action })
-                .collect();
-            L4BookLiteUpdates { coin: self.coin.value(), time, height, updates }
-        };
+    fn apply_trade_batch(&mut self, fills: Batch<NodeDataFill>) -> (L4BookLiteDepthUpdate, L4BookLiteUpdates) {
+        let time = fills.block_time();
+        let height = fills.block_number();
+        let (trade_levels, updates) = self.apply_trade_updates(fills, HashMap::new());
+        let updates = updates
+            .into_iter()
+            .map(|((side, px, action), sz)| L4BookLiteUpdate { px: px.to_str(), sz: sz.to_str(), side, action })
+            .collect();
+        let l4_updates = L4BookLiteUpdates { coin: self.coin.value(), time, height, updates };
         let depth_update = self.lite_state.depth_update(&self.coin, time, height, &trade_levels);
-
-        if let Some(book) = self.order_book_state.as_mut() {
-            book.apply_updates(order_statuses, order_diffs)?;
-        }
-        Ok((depth_update, l4_updates))
+        (depth_update, l4_updates)
     }
 }
 
@@ -410,6 +434,14 @@ impl CoinWorker {
                                 warn!("Worker failed to apply block for {}: {err}", coin.value());
                             }
                         }
+                    }
+                    CoinWorkerCommand::TradeBatch { fills } => {
+                        let mut state = state.lock().expect("coin worker state lock");
+                        let (depth_update, updates) = state.apply_trade_batch(fills);
+                        let depth_update = Arc::new(InternalMessage::L4BookLiteDepthUpdates { updates: depth_update });
+                        let _unused = internal_message_tx.send(depth_update);
+                        let updates = Arc::new(InternalMessage::L4BookLiteUpdates { updates });
+                        let _unused = internal_message_tx.send(updates);
                     }
                 }
             }
@@ -627,7 +659,9 @@ pub(crate) struct OrderBookListener {
     order_diff_file: Option<File>,
     order_diff_cache: BatchQueue<NodeDataOrderDiff>,
     order_status_cache: BatchQueue<NodeDataOrderStatus>,
-    fill_cache: BatchQueue<NodeDataFill>,
+    fill_cache: HashMap<u64, Batch<NodeDataFill>>,
+    processed_heights: VecDeque<u64>,
+    processed_height_set: HashSet<u64>,
     // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>, Batch<NodeDataFill>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
@@ -674,7 +708,9 @@ impl OrderBookListener {
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
-            fill_cache: BatchQueue::new(),
+            fill_cache: HashMap::new(),
+            processed_heights: VecDeque::new(),
+            processed_height_set: HashSet::new(),
             pending_fill_line: String::new(),
             pending_order_status_line: String::new(),
             pending_order_diff_line: String::new(),
@@ -714,13 +750,15 @@ impl OrderBookListener {
     ) -> Option<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>, Batch<NodeDataFill>)> {
         let diff = self.order_diff_cache.front()?;
         let status = self.order_status_cache.front()?;
-        let fills = self.fill_cache.front()?;
-        if diff.block_number() != status.block_number() || status.block_number() != fills.block_number() {
+        if diff.block_number() != status.block_number() {
             return None;
         }
         let statuses = self.order_status_cache.pop_front()?;
         let diffs = self.order_diff_cache.pop_front()?;
-        let fills = self.fill_cache.pop_front()?;
+        let fills = self
+            .fill_cache
+            .remove(&statuses.block_number())
+            .unwrap_or_else(|| Batch::empty_like(&statuses));
         Some((statuses, diffs, fills))
     }
 
@@ -774,6 +812,31 @@ impl OrderBookListener {
         }
     }
 
+    fn dispatch_trade_batches(&self, fills: Batch<NodeDataFill>) {
+        if self.initialization_state != InitializationState::Initialized || self.validation_in_progress {
+            return;
+        }
+        for coin in [Coin::new("BTC"), Coin::new("ETH")] {
+            if let Some(worker) = self.workers.get(&coin) {
+                let coin_fills = fills.filter_by_coin(|c| c == coin.value());
+                if !coin_fills.is_empty() {
+                    let _unused = worker.tx.send(CoinWorkerCommand::TradeBatch { fills: coin_fills });
+                }
+            }
+        }
+    }
+
+    fn track_processed_height(&mut self, height: u64) {
+        if self.processed_height_set.insert(height) {
+            self.processed_heights.push_back(height);
+            if self.processed_heights.len() > PROCESSED_HEIGHT_LIMIT {
+                if let Some(old) = self.processed_heights.pop_front() {
+                    self.processed_height_set.remove(&old);
+                }
+            }
+        }
+    }
+
     fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
         match updates {
             EventBatch::Orders(batch) => {
@@ -789,13 +852,18 @@ impl OrderBookListener {
                 self.order_diff_cache.push(batch);
             }
             EventBatch::Fills(batch) => {
+                let height = batch.block_number();
                 for fill in batch.events_ref() {
                     self.known_universe.insert(Coin::new(&fill.1.coin));
                 }
-                self.fill_cache.push(batch);
+                if self.processed_height_set.contains(&height) {
+                    self.dispatch_trade_batches(batch.clone());
+                }
+                self.fill_cache.insert(height, batch);
             }
         }
         while let Some((order_statuses, order_diffs, fills)) = self.pop_cache() {
+            let height = order_statuses.block_number();
             let active_coins: HashSet<String> = self
                 .active_symbols
                 .lock()
@@ -836,6 +904,7 @@ impl OrderBookListener {
                     let _unused = worker.tx.send(CoinWorkerCommand::Block { order_statuses: statuses, order_diffs: diffs, fills });
                 }
             }
+            self.track_processed_height(height);
         }
         Ok(())
     }
@@ -1039,7 +1108,9 @@ impl OrderBookListener {
     fn clear_caches(&mut self) {
         self.order_status_cache = BatchQueue::new();
         self.order_diff_cache = BatchQueue::new();
-        self.fill_cache = BatchQueue::new();
+        self.fill_cache = HashMap::new();
+        self.processed_heights.clear();
+        self.processed_height_set.clear();
     }
 
     fn reset_state_for_snapshot(&mut self) {
