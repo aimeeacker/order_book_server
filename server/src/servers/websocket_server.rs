@@ -18,13 +18,13 @@ use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
     env::home_dir,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 use tokio::select;
 use tokio::{
     net::TcpListener,
     sync::{
-        Mutex,
+        Mutex as TokioMutex,
         broadcast::{Sender, channel},
     },
 };
@@ -39,7 +39,7 @@ enum SubscriptionResponseData {
 
 pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_level: u32) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
-    let active_symbols = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+    let active_symbols = Arc::new(StdMutex::new(HashMap::<String, usize>::new()));
 
     // Central task: listen to messages and forward them for distribution
     let home_dir = home_dir().ok_or("Could not find home directory")?;
@@ -47,7 +47,7 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
         let internal_message_tx = internal_message_tx.clone();
         OrderBookListener::new(Some(internal_message_tx), ignore_spot, active_symbols.clone())
     };
-    let listener = Arc::new(Mutex::new(listener));
+    let listener = Arc::new(TokioMutex::new(listener));
     {
         let listener = listener.clone();
         tokio::spawn(async move {
@@ -92,10 +92,10 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
 fn ws_handler(
     incoming: yawc::IncomingUpgrade,
     internal_message_tx: Sender<Arc<InternalMessage>>,
-    listener: Arc<Mutex<OrderBookListener>>,
+    listener: Arc<TokioMutex<OrderBookListener>>,
     ignore_spot: bool,
     websocket_opts: yawc::Options,
-    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
+    active_symbols: Arc<StdMutex<HashMap<String, usize>>>,
 ) -> impl IntoResponse {
     let (resp, fut) = incoming.upgrade(websocket_opts).unwrap();
     tokio::spawn(async move {
@@ -116,9 +116,9 @@ fn ws_handler(
 async fn handle_socket(
     mut socket: WebSocket,
     internal_message_tx: Sender<Arc<InternalMessage>>,
-    listener: Arc<Mutex<OrderBookListener>>,
+    listener: Arc<TokioMutex<OrderBookListener>>,
     ignore_spot: bool,
-    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
+    active_symbols: Arc<StdMutex<HashMap<String, usize>>>,
 ) {
     let mut internal_message_rx = internal_message_tx.subscribe();
     let mut manager = SubscriptionManager::default();
@@ -244,8 +244,8 @@ async fn receive_client_message(
     manager: &mut SubscriptionManager,
     client_message: ClientMessage,
     universe: &HashSet<String>,
-    listener: Arc<Mutex<OrderBookListener>>,
-    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
+    listener: Arc<TokioMutex<OrderBookListener>>,
+    active_symbols: Arc<StdMutex<HashMap<String, usize>>>,
 ) {
     let subscription = match &client_message {
         ClientMessage::Unsubscribe { subscription, .. }
@@ -336,8 +336,8 @@ async fn receive_client_message(
     }
 }
 
-async fn update_active_symbols(active_symbols: Arc<Mutex<HashMap<String, usize>>>, coin: String, is_subscribe: bool) {
-    let mut active_symbols = active_symbols.lock().await;
+async fn update_active_symbols(active_symbols: Arc<StdMutex<HashMap<String, usize>>>, coin: String, is_subscribe: bool) {
+    let mut active_symbols = active_symbols.lock().expect("active_symbols lock");
     let entry = active_symbols.entry(coin).or_insert(0);
     if is_subscribe {
         *entry = entry.saturating_add(1);
@@ -346,7 +346,7 @@ async fn update_active_symbols(active_symbols: Arc<Mutex<HashMap<String, usize>>
     }
 }
 
-async fn prune_active_symbols(manager: &mut SubscriptionManager, active_symbols: &Arc<Mutex<HashMap<String, usize>>>) {
+async fn prune_active_symbols(manager: &mut SubscriptionManager, active_symbols: &Arc<StdMutex<HashMap<String, usize>>>) {
     let subscriptions = manager.subscriptions().clone();
     for subscription in subscriptions {
         if let Some(coin) = subscription_coin(&subscription) {
@@ -601,7 +601,7 @@ async fn send_ws_data_from_l4_book_lite_depth_updates(
 
 impl Subscription {
     // snapshots that begin a stream
-    async fn handle_immediate_snapshot(&self, listener: Arc<Mutex<OrderBookListener>>) -> Result<Option<ServerResponse>> {
+    async fn handle_immediate_snapshot(&self, listener: Arc<TokioMutex<OrderBookListener>>) -> Result<Option<ServerResponse>> {
         if let Self::L4Book { coin } = self {
             if !Self::is_l4_snapshot_coin(coin) {
                 return Ok(None);

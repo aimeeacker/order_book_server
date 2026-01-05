@@ -26,12 +26,12 @@ use std::{
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     os::unix::{fs::MetadataExt, io::AsRawFd},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 use tokio::{
     sync::{
-        Mutex,
+        Mutex as TokioMutex,
         broadcast::Sender,
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     },
@@ -368,21 +368,21 @@ impl CoinWorkerState {
 
 struct CoinWorker {
     coin: Coin,
-    state: Arc<Mutex<CoinWorkerState>>,
+    state: Arc<StdMutex<CoinWorkerState>>,
     tx: UnboundedSender<CoinWorkerCommand>,
 }
 
 impl CoinWorker {
     fn new(coin: Coin, ignore_spot: bool, internal_message_tx: Sender<Arc<InternalMessage>>) -> Self {
         let (tx, rx) = unbounded_channel();
-        let state = Arc::new(Mutex::new(CoinWorkerState::new(coin.clone(), ignore_spot)));
+        let state = Arc::new(StdMutex::new(CoinWorkerState::new(coin.clone(), ignore_spot)));
         Self::spawn_worker(coin.clone(), state.clone(), internal_message_tx, rx);
         Self { coin, state, tx }
     }
 
     fn spawn_worker(
         coin: Coin,
-        state: Arc<Mutex<CoinWorkerState>>,
+        state: Arc<StdMutex<CoinWorkerState>>,
         internal_message_tx: Sender<Arc<InternalMessage>>,
         mut rx: UnboundedReceiver<CoinWorkerCommand>,
     ) {
@@ -390,7 +390,7 @@ impl CoinWorker {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
                     CoinWorkerCommand::InitSnapshot { snapshot, height, time } => {
-                        let mut state = state.lock().await;
+                        let mut state = state.lock().expect("coin worker state lock");
                         state.init_from_snapshot(snapshot, height, time);
                         if let Some(snapshot) = state.l4_snapshot() {
                             let snapshot = Arc::new(InternalMessage::L4Snapshot { snapshot });
@@ -398,7 +398,7 @@ impl CoinWorker {
                         }
                     }
                     CoinWorkerCommand::Block { order_statuses, order_diffs, fills } => {
-                        let mut state = state.lock().await;
+                        let mut state = state.lock().expect("coin worker state lock");
                         match state.apply_block(order_statuses, order_diffs, fills) {
                             Ok((depth_update, updates)) => {
                                 let depth_update = Arc::new(InternalMessage::L4BookLiteDepthUpdates { updates: depth_update });
@@ -452,7 +452,7 @@ fn filter_l4_snapshot(snapshot: Snapshots<InnerL4Order>) -> Snapshots<InnerL4Ord
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
 pub(crate) async fn hl_listen(
-    listener: Arc<Mutex<OrderBookListener>>,
+    listener: Arc<TokioMutex<OrderBookListener>>,
     dir: PathBuf,
 ) -> Result<()> {
     let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
@@ -572,7 +572,7 @@ pub(crate) async fn hl_listen(
 }
 
 fn fetch_snapshot(
-    listener: Arc<Mutex<OrderBookListener>>,
+    listener: Arc<TokioMutex<OrderBookListener>>,
     tx: UnboundedSender<Result<()>>,
 ) {
     let tx = tx.clone();
@@ -648,7 +648,7 @@ pub(crate) struct OrderBookListener {
     snapshot_fetch_in_progress: bool,
     workers: HashMap<Coin, CoinWorker>,
     initialization_state: InitializationState,
-    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
+    active_symbols: Arc<StdMutex<HashMap<String, usize>>>,
     known_universe: HashSet<Coin>,
 }
 
@@ -656,7 +656,7 @@ impl OrderBookListener {
     pub(crate) fn new(
         internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
         ignore_spot: bool,
-        active_symbols: Arc<Mutex<HashMap<String, usize>>>,
+        active_symbols: Arc<StdMutex<HashMap<String, usize>>>,
     ) -> Self {
         let mut workers = HashMap::new();
         if let Some(tx) = &internal_message_tx {
@@ -700,7 +700,7 @@ impl OrderBookListener {
     pub(crate) fn is_ready(&self) -> bool {
         self.workers
             .values()
-            .all(|worker| worker.state.blocking_lock().order_book_state.is_some())
+            .all(|worker| worker.state.lock().expect("coin worker state lock").order_book_state.is_some())
     }
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
@@ -742,13 +742,13 @@ impl OrderBookListener {
     pub(crate) fn l4_book_lite_snapshot(&self, coin: String) -> Option<L4BookLiteSnapshot> {
         let coin = Coin::new(&coin);
         let worker = self.workers.get(&coin)?;
-        worker.state.blocking_lock().l4_book_lite_snapshot()
+        worker.state.lock().expect("coin worker state lock").l4_book_lite_snapshot()
     }
 
     pub(crate) fn l4_snapshot_for_coin(&self, coin: &str) -> Option<TimedSnapshots> {
         let coin = Coin::new(coin);
         let worker = self.workers.get(&coin)?;
-        worker.state.blocking_lock().l4_snapshot()
+        worker.state.lock().expect("coin worker state lock").l4_snapshot()
     }
 
     fn broadcast_update(&self, order_statuses: Batch<NodeDataOrderStatus>, order_diffs: Batch<NodeDataOrderDiff>) {
@@ -798,7 +798,8 @@ impl OrderBookListener {
         while let Some((order_statuses, order_diffs, fills)) = self.pop_cache() {
             let active_coins: HashSet<String> = self
                 .active_symbols
-                .blocking_lock()
+                .lock()
+                .expect("active_symbols lock")
                 .iter()
                 .filter(|(_, count)| **count > 0)
                 .map(|(coin, _)| coin.clone())
@@ -882,7 +883,7 @@ impl OrderBookListener {
     fn broadcast_l4_snapshot(&mut self) {
         if let Some(tx) = &self.internal_message_tx {
             for worker in self.workers.values() {
-                if let Some(snapshot) = worker.state.blocking_lock().l4_snapshot() {
+                if let Some(snapshot) = worker.state.lock().expect("coin worker state lock").l4_snapshot() {
                     let snapshot = Arc::new(InternalMessage::L4Snapshot { snapshot });
                     let _unused = tx.send(snapshot);
                 }
@@ -1046,7 +1047,7 @@ impl OrderBookListener {
         self.clear_caches();
         self.fetched_snapshot_cache = None;
         for worker in self.workers.values() {
-            let mut state = worker.state.blocking_lock();
+            let mut state = worker.state.lock().expect("coin worker state lock");
             state.order_book_state = None;
             state.lite_state = BookState::default();
         }
@@ -1246,7 +1247,15 @@ impl DirectoryListener for OrderBookListener {
                         "{event_source} serialization error {err}, height: {:?}, line: {:?}",
                         self.workers
                             .get(&Coin::new("BTC"))
-                            .and_then(|worker| worker.state.blocking_lock().order_book_state.as_ref().map(OrderBookState::height)),
+                            .and_then(|worker| {
+                                worker
+                                    .state
+                                    .lock()
+                                    .expect("coin worker state lock")
+                                    .order_book_state
+                                    .as_ref()
+                                    .map(OrderBookState::height)
+                            }),
                         line.chars().take(100).collect::<String>(),
                     );
                     *self.pending_line_mut(event_source) = line.to_string();
