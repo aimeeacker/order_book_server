@@ -10,8 +10,17 @@ pub(crate) const DEFAULT_LEVELS: usize = 20;
 #[serde(tag = "method")]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ClientMessage {
-    Subscribe { subscription: Subscription },
-    Unsubscribe { subscription: Subscription },
+    #[serde(rename = "subscribe")]
+    Subscribe { #[serde(flatten)] payload: SubscribePayload },
+    #[serde(rename = "unsubscribe")]
+    Unsubscribe { #[serde(flatten)] payload: SubscribePayload },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum SubscribePayload {
+    Single { subscription: Subscription },
+    Streams { streams: Vec<String>, #[serde(rename = "req_id")] req_id: Option<i64> },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -24,6 +33,8 @@ pub(crate) enum Subscription {
     L2Book { coin: String, n_sig_figs: Option<u32>, n_levels: Option<usize>, mantissa: Option<u64> },
     #[serde(rename_all = "camelCase")]
     L4Book { coin: String },
+    #[serde(rename_all = "camelCase")]
+    L4Lite { coin: String },
 }
 
 impl Subscription {
@@ -69,17 +80,45 @@ impl Subscription {
                 info!("Valid subscription");
                 true
             }
+            Self::L4Lite { coin } => {
+                if !universe.contains(coin) || coin.starts_with('@') {
+                    info!("Invalid subscription: coin not found");
+                    return false;
+                }
+                info!("Valid subscription");
+                true
+            }
         }
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct AnalysisData {
+    #[serde(rename = "b")]
+    pub bids: Vec<crate::listeners::order_book::lite::AnalysisUpdate>,
+    #[serde(rename = "a")]
+    pub asks: Vec<crate::listeners::order_book::lite::AnalysisUpdate>,
+    #[serde(rename = "block_height")]
+    pub block_height: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "channel", content = "data")]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ServerResponse {
-    SubscriptionResponse(ClientMessage),
+    // New response format: return list of streams and echo req_id (or null)
+    SubscriptionResponse { streams: Vec<String>, #[serde(rename = "req_id")] req_id: Option<i64> },
     L2Book(L2Book),
     L4Book(L4Book),
+    L4Lite(crate::listeners::order_book::lite::L2BlockUpdate),
+    L4LiteAnalysis(AnalysisData),
+    L4LiteUpdate {
+        #[serde(rename = "l4Lite")]
+        lite: crate::listeners::order_book::lite::L2BlockUpdate,
+        #[serde(rename = "l4LiteAnalysis")]
+        analysis: AnalysisData,
+    },
+    L2Snapshot(crate::listeners::order_book::lite::L2Snapshot),
     Trades(Vec<Trade>),
     Error(String),
 }
@@ -112,10 +151,12 @@ mod test {
     #[test]
     fn test_message_deserialization_subscription_response() {
         let message = r#"
-            {"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC","nSigFigs":null,"mantissa":null}}}
+            {"channel":"subscriptionResponse","streams":["btc@l2Book"],"req_id":null}
         "#;
-        let msg = serde_json::from_str(message).unwrap();
-        assert!(matches!(msg, ServerResponse::SubscriptionResponse(_)));
+        let v: serde_json::Value = serde_json::from_str(message).unwrap();
+        assert_eq!(v["channel"], "subscriptionResponse");
+        assert_eq!(v["streams"], serde_json::json!(["btc@l2Book"]));
+        assert!(v.get("req_id").unwrap().is_null());
     }
 
     #[test]
@@ -142,11 +183,36 @@ mod test {
             { "method": "subscribe", "subscription":{ "type": "l2Book", "coin": "BTC" }}
         "#;
         let msg: ClientMessage = serde_json::from_str(message).unwrap();
-        assert!(matches!(
-            msg,
-            ClientMessage::Subscribe {
-                subscription: Subscription::L2Book { n_sig_figs: None, n_levels: None, mantissa: None, .. },
+        match msg {
+            ClientMessage::Subscribe { payload } => {
+                match payload {
+                    SubscribePayload::Single { subscription } => {
+                        assert!(matches!(subscription, Subscription::L2Book { n_sig_figs: None, n_levels: None, mantissa: None, .. }));
+                    }
+                    _ => panic!("unexpected payload"),
+                }
             }
-        ));
+            _ => panic!("unexpected message"),
+        }
+    }
+
+    #[test]
+    fn test_client_message_deserialization_streams() {
+        let message = r#"
+            { "method": "subscribe", "streams": ["BTC@l4Book","BTC@trade"], "req_id": 102 }
+        "#;
+        let msg: ClientMessage = serde_json::from_str(message).unwrap();
+        match msg {
+            ClientMessage::Subscribe { payload } => {
+                match payload {
+                    SubscribePayload::Streams { streams, req_id } => {
+                        assert_eq!(streams, vec!["BTC@l4Book".to_string(), "BTC@trade".to_string()]);
+                        assert_eq!(req_id, Some(102));
+                    }
+                    _ => panic!("unexpected payload"),
+                }
+            }
+            _ => panic!("unexpected message"),
+        }
     }
 }

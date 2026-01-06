@@ -30,7 +30,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    Builder::from_env(Env::default().default_filter_or("info")).init();
+    Builder::from_env(Env::default().default_filter_or("info"))
+        .format_timestamp_micros()
+        .init();
 
     let args = Args::parse();
 

@@ -90,4 +90,26 @@ impl<E> Batch<E> {
     pub(crate) fn events(self) -> Vec<E> {
         self.events
     }
+
+    pub(crate) fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&E) -> bool,
+    {
+        self.events.retain(f);
+    }
+    
+    pub(crate) fn new(block_number: u64, block_time_millis: u64, events: Vec<E>) -> Self {
+        let block_time = NaiveDateTime::from_timestamp_millis(block_time_millis as i64).unwrap_or_default();
+        Self {
+            local_time: chrono::Local::now().naive_local(),
+            block_time,
+            block_number,
+            events
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
 }

@@ -34,9 +34,11 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
 
     // Central task: listen to messages and forward them for distribution
     let home_dir = home_dir().ok_or("Could not find home directory")?;
+    let active_symbols = Arc::new(Mutex::new(HashMap::new()));
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
-        OrderBookListener::new(Some(internal_message_tx), ignore_spot)
+        let active_symbols = active_symbols.clone();
+        OrderBookListener::new(Some(internal_message_tx), Some(active_symbols), ignore_spot)
     };
     let listener = Arc::new(Mutex::new(listener));
     {
@@ -55,8 +57,16 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
         "/ws",
         get({
             let internal_message_tx = internal_message_tx.clone();
+            let active_symbols = active_symbols.clone();
             async move |ws_upgrade| {
-                ws_handler(ws_upgrade, internal_message_tx.clone(), listener.clone(), ignore_spot, websocket_opts)
+                ws_handler(
+                    ws_upgrade,
+                    internal_message_tx.clone(),
+                    listener.clone(),
+                    active_symbols,
+                    ignore_spot,
+                    websocket_opts,
+                )
             }
         }),
     );
@@ -76,6 +86,7 @@ fn ws_handler(
     incoming: yawc::IncomingUpgrade,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
+    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
     ignore_spot: bool,
     websocket_opts: yawc::Options,
 ) -> impl IntoResponse {
@@ -89,7 +100,7 @@ fn ws_handler(
             }
         };
 
-        handle_socket(ws, internal_message_tx, listener, ignore_spot).await
+        handle_socket(ws, internal_message_tx, listener, active_symbols, ignore_spot).await
     });
 
     resp
@@ -99,6 +110,7 @@ async fn handle_socket(
     mut socket: WebSocket,
     internal_message_tx: Sender<Arc<InternalMessage>>,
     listener: Arc<Mutex<OrderBookListener>>,
+    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
     ignore_spot: bool,
 ) {
     let mut internal_message_rx = internal_message_tx.subscribe();
@@ -134,12 +146,32 @@ async fn handle_socket(
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
                                 }
                             },
+                            InternalMessage::L4Lite{ updates, analysis_b, analysis_a, height } => {
+                                let mut updates_by_coin: HashMap<String, crate::listeners::order_book::lite::L2BlockUpdate> = HashMap::new();
+                                for u in updates {
+                                    updates_by_coin.insert(u.coin.clone(), u.clone());
+                                }
+                                
+                                let mut analysis_by_coin_b: HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>> = HashMap::new();
+                                for a in analysis_b {
+                                    analysis_by_coin_b.entry(a.coin.value()).or_default().push(a.clone());
+                                }
+                                let mut analysis_by_coin_a: HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>> = HashMap::new();
+                                for a in analysis_a {
+                                    analysis_by_coin_a.entry(a.coin.value()).or_default().push(a.clone());
+                                }
+
+                                for sub in manager.subscriptions() {
+                                    send_ws_data_from_lite_updates(&mut socket, sub, &mut updates_by_coin, &mut analysis_by_coin_b, &mut analysis_by_coin_a, *height).await;
+                                }
+                            },
                         }
+
 
                     }
                     Err(err) => {
                         error!("Receiver error: {err}");
-                        return;
+                        break;
                     }
                 }
             }
@@ -153,14 +185,14 @@ async fn handle_socket(
                                 Err(err) => {
                                     log::warn!("unable to parse websocket content: {err}: {:?}", frame.payload.as_ref());
                                     // deserves to close the connection because the payload is not a valid utf8 string.
-                                    return;
+                                    break;
                                 }
                             };
 
                             info!("Client message: {text}");
 
                             if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
-                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone()).await;
+                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), active_symbols.clone()).await;
                             }
                             else {
                                 let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
@@ -169,14 +201,31 @@ async fn handle_socket(
                         }
                         OpCode::Close => {
                             info!("Client disconnected");
-                            return;
+                            break;
                         }
                         _ => {}
                     }
                 } else {
                     info!("Client connection closed");
-                    return;
+                    break;
                 }
+            }
+        }
+    }
+
+    // Cleanup subscriptions
+    let mut guard = active_symbols.lock().await;
+    for sub in manager.subscriptions() {
+        let coin = match sub {
+            Subscription::Trades { coin } => coin,
+            Subscription::L2Book { coin, .. } => coin,
+            Subscription::L4Book { coin } => coin,
+            Subscription::L4Lite { coin } => coin,
+        };
+        if let Some(count) = guard.get_mut(coin) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                guard.remove(coin);
             }
         }
     }
@@ -188,57 +237,210 @@ async fn receive_client_message(
     client_message: ClientMessage,
     universe: &HashSet<String>,
     listener: Arc<Mutex<OrderBookListener>>,
+    active_symbols: Arc<Mutex<HashMap<String, usize>>>,
 ) {
-    let subscription = match &client_message {
-        ClientMessage::Unsubscribe { subscription } | ClientMessage::Subscribe { subscription } => subscription.clone(),
-    };
-    // this is used for display purposes only, hence unwrap_or_default. It also shouldn't fail
-    let sub = serde_json::to_string(&subscription).unwrap_or_default();
-    if !subscription.validate(universe) {
-        let msg = ServerResponse::Error(format!("Invalid subscription: {sub}"));
-        send_socket_message(socket, msg).await;
-        return;
+    // Helper to convert subscription to a stream string like "btc@l4Book"
+    fn sub_to_stream(s: &Subscription) -> String {
+        match s {
+            Subscription::Trades { coin } => format!("{}@trade", coin.to_lowercase()),
+            Subscription::L2Book { coin, .. } => format!("{}@l2Book", coin.to_lowercase()),
+            Subscription::L4Book { coin } => format!("{}@l4Book", coin.to_lowercase()),
+            Subscription::L4Lite { coin } => format!("{}@l4Lite", coin.to_lowercase()),
+        }
     }
-    let (word, success) = match &client_message {
-        ClientMessage::Subscribe { .. } => ("", manager.subscribe(subscription)),
-        ClientMessage::Unsubscribe { .. } => ("un", manager.unsubscribe(subscription)),
+
+    // parse "btc@l4Book" into Subscription
+    fn parse_stream_string(s: &str) -> Option<Subscription> {
+        let mut parts = s.splitn(2, '@');
+        let coin = parts.next()?.to_uppercase();
+        let kind = parts.next()?.to_lowercase();
+        match kind.as_str() {
+            "l4book" => Some(Subscription::L4Book { coin }),
+            "l4lite" => Some(Subscription::L4Lite { coin }),
+            "l2book" => Some(Subscription::L2Book { coin, n_sig_figs: None, n_levels: None, mantissa: None }),
+            "trade" | "trades" => Some(Subscription::Trades { coin }),
+            _ => None,
+        }
+    }
+
+    // Build list of subscriptions and streams + req_id
+    let (subscriptions, streams, req_id, is_subscribe) = match client_message {
+        ClientMessage::Subscribe { payload } => match payload {
+            crate::types::subscription::SubscribePayload::Single { subscription } => {
+                (vec![subscription.clone()], vec![sub_to_stream(&subscription)], None, true)
+            }
+            crate::types::subscription::SubscribePayload::Streams { streams, req_id } => {
+                let mut subs = Vec::new();
+                let mut valid_streams = Vec::new();
+                for s in streams {
+                    if let Some(sub) = parse_stream_string(&s) {
+                        valid_streams.push(s);
+                        subs.push(sub);
+                    }
+                }
+                (subs, valid_streams, req_id, true)
+            }
+        },
+        ClientMessage::Unsubscribe { payload } => match payload {
+            crate::types::subscription::SubscribePayload::Single { subscription } => {
+                (vec![subscription.clone()], vec![sub_to_stream(&subscription)], None, false)
+            }
+            crate::types::subscription::SubscribePayload::Streams { streams, req_id } => {
+                let mut subs = Vec::new();
+                let mut valid_streams = Vec::new();
+                for s in streams {
+                    if let Some(sub) = parse_stream_string(&s) {
+                        valid_streams.push(s);
+                        subs.push(sub);
+                    }
+                }
+                (subs, valid_streams, req_id, false)
+            }
+        },
     };
-    if success {
-        let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
-            let msg = subscription.handle_immediate_snapshot(listener).await;
-            match msg {
-                Ok(msg) => msg,
-                Err(err) => {
-                    manager.unsubscribe(subscription.clone());
-                    let msg = ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"));
-                    send_socket_message(socket, msg).await;
-                    return;
+
+    // Validate all subscriptions
+    for sub in &subscriptions {
+        if !sub.validate(universe) {
+            let sub_str = serde_json::to_string(sub).unwrap_or_default();
+            let msg = ServerResponse::Error(format!("Invalid subscription: {sub_str}"));
+            send_socket_message(socket, msg).await;
+            return;
+        }
+    }
+
+    // Apply subscriptions/unsubscriptions
+    // We will batch apply and if any error occurs revert changes
+    let mut applied_coins: Vec<String> = Vec::new();
+    let mut applied_subs: Vec<Subscription> = Vec::new();
+    {
+        let mut guard = active_symbols.lock().await;
+        for sub in &subscriptions {
+            let coin = match sub {
+                Subscription::Trades { coin } => coin,
+                Subscription::L2Book { coin, .. } => coin,
+                Subscription::L4Book { coin } => coin,
+                Subscription::L4Lite { coin } => coin,
+            };
+            if is_subscribe {
+                *guard.entry(coin.clone()).or_insert(0) += 1;
+                applied_coins.push(coin.clone());
+                applied_subs.push(sub.clone());
+            } else {
+                if let Some(count) = guard.get_mut(coin) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        guard.remove(coin);
+                    }
+                }
+                applied_subs.push(sub.clone());
+            }
+        }
+    }
+
+    // Now register with manager for each subscription
+    for sub in &applied_subs {
+        let success = if is_subscribe { manager.subscribe(sub.clone()) } else { manager.unsubscribe(sub.clone()) };
+        if !success {
+            // revert active_symbols changes
+            let mut guard = active_symbols.lock().await;
+            for coin in applied_coins.iter() {
+                if let Some(count) = guard.get_mut(coin) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        guard.remove(coin);
+                    }
                 }
             }
-        } else {
-            None
-        };
-        let msg = ServerResponse::SubscriptionResponse(client_message);
-        send_socket_message(socket, msg).await;
-        if let Some(snapshot_msg) = snapshot_msg {
-            send_socket_message(socket, snapshot_msg).await;
+            // drop the guard before awaiting
+            drop(guard);
+            let sub_repr = serde_json::to_string(sub).unwrap_or_default();
+            let word = if is_subscribe { "" } else { "un" };
+            let msg = ServerResponse::Error(format!("Already {word}subscribed: {sub_repr}"));
+            send_socket_message(socket, msg).await;
+            return;
         }
-    } else {
-        let msg = ServerResponse::Error(format!("Already {word}subscribed: {sub}"));
-        send_socket_message(socket, msg).await;
+    }
+
+    // For subscribe, attempt to gather immediate snapshots for L4Book subs
+    let mut snapshot_msgs: Vec<ServerResponse> = Vec::new();
+    if is_subscribe {
+        for sub in &subscriptions {
+            // Check if subscription type supports snapshots
+            let should_try_snapshot = matches!(sub, Subscription::L4Book { .. } | Subscription::L4Lite { .. });
+            if should_try_snapshot {
+                // Build a subscription object to call handle_immediate_snapshot
+                let maybe = sub.handle_immediate_snapshot(listener.clone()).await;
+                match maybe {
+                    Ok(Some(msg)) => snapshot_msgs.push(msg),
+                    Ok(None) => {}
+                    Err(err) => {
+                        // revert changes
+                        let mut guard = active_symbols.lock().await;
+                        for coin in applied_coins.iter() {
+                            if let Some(count) = guard.get_mut(coin) {
+                                *count = count.saturating_sub(1);
+                                if *count == 0 {
+                                    guard.remove(coin);
+                                }
+                            }
+                        }
+                        for s in &applied_subs {
+                            manager.unsubscribe(s.clone());
+                        }
+                        // drop the guard before awaiting
+                        drop(guard);
+                        let msg = ServerResponse::Error(format!("Unable to grab order book snapshot: {err}"));
+                        send_socket_message(socket, msg).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Success: send subscription response with streams and req_id
+    let msg = ServerResponse::SubscriptionResponse { streams, req_id };
+    send_socket_message(socket, msg).await;
+
+    // send any immediate snapshot messages
+    for sm in snapshot_msgs {
+        send_socket_message(socket, sm).await;
     }
 }
 
+
 async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
-    let msg = serde_json::to_string(&msg);
+    // Special-case subscription response so `req_id` is placed at top-level
     match msg {
-        Ok(msg) => {
-            if let Err(err) = socket.send(FrameView::text(msg)).await {
-                error!("Failed to send: {err}");
+        ServerResponse::SubscriptionResponse { streams, req_id } => {
+            // Return without data wrapper: top-level streams and req_id
+            let obj = serde_json::json!({
+                "channel": "subscriptionResponse",
+                "streams": streams,
+                "req_id": req_id,
+            });
+            match serde_json::to_string(&obj) {
+                Ok(msg) => {
+                    if let Err(err) = socket.send(FrameView::text(msg)).await {
+                        error!("Failed to send: {err}");
+                    }
+                }
+                Err(err) => error!("Server response serialization error: {err}"),
             }
         }
-        Err(err) => {
-            error!("Server response serialization error: {err}");
+        other => {
+            let msg = serde_json::to_string(&other);
+            match msg {
+                Ok(msg) => {
+                    if let Err(err) = socket.send(FrameView::text(msg)).await {
+                        error!("Failed to send: {err}");
+                    }
+                }
+                Err(err) => {
+                    error!("Server response serialization error: {err}");
+                }
+            }
         }
     }
 }
@@ -318,6 +520,46 @@ fn coin_to_book_updates(
     updates
 }
 
+async fn send_ws_data_from_lite_updates(
+    socket: &mut WebSocket,
+    subscription: &Subscription,
+    updates: &mut HashMap<String, crate::listeners::order_book::lite::L2BlockUpdate>,
+    analysis_b: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
+    analysis_a: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
+    block_height: u64,
+) {
+    if let Subscription::L4Lite { coin } = subscription {
+        use crate::types::subscription::AnalysisData;
+        
+        let lite = updates.get(coin).cloned().unwrap_or_else(|| {
+             crate::listeners::order_book::lite::L2BlockUpdate {
+                 coin: coin.clone(),
+                 b: Vec::new(),
+                 a: Vec::new(),
+                 block_height
+             }
+        });
+        
+        // Send analysis frame 
+        let a_b = analysis_b.remove(coin).unwrap_or_default();
+        let a_a = analysis_a.remove(coin).unwrap_or_default();
+
+        let analysis = AnalysisData {
+             bids: a_b,
+             asks: a_a,
+             block_height,
+        };
+        
+        // Combined Update
+        let msg = ServerResponse::L4LiteUpdate {
+             lite,
+             analysis
+        };
+        
+        send_socket_message(socket, msg).await;
+    }
+}
+
 async fn send_ws_data_from_book_updates(
     socket: &mut WebSocket,
     subscription: &Subscription,
@@ -350,24 +592,36 @@ impl Subscription {
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
     ) -> Result<Option<ServerResponse>> {
-        if let Self::L4Book { coin } = self {
-            let snapshot = listener.lock().await.compute_snapshot();
-            if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
-                let snapshot =
-                    snapshot.value().into_iter().filter(|(c, _)| *c == Coin::new(coin)).collect::<Vec<_>>().pop();
-                if let Some((coin, snapshot)) = snapshot {
+        match self {
+            Self::L4Book { coin } => {
+                let snapshot = listener.lock().await.compute_snapshot();
+                if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
                     let snapshot =
-                        snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
-                    return Ok(Some(ServerResponse::L4Book(L4Book::Snapshot {
-                        coin: coin.value(),
-                        time,
-                        height,
-                        levels: snapshot,
-                    })));
+                        snapshot.value().into_iter().filter(|(c, _)| *c == Coin::new(coin)).collect::<Vec<_>>().pop();
+                    if let Some((coin, snapshot)) = snapshot {
+                        let snapshot =
+                            snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
+                        return Ok(Some(ServerResponse::L4Book(L4Book::Snapshot {
+                            coin: coin.value(),
+                            time,
+                            height,
+                            levels: snapshot,
+                        })));
+                    }
+                }
+                return Err("Snapshot Failed".into());
+            }
+            Self::L4Lite { coin } => {
+                // Fetch L2 Snapshot from LiteBook
+                let listener = listener.lock().await;
+                if let Some(lb) = listener.lite_books.get(&Coin::new(coin)) {
+                     let snap = lb.get_snapshot();
+                     return Ok(Some(ServerResponse::L2Snapshot(snap)));
+                } else {
+                     return Err("LiteBook not ready".into());
                 }
             }
-            return Err("Snapshot Failed".into());
+            _ => Ok(None)
         }
-        Ok(None)
     }
 }

@@ -50,8 +50,13 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
     expected: Snapshots<O>,
     ignore_spot: bool,
 ) -> Result<()> {
+    // Only validate for coins we track (snapshot)
+    let tracked_coins: std::collections::HashSet<_> = snapshot.as_ref().keys().collect();
+
     let mut snapshot_map: HashMap<_, _> =
-        expected.value().into_iter().filter(|(c, _)| !c.is_spot() || !ignore_spot).collect();
+        expected.value().into_iter()
+            .filter(|(c, _)| (!c.is_spot() || !ignore_spot) && tracked_coins.contains(c))
+            .collect();
 
     for (coin, book) in snapshot.as_ref() {
         if ignore_spot && coin.is_spot() {
@@ -63,17 +68,21 @@ pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
                 for (order1, order2) in orders1.iter().zip(orders2.iter()) {
                     if *order1 != *order2 {
                         return Err(
-                            format!("Orders do not match, expected: {:?} received: {:?}", *order2, *order1).into()
+                            format!("Orders do not match for {}, expected: {:?} received: {:?}", coin.value(), *order2, *order1).into()
                         );
                     }
                 }
             }
         } else if !book1[0].is_empty() || !book1[1].is_empty() {
-            return Err(format!("Missing {} book", coin.value()).into());
+             // We have a book locally but not in expected (and we decided to track it). 
+             // This logic still holds: if snapshot has it, expected should have it.
+            return Err(format!("Missing {} book in expected snapshot", coin.value()).into());
         }
     }
+    // Since we filtered snapshot_map by tracked_coins, this check is now safe:
+    // It only complains if we expected it (tracked in local) but didn't match it earlier.
     if !snapshot_map.is_empty() {
-        return Err("Extra orderbooks detected".to_string().into());
+        return Err(format!("Extra orderbooks detected in expected snapshot: {:?}", snapshot_map.keys().map(|k| k.value()).collect::<Vec<_>>()).into());
     }
     Ok(())
 }
@@ -84,6 +93,7 @@ impl L2SnapshotParams {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(order_books: &OrderBooks<O>) -> L2Snapshots {
     L2Snapshots(
         order_books

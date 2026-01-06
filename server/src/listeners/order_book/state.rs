@@ -48,6 +48,7 @@ impl OrderBookState {
     }
 
     // (time, snapshot)
+    #[allow(dead_code)]
     pub(super) fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
         if self.snapped {
             None

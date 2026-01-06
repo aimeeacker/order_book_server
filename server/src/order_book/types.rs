@@ -11,16 +11,22 @@ pub(crate) enum Side {
     Bid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Default for Side {
+    fn default() -> Self {
+        Side::Bid
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct Oid(u64);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) struct Px(u64);
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct Sz(u64);
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub(crate) struct Coin(String);
 
 impl Sz {
@@ -30,7 +36,7 @@ impl Sz {
     pub(super) const fn is_positive(self) -> bool {
         self.0 > 0
     }
-    pub(super) const fn is_zero(self) -> bool {
+    pub(crate) const fn is_zero(self) -> bool {
         self.0 == 0
     }
     pub(crate) const fn value(self) -> u64 {
@@ -122,6 +128,7 @@ impl Px {
 
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
+    #[allow(dead_code)]
     pub(crate) fn num_digits(self) -> u32 {
         if self.value() == 0 { 1 } else { (self.value() as f64).log10().floor() as u32 + 1 }
     }
