@@ -30,7 +30,7 @@ use tokio::{
         broadcast::Sender,
         mpsc::{Sender as MpscSender, UnboundedSender, channel, unbounded_channel},
     },
-    time::{Instant, interval_at, sleep},
+    time::{Instant, interval, interval_at, sleep},
 };
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
 
@@ -75,6 +75,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
 
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(10));
+    let mut health_check = interval(Duration::from_secs(5));
     loop {
         tokio::select! {
             snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
@@ -93,9 +94,9 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
                 fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
             }
-            () = sleep(Duration::from_secs(5)) => {
+            _ = health_check.tick() => {
                 let listener = listener.lock().await;
-                if listener.is_ready() {
+                if listener.is_ready() && listener.is_stalled(Duration::from_secs(5)) {
                     return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
                 }
             }
@@ -163,6 +164,7 @@ pub(crate) struct OrderBookListener {
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
     last_fill: Option<u64>,
+    last_event_time: Option<Instant>,
     order_diff_cache: BatchQueue<NodeDataOrderDiff>,
     order_status_cache: BatchQueue<NodeDataOrderStatus>,
     // Only Some when we want it to collect updates
@@ -184,6 +186,7 @@ impl OrderBookListener {
             ignore_spot,
             order_book_state: None,
             last_fill: None,
+            last_event_time: None,
             fetched_snapshot_cache: None,
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
@@ -197,6 +200,13 @@ impl OrderBookListener {
 
     pub(crate) const fn is_ready(&self) -> bool {
         self.order_book_state.is_some()
+    }
+
+    fn is_stalled(&self, threshold: Duration) -> bool {
+        match self.last_event_time {
+            Some(last_event_time) => last_event_time.elapsed() >= threshold,
+            None => false,
+        }
     }
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
@@ -333,6 +343,7 @@ impl OrderBookListener {
         if line.is_empty() {
             return Ok(());
         }
+        self.last_event_time = Some(Instant::now());
         let (height, event_batch) = match self.parse_batch_line(&line, event_source) {
             Ok(data) => data,
             Err(err) => {

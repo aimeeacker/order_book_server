@@ -3,6 +3,7 @@ use std::net::Ipv4Addr;
 
 use clap::Parser;
 use server::{Result, run_websocket_server};
+use env_logger::{Env, Builder};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -29,7 +30,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    Builder::from_env(Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
 
