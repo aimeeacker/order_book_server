@@ -20,6 +20,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader},
     path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
     sync::Arc,
     thread,
     time::Duration,
@@ -40,6 +41,7 @@ mod utils;
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
 pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: PathBuf) -> Result<()> {
+    let dropped_updates = Arc::new(AtomicBool::new(false));
     let fifo_paths = [
         (EventSource::OrderStatuses, fifo_path(EventSource::OrderStatuses)),
         (EventSource::Fills, fifo_path(EventSource::Fills)),
@@ -51,11 +53,16 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
 
     let (stream_tx, mut stream_rx) = channel::<StreamMessage>(FIFO_QUEUE_MAX_LEN);
     for (source, path) in fifo_paths {
-        spawn_fifo_reader(source, path, stream_tx.clone());
+        spawn_fifo_reader(source, path, stream_tx.clone(), dropped_updates.clone());
     }
     let parser_listener = listener.clone();
+    let parser_dropped_updates = dropped_updates.clone();
     tokio::spawn(async move {
         while let Some(message) = stream_rx.recv().await {
+            if parser_dropped_updates.swap(false, AtomicOrdering::SeqCst) {
+                let mut listener = parser_listener.lock().await;
+                listener.reset_after_drop();
+            }
             if let Err(err) = parser_listener.lock().await.process_stream_line(message.line, message.event_source) {
                 error!("Stream processing error: {err}");
             }
@@ -199,6 +206,14 @@ impl OrderBookListener {
 
     pub(crate) const fn is_ready(&self) -> bool {
         self.order_book_state.is_some()
+    }
+
+    fn reset_after_drop(&mut self) {
+        warn!("Dropped FIFO messages; resetting state and waiting for next snapshot.");
+        self.order_book_state = None;
+        self.order_diff_cache = BatchQueue::new();
+        self.order_status_cache = BatchQueue::new();
+        self.fetched_snapshot_cache = None;
     }
 
     fn is_stalled(&self, threshold: Duration) -> bool {
@@ -412,7 +427,12 @@ fn fifo_path(event_source: EventSource) -> PathBuf {
     PathBuf::from(FIFO_BASE_DIR).join(name)
 }
 
-fn spawn_fifo_reader(event_source: EventSource, path: PathBuf, tx: MpscSender<StreamMessage>) {
+fn spawn_fifo_reader(
+    event_source: EventSource,
+    path: PathBuf,
+    tx: MpscSender<StreamMessage>,
+    dropped_updates: Arc<AtomicBool>,
+) {
     thread::spawn(move || loop {
         let file = match File::open(&path) {
             Ok(file) => file,
@@ -438,6 +458,7 @@ fn spawn_fifo_reader(event_source: EventSource, path: PathBuf, tx: MpscSender<St
                         line: trimmed.to_string(),
                     };
                     if let Err(err) = tx.try_send(message) {
+                        dropped_updates.store(true, AtomicOrdering::SeqCst);
                         warn!("FIFO queue full for {event_source}. Dropping message: {err}");
                     }
                 }
