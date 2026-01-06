@@ -58,7 +58,6 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
         while let Some(message) = stream_rx.recv().await {
             if let Err(err) = parser_listener.lock().await.process_stream_line(message.line, message.event_source) {
                 error!("Stream processing error: {err}");
-                break;
             }
         }
         error!("Stream channel closed. Parser exiting");
