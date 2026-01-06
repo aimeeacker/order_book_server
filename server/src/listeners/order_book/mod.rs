@@ -1,6 +1,6 @@
 use crate::{
     HL_NODE,
-    listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
+    listeners::order_book::state::OrderBookState,
     order_book::{
         Coin, Snapshot,
         multi_book::{Snapshots, load_snapshots_from_json},
@@ -14,21 +14,21 @@ use crate::{
 };
 use alloy::primitives::Address;
 use fs::File;
-use log::{error, info};
-use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
+use log::{error, info, warn};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader},
     path::PathBuf,
     sync::Arc,
+    thread,
     time::Duration,
 };
 use tokio::{
     sync::{
         Mutex,
         broadcast::Sender,
-        mpsc::{UnboundedSender, unbounded_channel},
+        mpsc::{Sender as MpscSender, UnboundedSender, channel, unbounded_channel},
     },
     time::{Instant, interval_at, sleep},
 };
@@ -40,21 +40,29 @@ mod utils;
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
 pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: PathBuf) -> Result<()> {
-    let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
-    let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
-    let order_diffs_dir = EventSource::OrderDiffs.event_source_dir(&dir).canonicalize()?;
-    info!("Monitoring order status directory: {}", order_statuses_dir.display());
-    info!("Monitoring order diffs directory: {}", order_diffs_dir.display());
-    info!("Monitoring fills directory: {}", fills_dir.display());
+    let fifo_paths = [
+        (EventSource::OrderStatuses, fifo_path(EventSource::OrderStatuses)),
+        (EventSource::Fills, fifo_path(EventSource::Fills)),
+        (EventSource::OrderDiffs, fifo_path(EventSource::OrderDiffs)),
+    ];
+    for (source, path) in &fifo_paths {
+        info!("Monitoring FIFO for {source}: {}", path.display());
+    }
 
-    // monitoring the directory via the notify crate (gives file system events)
-    let (fs_event_tx, mut fs_event_rx) = unbounded_channel();
-    let mut watcher = recommended_watcher(move |res| {
-        let fs_event_tx = fs_event_tx.clone();
-        if let Err(err) = fs_event_tx.send(res) {
-            error!("Error sending fs event to processor via channel: {err}");
+    let (stream_tx, mut stream_rx) = channel::<StreamMessage>(FIFO_QUEUE_MAX_LEN);
+    for (source, path) in fifo_paths {
+        spawn_fifo_reader(source, path, stream_tx.clone());
+    }
+    let parser_listener = listener.clone();
+    tokio::spawn(async move {
+        while let Some(message) = stream_rx.recv().await {
+            if let Err(err) = parser_listener.lock().await.process_stream_line(message.line, message.event_source) {
+                error!("Stream processing error: {err}");
+                break;
+            }
         }
-    })?;
+        error!("Stream channel closed. Parser exiting");
+    });
 
     let ignore_spot = {
         let listener = listener.lock().await;
@@ -65,47 +73,10 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     // Result is sent back along this channel (if error, we want to return to top level)
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
 
-    watcher.watch(&order_statuses_dir, RecursiveMode::Recursive)?;
-    watcher.watch(&fills_dir, RecursiveMode::Recursive)?;
-    watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(10));
     loop {
         tokio::select! {
-            event = fs_event_rx.recv() =>  match event {
-                Some(Ok(event)) => {
-                    if event.kind.is_create() || event.kind.is_modify() {
-                        let new_path = &event.paths[0];
-                        if new_path.starts_with(&order_statuses_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
-                                .process_update(&event, new_path, EventSource::OrderStatuses)
-                                .map_err(|err| format!("Order status processing error: {err}"))?;
-                        } else if new_path.starts_with(&fills_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
-                                .process_update(&event, new_path, EventSource::Fills)
-                                .map_err(|err| format!("Fill update processing error: {err}"))?;
-                        } else if new_path.starts_with(&order_diffs_dir) && new_path.is_file() {
-                            listener
-                                .lock()
-                                .await
-                                .process_update(&event, new_path, EventSource::OrderDiffs)
-                                .map_err(|err| format!("Book diff processing error: {err}"))?;
-                        }
-                    }
-                }
-                Some(Err(err)) => {
-                    error!("Watcher error: {err}");
-                    return Err(format!("Watcher error: {err}").into());
-                }
-                None => {
-                    error!("Channel closed. Listener exiting");
-                    return Err("Channel closed.".into());
-                }
-            },
             snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
                 match snapshot_fetch_res {
                     None => {
@@ -189,9 +160,6 @@ fn fetch_snapshot(
 
 pub(crate) struct OrderBookListener {
     ignore_spot: bool,
-    fill_status_file: Option<File>,
-    order_status_file: Option<File>,
-    order_diff_file: Option<File>,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
     last_fill: Option<u64>,
@@ -202,13 +170,18 @@ pub(crate) struct OrderBookListener {
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
 }
 
+const FIFO_QUEUE_MAX_LEN: usize = 30;
+const FIFO_BASE_DIR: &str = "/dev/shm/book_tmpfs";
+
+struct StreamMessage {
+    event_source: EventSource,
+    line: String,
+}
+
 impl OrderBookListener {
     pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
         Self {
             ignore_spot,
-            fill_status_file: None,
-            order_status_file: None,
-            order_diff_file: None,
             order_book_state: None,
             last_fill: None,
             fetched_snapshot_cache: None,
@@ -342,98 +315,41 @@ impl OrderBookListener {
 }
 
 impl OrderBookListener {
-    fn process_update(&mut self, event: &Event, new_path: &PathBuf, event_source: EventSource) -> Result<()> {
-        if event.kind.is_create() {
-            info!("-- Event: {} created --", new_path.display());
-            self.on_file_creation(new_path.clone(), event_source)?;
-        }
-        // Check for `Modify` event (only if the file is already initialized)
-        else {
-            // If we are not tracking anything right now, we treat a file update as declaring that it has been created.
-            // Unfortunately, we miss the update that occurs at this time step.
-            // We go to the end of the file to read for updates after that.
-            if self.is_reading(event_source) {
-                self.on_file_modification(event_source)?;
-            } else {
-                info!("-- Event: {} modified, tracking it now --", new_path.display());
-                let file = self.file_mut(event_source);
-                let mut new_file = File::open(new_path)?;
-                new_file.seek(SeekFrom::End(0))?;
-                *file = Some(new_file);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl DirectoryListener for OrderBookListener {
-    fn is_reading(&self, event_source: EventSource) -> bool {
+    fn parse_batch_line(&self, line: &str, event_source: EventSource) -> Result<(u64, EventBatch)> {
         match event_source {
-            EventSource::Fills => self.fill_status_file.is_some(),
-            EventSource::OrderStatuses => self.order_status_file.is_some(),
-            EventSource::OrderDiffs => self.order_diff_file.is_some(),
+            EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(line)
+                .map(|batch| (batch.block_number(), EventBatch::Fills(batch)))
+                .map_err(Into::into),
+            EventSource::OrderStatuses => serde_json::from_str::<Batch<NodeDataOrderStatus>>(line)
+                .map(|batch| (batch.block_number(), EventBatch::Orders(batch)))
+                .map_err(Into::into),
+            EventSource::OrderDiffs => serde_json::from_str::<Batch<NodeDataOrderDiff>>(line)
+                .map(|batch| (batch.block_number(), EventBatch::BookDiffs(batch)))
+                .map_err(Into::into),
         }
     }
 
-    fn file_mut(&mut self, event_source: EventSource) -> &mut Option<File> {
-        match event_source {
-            EventSource::Fills => &mut self.fill_status_file,
-            EventSource::OrderStatuses => &mut self.order_status_file,
-            EventSource::OrderDiffs => &mut self.order_diff_file,
+    fn process_stream_line(&mut self, line: String, event_source: EventSource) -> Result<()> {
+        if line.is_empty() {
+            return Ok(());
         }
-    }
-
-    fn on_file_creation(&mut self, new_file: PathBuf, event_source: EventSource) -> Result<()> {
-        if let Some(file) = self.file_mut(event_source).as_mut() {
-            let mut buf = String::new();
-            file.read_to_string(&mut buf)?;
-            if !buf.is_empty() {
-                self.process_data(buf, event_source)?;
+        let (height, event_batch) = match self.parse_batch_line(&line, event_source) {
+            Ok(data) => data,
+            Err(err) => {
+                error!(
+                    "{event_source} serialization error {err}, height: {:?}, line: {:?}",
+                    self.order_book_state.as_ref().map(OrderBookState::height),
+                    &line[..line.len().min(100)],
+                );
+                return Ok(());
             }
+        };
+        if height % 100 == 0 {
+            info!("{event_source} block: {height}");
         }
-        *self.file_mut(event_source) = Some(File::open(new_file)?);
-        Ok(())
-    }
-
-    fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
-        let total_len = data.len();
-        let lines = data.lines();
-        for line in lines {
-            if line.is_empty() {
-                continue;
-            }
-            let res = match event_source {
-                EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(line).map(|batch| {
-                    let height = batch.block_number();
-                    (height, EventBatch::Fills(batch))
-                }),
-                EventSource::OrderStatuses => serde_json::from_str(line)
-                    .map(|batch: Batch<NodeDataOrderStatus>| (batch.block_number(), EventBatch::Orders(batch))),
-                EventSource::OrderDiffs => serde_json::from_str(line)
-                    .map(|batch: Batch<NodeDataOrderDiff>| (batch.block_number(), EventBatch::BookDiffs(batch))),
-            };
-            let (height, event_batch) = match res {
-                Ok(data) => data,
-                Err(err) => {
-                    // if we run into a serialization error (hitting EOF), just return to last line.
-                    error!(
-                        "{event_source} serialization error {err}, height: {:?}, line: {:?}",
-                        self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
-                    );
-                    #[allow(clippy::unwrap_used)]
-                    let total_len: i64 = total_len.try_into().unwrap();
-                    self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
-                    break;
-                }
-            };
-            if height % 100 == 0 {
-                info!("{event_source} block: {height}");
-            }
-            if let Err(err) = self.receive_batch(event_batch) {
-                self.order_book_state = None;
-                return Err(err);
-            }
+        if let Err(err) = self.receive_batch(event_batch) {
+            self.order_book_state = None;
+            return Err(err);
         }
         let snapshot = self.l2_snapshots(true);
         if let Some(snapshot) = snapshot {
@@ -447,6 +363,7 @@ impl DirectoryListener for OrderBookListener {
         }
         Ok(())
     }
+
 }
 
 pub(crate) struct L2Snapshots(HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>);
@@ -474,4 +391,52 @@ pub(crate) enum InternalMessage {
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
+}
+
+fn fifo_path(event_source: EventSource) -> PathBuf {
+    let name = match event_source {
+        EventSource::Fills => "fills",
+        EventSource::OrderStatuses => "order",
+        EventSource::OrderDiffs => "diffs",
+    };
+    PathBuf::from(FIFO_BASE_DIR).join(name)
+}
+
+fn spawn_fifo_reader(event_source: EventSource, path: PathBuf, tx: MpscSender<StreamMessage>) {
+    thread::spawn(move || loop {
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(err) => {
+                error!("Failed to open FIFO for {event_source} at {}: {err}", path.display());
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim_end_matches('\n');
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let message = StreamMessage {
+                        event_source,
+                        line: trimmed.to_string(),
+                    };
+                    if let Err(err) = tx.try_send(message) {
+                        warn!("FIFO queue full for {event_source}. Dropping message: {err}");
+                    }
+                }
+                Err(err) => {
+                    error!("FIFO read error for {event_source}: {err}");
+                    break;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    });
 }

@@ -27,6 +27,11 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
 ## Setup
 
 1. Run a non-validating node (from [`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node)). Requires batching by block. Requires recording fills, order statuses, and raw book diffs.
+   - The node should write newline-delimited JSON batches into FIFOs at `/dev/shm/book_tmpfs`:
+     - `fills`
+     - `order`
+     - `diffs`
+   - Snapshot requests are written to `/dev/shm/snapshot.json`.
 
 2. Then run this local server:
 

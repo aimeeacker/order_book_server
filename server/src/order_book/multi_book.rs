@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
 };
-use tokio::fs::read_to_string;
+use tokio::fs::read;
 
 pub(crate) struct Snapshots<O>(HashMap<Coin, Snapshot<O>>);
 
@@ -69,6 +69,7 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
@@ -76,6 +77,25 @@ where
 {
     #[allow(clippy::type_complexity)]
     let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = serde_json::from_str(str)?;
+    build_snapshots(height, snapshot)
+}
+
+pub(crate) async fn load_snapshots_from_json<O, R>(path: &Path) -> Result<(u64, Snapshots<O>)>
+where
+    O: TryFrom<R, Error = Error>,
+    R: Serialize + for<'a> Deserialize<'a>,
+{
+    let mut file_contents = read(path).await?;
+    #[allow(clippy::type_complexity)]
+    let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = simd_json::from_slice(&mut file_contents)?;
+    build_snapshots(height, snapshot)
+}
+
+fn build_snapshots<O, R>(height: u64, snapshot: Vec<(String, [Vec<R>; 2])>) -> Result<(u64, Snapshots<O>)>
+where
+    O: TryFrom<R, Error = Error>,
+    R: Serialize + for<'a> Deserialize<'a>,
+{
     Ok((
         height,
         Snapshots::new(
@@ -89,15 +109,6 @@ where
                 .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?,
         ),
     ))
-}
-
-pub(crate) async fn load_snapshots_from_json<O, R>(path: &Path) -> Result<(u64, Snapshots<O>)>
-where
-    O: TryFrom<R, Error = Error>,
-    R: Serialize + for<'a> Deserialize<'a>,
-{
-    let file_contents = read_to_string(path).await?;
-    load_snapshots_from_str(&file_contents)
 }
 
 #[cfg(test)]
