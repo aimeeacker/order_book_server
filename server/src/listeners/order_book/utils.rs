@@ -7,7 +7,7 @@ use crate::{
     },
     prelude::*,
     types::{
-        inner::InnerLevel,
+        inner::{InnerL4Order, InnerLevel},
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
@@ -15,6 +15,8 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use reqwest::Client;
 use serde_json::json;
 use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -45,44 +47,70 @@ pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
     Ok(output_path)
 }
 
-pub(super) fn validate_snapshot_consistency<O: Clone + PartialEq + Debug>(
-    snapshot: &Snapshots<O>,
-    expected: Snapshots<O>,
+fn hash_l4_order(order: &InnerL4Order, hasher: &mut DefaultHasher) {
+    order.user.hash(hasher);
+    order.coin.hash(hasher);
+    order.side.hash(hasher);
+    order.limit_px.value().hash(hasher);
+    order.sz.value().hash(hasher);
+    order.oid.hash(hasher);
+    order.timestamp.hash(hasher);
+    order.trigger_condition.hash(hasher);
+    order.is_trigger.hash(hasher);
+    order.trigger_px.hash(hasher);
+    order.is_position_tpsl.hash(hasher);
+    order.reduce_only.hash(hasher);
+    order.order_type.hash(hasher);
+    order.tif.hash(hasher);
+    order.cloid.hash(hasher);
+}
+
+pub(super) fn validate_snapshot_hash(
+    snapshot: &Snapshots<InnerL4Order>,
+    expected: &Snapshots<InnerL4Order>,
     ignore_spot: bool,
 ) -> Result<()> {
-    // Only validate for coins we track (snapshot)
-    let tracked_coins: std::collections::HashSet<_> = snapshot.as_ref().keys().collect();
+    let mut hasher_snapshot = DefaultHasher::new();
+    let mut hasher_expected = DefaultHasher::new();
 
-    let mut snapshot_map: HashMap<_, _> =
-        expected.value().into_iter()
-            .filter(|(c, _)| (!c.is_spot() || !ignore_spot) && tracked_coins.contains(c))
-            .collect();
+    let mut coins: Vec<_> = snapshot.as_ref().iter().collect();
+    coins.sort_by_key(|(coin, _)| coin.value());
 
-    for (coin, book) in snapshot.as_ref() {
+    for (coin, book) in coins {
         if ignore_spot && coin.is_spot() {
             continue;
         }
         let book1 = book.as_ref();
-        if let Some(book2) = snapshot_map.remove(coin) {
+        if let Some(book2) = expected.as_ref().get(coin) {
+            coin.value().hash(&mut hasher_snapshot);
+            coin.value().hash(&mut hasher_expected);
+
             for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
+                if orders1.len() != orders2.len() {
+                    return Err(format!(
+                        "Order count mismatch for {}: {} vs {}",
+                        coin.value(),
+                        orders1.len(),
+                        orders2.len()
+                    ).into());
+                }
                 for (order1, order2) in orders1.iter().zip(orders2.iter()) {
-                    if *order1 != *order2 {
-                        return Err(
-                            format!("Orders do not match for {}, expected: {:?} received: {:?}", coin.value(), *order2, *order1).into()
-                        );
-                    }
+                    hash_l4_order(order1, &mut hasher_snapshot);
+                    hash_l4_order(order2, &mut hasher_expected);
                 }
             }
         } else if !book1[0].is_empty() || !book1[1].is_empty() {
-             // We have a book locally but not in expected (and we decided to track it). 
-             // This logic still holds: if snapshot has it, expected should have it.
             return Err(format!("Missing {} book in expected snapshot", coin.value()).into());
         }
     }
-    // Since we filtered snapshot_map by tracked_coins, this check is now safe:
-    // It only complains if we expected it (tracked in local) but didn't match it earlier.
-    if !snapshot_map.is_empty() {
-        return Err(format!("Extra orderbooks detected in expected snapshot: {:?}", snapshot_map.keys().map(|k| k.value()).collect::<Vec<_>>()).into());
+
+    let hash_snapshot = hasher_snapshot.finish();
+    let hash_expected = hasher_expected.finish();
+    if hash_snapshot != hash_expected {
+        return Err(format!(
+            "Snapshot hash mismatch: expected={}, actual={}",
+            hash_expected, hash_snapshot
+        ).into());
     }
     Ok(())
 }

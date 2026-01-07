@@ -10,9 +10,12 @@ use std::{
 };
 use tokio::fs::read;
 
-pub(crate) struct Snapshots<O>(HashMap<Coin, Snapshot<O>>);
+#[derive(Clone)]
+pub(crate) struct Snapshots<O>(HashMap<Coin, Snapshot<O>>)
+where
+    O: Clone;
 
-impl<O> Snapshots<O> {
+impl<O: Clone> Snapshots<O> {
     pub(crate) const fn new(value: HashMap<Coin, Snapshot<O>>) -> Self {
         Self(value)
     }
@@ -80,9 +83,10 @@ where
     build_snapshots(height, snapshot)
 }
 
+#[cfg(test)]
 pub(crate) async fn load_snapshots_from_json<O, R>(path: &Path) -> Result<(u64, Snapshots<O>)>
 where
-    O: TryFrom<R, Error = Error>,
+    O: TryFrom<R, Error = Error> + Clone,
     R: Serialize + for<'a> Deserialize<'a>,
 {
     let mut file_contents = read(path).await?;
@@ -91,24 +95,62 @@ where
     build_snapshots(height, snapshot)
 }
 
+pub(crate) async fn load_snapshots_from_json_filtered<O, R>(
+    path: &Path,
+    allowed_coins: &[&str],
+) -> Result<(u64, Snapshots<O>)>
+where
+    O: TryFrom<R, Error = Error> + Clone,
+    R: Serialize + for<'a> Deserialize<'a>,
+{
+    let mut file_contents = read(path).await?;
+    #[allow(clippy::type_complexity)]
+    let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = simd_json::from_slice(&mut file_contents)?;
+    build_snapshots_filtered(height, snapshot, allowed_coins)
+}
+
+#[cfg(test)]
 fn build_snapshots<O, R>(height: u64, snapshot: Vec<(String, [Vec<R>; 2])>) -> Result<(u64, Snapshots<O>)>
 where
-    O: TryFrom<R, Error = Error>,
+    O: TryFrom<R, Error = Error> + Clone,
     R: Serialize + for<'a> Deserialize<'a>,
 {
     Ok((
         height,
-        Snapshots::new(
-            snapshot
-                .into_iter()
-                .map(|(coin, [bids, asks])| {
-                    let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
-                    let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
-                    Ok((Coin::new(&coin), Snapshot([bids, asks])))
-                })
-                .collect::<Result<HashMap<Coin, Snapshot<O>>>>()?,
-        ),
+        Snapshots::new(build_snapshot_map(snapshot, &[])?),
     ))
+}
+
+fn build_snapshots_filtered<O, R>(
+    height: u64,
+    snapshot: Vec<(String, [Vec<R>; 2])>,
+    allowed_coins: &[&str],
+) -> Result<(u64, Snapshots<O>)>
+where
+    O: TryFrom<R, Error = Error> + Clone,
+    R: Serialize + for<'a> Deserialize<'a>,
+{
+    Ok((height, Snapshots::new(build_snapshot_map(snapshot, allowed_coins)?)))
+}
+
+fn build_snapshot_map<O, R>(
+    snapshot: Vec<(String, [Vec<R>; 2])>,
+    allowed_coins: &[&str],
+) -> Result<HashMap<Coin, Snapshot<O>>>
+where
+    O: TryFrom<R, Error = Error> + Clone,
+    R: Serialize + for<'a> Deserialize<'a>,
+{
+    let mut out = HashMap::new();
+    for (coin, [bids, asks]) in snapshot {
+        if !allowed_coins.is_empty() && !allowed_coins.iter().any(|c| *c == coin) {
+            continue;
+        }
+        let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+        let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+        out.insert(Coin::new(&coin), Snapshot([bids, asks]));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

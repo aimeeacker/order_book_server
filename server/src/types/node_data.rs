@@ -97,16 +97,6 @@ impl<E> Batch<E> {
     {
         self.events.retain(f);
     }
-    
-    pub(crate) fn new(block_number: u64, block_time_millis: u64, events: Vec<E>) -> Self {
-        let block_time = NaiveDateTime::from_timestamp_millis(block_time_millis as i64).unwrap_or_default();
-        Self {
-            local_time: chrono::Local::now().naive_local(),
-            block_time,
-            block_number,
-            events
-        }
-    }
 
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {

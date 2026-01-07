@@ -97,7 +97,7 @@ impl Add<Self> for Sz {
 }
 
 // Multiply all sizes and prices by 10^MAX_DECIMALS for ease of computation.
-const MULTIPLIER: f64 = 100_000_000.0;
+pub(crate) const MULTIPLIER: f64 = 100_000_000.0;
 
 impl Debug for Px {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
