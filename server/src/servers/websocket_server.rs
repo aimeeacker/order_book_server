@@ -134,6 +134,47 @@ async fn handle_socket(
                                     send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time).await;
                                 }
                             },
+                            InternalMessage::SnapshotRebuilt { time, height, l4_snapshot, lite_snapshots } => {
+                                let mut l4book_payloads: HashMap<String, serde_json::Value> = HashMap::new();
+                                for (coin, snapshot) in l4_snapshot.as_ref() {
+                                    let levels =
+                                        snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
+                                    let payload = L4Book::Snapshot {
+                                        coin: coin.value(),
+                                        time: *time,
+                                        height: *height,
+                                        levels,
+                                    };
+                                    if let Ok(val) = serde_json::to_value(payload) {
+                                        l4book_payloads.insert(coin.value().to_string(), val);
+                                    }
+                                }
+
+                                let mut lite_payloads: HashMap<String, serde_json::Value> = HashMap::new();
+                                for (coin, snapshot) in lite_snapshots {
+                                    if let Ok(val) = serde_json::to_value(snapshot) {
+                                        lite_payloads.insert(coin.value().to_string(), val);
+                                    }
+                                }
+
+                                for sub in manager.subscriptions() {
+                                    match sub {
+                                        Subscription::L4Book { coin } => {
+                                            if let Some(data) = l4book_payloads.get(coin) {
+                                                let channel = format!("{}@l4Book", coin.to_lowercase());
+                                                send_stream_snapshot_message(&mut socket, &channel, data.clone()).await;
+                                            }
+                                        }
+                                        Subscription::L4Lite { coin } => {
+                                            if let Some(data) = lite_payloads.get(coin) {
+                                                let channel = format!("{}@l4Lite", coin.to_lowercase());
+                                                send_stream_snapshot_message(&mut socket, &channel, data.clone()).await;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             InternalMessage::Fills{ batch } => {
                                 let mut trades = coin_to_trades(batch);
                                 for sub in manager.subscriptions() {
@@ -520,6 +561,25 @@ async fn send_snapshot_response(
     let obj = serde_json::json!({
         "channel": channel,
         "req_id": req_id,
+        "data": data,
+    });
+    match serde_json::to_string(&obj) {
+        Ok(msg) => {
+            if let Err(err) = socket.send(FrameView::text(msg)).await {
+                error!("Failed to send: {err}");
+            }
+        }
+        Err(err) => error!("Server response serialization error: {err}"),
+    }
+}
+
+async fn send_stream_snapshot_message(
+    socket: &mut WebSocket,
+    channel: &str,
+    data: serde_json::Value,
+) {
+    let obj = serde_json::json!({
+        "channel": channel,
         "data": data,
     });
     match serde_json::to_string(&obj) {

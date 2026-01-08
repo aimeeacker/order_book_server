@@ -90,6 +90,12 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     // every so often, we fetch a new snapshot and the snapshot_fetch_task starts running.
     // Result is sent back along this channel (if error, we want to return to top level)
     let (snapshot_fetch_task_tx, mut snapshot_fetch_task_rx) = unbounded_channel::<Result<()>>();
+    let (snapshot_request_tx, mut snapshot_request_rx) = unbounded_channel::<()>();
+    let snapshot_inflight = {
+        let mut listener = listener.lock().await;
+        listener.set_snapshot_requester(snapshot_request_tx);
+        listener.snapshot_request_inflight()
+    };
 
     // Initialize Scheduler
     let sched = JobScheduler::new().await.map_err(|e| format!("Failed to create scheduler: {e}"))?;
@@ -98,10 +104,11 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     let job_dir = dir.clone();
     let job_listener = listener.clone();
     let job_tx = snapshot_fetch_task_tx.clone();
+    let job_inflight = snapshot_inflight.clone();
     let job = Job::new("30 0,30 * * * *", move |_uuid, _l| {
         let listener = job_listener.clone();
         let snapshot_fetch_task_tx = job_tx.clone();
-        fetch_snapshot(job_dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+        trigger_snapshot_fetch(job_dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot, job_inflight.clone());
     }).map_err(|e| format!("Failed to create cron job: {e}"))?;
 
     sched.add(job).await.map_err(|e| format!("Failed to add job: {e}"))?;
@@ -111,7 +118,13 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     
     // Trigger initial snapshot fetch
     info!("Triggering initial snapshot fetch");
-    fetch_snapshot(dir.clone(), listener.clone(), snapshot_fetch_task_tx.clone(), ignore_spot);
+    trigger_snapshot_fetch(
+        dir.clone(),
+        listener.clone(),
+        snapshot_fetch_task_tx.clone(),
+        ignore_spot,
+        snapshot_inflight.clone(),
+    );
 
     let mut health_check = interval(Duration::from_secs(5));
     loop {
@@ -122,9 +135,23 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                         return Err("Snapshot fetch task sender dropped".into());
                     }
                     Some(Err(err)) => {
+                        snapshot_inflight.store(false, AtomicOrdering::SeqCst);
                         return Err(format!("Abci state reading error: {err}").into());
                     }
-                    Some(Ok(())) => {}
+                    Some(Ok(())) => {
+                        snapshot_inflight.store(false, AtomicOrdering::SeqCst);
+                    }
+                }
+            }
+            snapshot_request = snapshot_request_rx.recv() => {
+                if snapshot_request.is_some() {
+                    trigger_snapshot_fetch(
+                        dir.clone(),
+                        listener.clone(),
+                        snapshot_fetch_task_tx.clone(),
+                        ignore_spot,
+                        snapshot_inflight.clone(),
+                    );
                 }
             }
             _ = health_check.tick() => {
@@ -135,6 +162,19 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
             }
         }
     }
+}
+
+fn trigger_snapshot_fetch(
+    dir: PathBuf,
+    listener: Arc<Mutex<OrderBookListener>>,
+    tx: UnboundedSender<Result<()>>,
+    ignore_spot: bool,
+    inflight: Arc<AtomicBool>,
+) {
+    if inflight.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
+    fetch_snapshot(dir, listener, tx, ignore_spot);
 }
 
 fn fetch_snapshot(
@@ -293,11 +333,16 @@ fn fetch_snapshot(
                                                                 }
                                                                 drop(listener_guard);
                                                                 if rebuilt {
+                                                                    let inflight = {
+                                                                        let listener = listener.lock().await;
+                                                                        listener.snapshot_request_inflight()
+                                                                    };
                                                                     schedule_snapshot_validation(
                                                                         dir.clone(),
                                                                         listener.clone(),
                                                                         tx.clone(),
                                                                         ignore_spot,
+                                                                        inflight,
                                                                     );
                                                                 }
                                                             }
@@ -347,6 +392,7 @@ fn fetch_snapshot(
                                         }
                                     }
 
+                                    let inflight = listener_guard.snapshot_request_inflight();
                                     if replay_failed {
                                         listener_guard.reset_after_drop();
                                     } else {
@@ -354,7 +400,13 @@ fn fetch_snapshot(
                                     }
                                     drop(listener_guard);
                                     if schedule_validation {
-                                        schedule_snapshot_validation(dir.clone(), listener.clone(), tx.clone(), ignore_spot);
+                                        schedule_snapshot_validation(
+                                            dir.clone(),
+                                            listener.clone(),
+                                            tx.clone(),
+                                            ignore_spot,
+                                            inflight,
+                                        );
                                     }
                                     Ok(())
                                 }
@@ -385,6 +437,7 @@ fn fetch_snapshot(
                                         }
                                     }
 
+                                    let inflight = listener_guard.snapshot_request_inflight();
                                     if replay_failed {
                                         listener_guard.reset_after_drop();
                                     } else {
@@ -392,7 +445,13 @@ fn fetch_snapshot(
                                     }
                                     drop(listener_guard);
                                     if schedule_validation {
-                                        schedule_snapshot_validation(dir.clone(), listener.clone(), tx.clone(), ignore_spot);
+                                        schedule_snapshot_validation(
+                                            dir.clone(),
+                                            listener.clone(),
+                                            tx.clone(),
+                                            ignore_spot,
+                                            inflight,
+                                        );
                                     }
                                     Ok(())
                                 }
@@ -403,7 +462,17 @@ fn fetch_snapshot(
                                 listener.init_from_snapshot(expected_snapshot, height)
                             };
                             if schedule_validation {
-                                schedule_snapshot_validation(dir.clone(), listener.clone(), tx.clone(), ignore_spot);
+                                let inflight = {
+                                    let listener = listener.lock().await;
+                                    listener.snapshot_request_inflight()
+                                };
+                                schedule_snapshot_validation(
+                                    dir.clone(),
+                                    listener.clone(),
+                                    tx.clone(),
+                                    ignore_spot,
+                                    inflight,
+                                );
                             }
                             Ok(())
                         }
@@ -423,10 +492,11 @@ fn schedule_snapshot_validation(
     listener: Arc<Mutex<OrderBookListener>>,
     tx: UnboundedSender<Result<()>>,
     ignore_spot: bool,
+    inflight: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
         sleep(Duration::from_secs(59)).await;
-        fetch_snapshot(dir, listener, tx, ignore_spot);
+        trigger_snapshot_fetch(dir, listener, tx, ignore_spot, inflight);
     });
 }
 
@@ -446,6 +516,8 @@ pub(crate) struct OrderBookListener {
     active_coins: Option<Arc<Mutex<HashMap<String, usize>>>>,
     pub lite_books: HashMap<Coin, lite::BookState>,
     warmup_deadline: Arc<AtomicU64>,
+    snapshot_request_tx: Option<UnboundedSender<()>>,
+    snapshot_request_inflight: Arc<AtomicBool>,
 }
 
 const FIFO_QUEUE_MAX_LEN: usize = 255;
@@ -466,6 +538,7 @@ impl OrderBookListener {
         ignore_spot: bool
     ) -> Self {
         let warmup_deadline = Arc::new(AtomicU64::new(now_millis() + WARMUP_MS));
+        let snapshot_request_inflight = Arc::new(AtomicBool::new(false));
         Self {
             ignore_spot,
             order_book_state: None,
@@ -480,6 +553,8 @@ impl OrderBookListener {
             active_coins,
             lite_books: HashMap::new(),
             warmup_deadline,
+            snapshot_request_tx: None,
+            snapshot_request_inflight,
         }
     }
 
@@ -521,6 +596,26 @@ impl OrderBookListener {
     fn bump_warmup_deadline(&self) {
         self.warmup_deadline.store(now_millis() + WARMUP_MS, AtomicOrdering::SeqCst);
     }
+
+    fn set_snapshot_requester(&mut self, tx: UnboundedSender<()>) {
+        self.snapshot_request_tx = Some(tx);
+    }
+
+    fn snapshot_request_inflight(&self) -> Arc<AtomicBool> {
+        self.snapshot_request_inflight.clone()
+    }
+
+    fn request_snapshot_rebuild(&self) -> bool {
+        let Some(tx) = &self.snapshot_request_tx else {
+            return false;
+        };
+        if !self.snapshot_request_inflight.load(AtomicOrdering::SeqCst) {
+            let _unused = tx.send(());
+            return true;
+        }
+        false
+    }
+
 
     #[allow(clippy::type_complexity)]
     // pops triplets of cached updates that have the same block height
@@ -663,6 +758,7 @@ impl OrderBookListener {
                      coin_fills.entry(Coin::new(&fill.1.coin)).or_default().push(fill);
                 }
 
+                let mut lite_errors: Vec<(Coin, u64, String)> = Vec::new();
                 for (coin, lb) in &mut self.lite_books {
                      if !lb.is_initialized() {
                          continue;
@@ -684,15 +780,31 @@ impl OrderBookListener {
                              }
                          }
                          Err(err) => {
-                             warn!(
-                                 "L4Lite out of sync for {} at height {}: {}. Waiting for next snapshot.",
-                                 coin.value(),
-                                 target_height,
-                                 err
-                             );
+                             lite_errors.push((coin.clone(), target_height, err.to_string()));
                              lb.reset();
                          }
                      }
+                }
+
+                if !lite_errors.is_empty() {
+                    let requested = self.request_snapshot_rebuild();
+                    for (coin, target_height, err) in lite_errors {
+                        if requested {
+                            warn!(
+                                "L4Lite out of sync for {} at height {}: {}. Triggering snapshot rebuild.",
+                                coin.value(),
+                                target_height,
+                                err
+                            );
+                        } else {
+                            warn!(
+                                "L4Lite out of sync for {} at height {}: {}. Snapshot rebuild already in progress.",
+                                coin.value(),
+                                target_height,
+                                err
+                            );
+                        }
+                    }
                 }
 
 
@@ -709,10 +821,20 @@ impl OrderBookListener {
                     let _unused = tx.send(msg);
                 }
 
-                self.order_book_state
+                if let Err(err) = self
+                    .order_book_state
                     .as_mut()
                     .map(|book| book.apply_updates(state_statuses, state_diffs))
-                    .transpose()?;
+                    .transpose()
+                {
+                    let requested = self.request_snapshot_rebuild();
+                    if requested {
+                        warn!("L4Book out of sync: {}. Triggering snapshot rebuild.", err);
+                    } else {
+                        warn!("L4Book out of sync: {}. Snapshot rebuild already in progress.", err);
+                    }
+                    return Err(err);
+                }
                 
                 if let Some(cache) = &mut self.fetched_snapshot_cache {
                     // Cache full updates (Filtered by Active | Main already) for snapshot catch-up
@@ -808,6 +930,7 @@ impl OrderBookListener {
                  coin_fills.entry(Coin::new(&fill.1.coin)).or_default().push(fill);
             }
 
+            let mut lite_errors: Vec<(Coin, u64, String)> = Vec::new();
             for (coin, lb) in &mut self.lite_books {
                  if !lb.is_initialized() {
                      continue;
@@ -817,14 +940,30 @@ impl OrderBookListener {
                  let fills = coin_fills.remove(coin).unwrap_or_default();
                  
                  if let Err(err) = lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height) {
-                     warn!(
-                         "L4Lite out of sync for {} at height {} during snapshot catch-up: {}. Waiting for next snapshot.",
-                         coin.value(),
-                         target_height,
-                         err
-                     );
+                     lite_errors.push((coin.clone(), target_height, err.to_string()));
                      lb.reset();
                  }
+            }
+
+            if !lite_errors.is_empty() {
+                let requested = self.request_snapshot_rebuild();
+                for (coin, target_height, err) in lite_errors {
+                    if requested {
+                        warn!(
+                            "L4Lite out of sync for {} at height {} during snapshot catch-up: {}. Triggering snapshot rebuild.",
+                            coin.value(),
+                            target_height,
+                            err
+                        );
+                    } else {
+                        warn!(
+                            "L4Lite out of sync for {} at height {} during snapshot catch-up: {}. Snapshot rebuild already in progress.",
+                            coin.value(),
+                            target_height,
+                            err
+                        );
+                    }
+                }
             }
 
             if new_order_book.apply_updates(state_statuses, state_diffs).is_err() {
@@ -838,6 +977,7 @@ impl OrderBookListener {
         if !retry {
             self.order_book_state = Some(new_order_book);
             info!("Order book ready");
+            self.broadcast_rebuilt_snapshots();
             true
         } else {
             false
@@ -860,6 +1000,55 @@ impl OrderBookListener {
             lb.init_from_snapshot(orders, height);
             self.lite_books.insert(coin.clone(), lb);
         }
+
+        self.broadcast_rebuilt_snapshots();
+    }
+
+    fn broadcast_rebuilt_snapshots(&self) {
+        let Some(tx) = &self.internal_message_tx else {
+            return;
+        };
+        let Some(book) = self.order_book_state.as_ref() else {
+            return;
+        };
+
+        let active_filter = self
+            .active_coins
+            .as_ref()
+            .and_then(|active| active.try_lock().ok())
+            .map(|active| active.keys().cloned().collect::<HashSet<String>>());
+        if let Some(active) = active_filter.as_ref() {
+            if active.is_empty() {
+                return;
+            }
+        }
+
+        let TimedSnapshots { time, height, snapshot } = book.compute_snapshot();
+        let mut snapshot_map = snapshot.value();
+        if let Some(active) = active_filter.as_ref() {
+            snapshot_map.retain(|coin, _| active.contains(coin.value().as_str()));
+        }
+        let l4_snapshot = Snapshots::new(snapshot_map);
+
+        let mut lite_snapshots = HashMap::new();
+        for (coin, lb) in &self.lite_books {
+            if let Some(active) = active_filter.as_ref() {
+                if !active.contains(coin.value().as_str()) {
+                    continue;
+                }
+            }
+            if lb.is_initialized() {
+                lite_snapshots.insert(coin.clone(), lb.get_snapshot());
+            }
+        }
+
+        let msg = InternalMessage::SnapshotRebuilt {
+            time,
+            height,
+            l4_snapshot,
+            lite_snapshots,
+        };
+        let _unused = tx.send(Arc::new(msg));
     }
 
     // forcibly grab current snapshot
@@ -951,6 +1140,12 @@ pub(crate) struct TimedSnapshots {
 pub(crate) enum InternalMessage {
     #[allow(dead_code)]
     Snapshot { l2_snapshots: L2Snapshots, time: u64 },
+    SnapshotRebuilt {
+        time: u64,
+        height: u64,
+        l4_snapshot: Snapshots<InnerL4Order>,
+        lite_snapshots: HashMap<Coin, lite::L2Snapshot>,
+    },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
     L4Lite { updates: Vec<lite::L2BlockUpdate>, analysis_b: Vec<lite::AnalysisUpdate>, analysis_a: Vec<lite::AnalysisUpdate>, height: u64 },
