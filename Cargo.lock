@@ -3602,6 +3602,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "itertools 0.14.0",
+ "libc",
  "log",
  "notify",
  "rand 0.9.1",

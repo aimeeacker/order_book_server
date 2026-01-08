@@ -14,6 +14,8 @@ pub(crate) enum ClientMessage {
     Subscribe { #[serde(flatten)] payload: SubscribePayload },
     #[serde(rename = "unsubscribe")]
     Unsubscribe { #[serde(flatten)] payload: SubscribePayload },
+    #[serde(rename = "getSnapshot")]
+    GetSnapshot { snapshot: String, #[serde(rename = "req_id")] req_id: Option<i64> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

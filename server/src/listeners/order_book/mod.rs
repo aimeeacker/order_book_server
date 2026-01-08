@@ -18,11 +18,12 @@ use log::{debug, error, info, warn};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader},
+    os::unix::io::AsRawFd,
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering as AtomicOrdering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{
@@ -43,6 +44,10 @@ pub(crate) mod lite;
 // if there are scripts running, this may not work as intended
 pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: PathBuf) -> Result<()> {
     let dropped_updates = Arc::new(AtomicBool::new(false));
+    let warmup_deadline = {
+        let listener = listener.lock().await;
+        listener.warmup_deadline()
+    };
     let fifo_paths = [
         (EventSource::OrderStatuses, fifo_path(EventSource::OrderStatuses)),
         (EventSource::Fills, fifo_path(EventSource::Fills)),
@@ -54,7 +59,13 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
 
     let (stream_tx, mut stream_rx) = channel::<StreamMessage>(FIFO_QUEUE_MAX_LEN);
     for (source, path) in fifo_paths {
-        spawn_fifo_reader(source, path, stream_tx.clone(), dropped_updates.clone());
+        spawn_fifo_reader(
+            source,
+            path,
+            stream_tx.clone(),
+            dropped_updates.clone(),
+            warmup_deadline.clone(),
+        );
     }
     let parser_listener = listener.clone();
     let parser_dropped_updates = dropped_updates.clone();
@@ -334,37 +345,12 @@ fn fetch_snapshot(
                                                 break;
                                             }
                                         }
-
-                                        let mut coin_statuses: HashMap<Coin, Vec<NodeDataOrderStatus>> = HashMap::new();
-                                        for status in order_statuses.clone().events() {
-                                            coin_statuses.entry(Coin::new(&status.order.coin)).or_default().push(status);
-                                        }
-                                        let mut coin_diffs: HashMap<Coin, Vec<NodeDataOrderDiff>> = HashMap::new();
-                                        for diff in order_diffs.clone().events() {
-                                            coin_diffs.entry(diff.coin()).or_default().push(diff);
-                                        }
-                                        let fills: Vec<NodeDataFill> = Vec::new();
-
-                                        for (coin, lb) in &mut listener_guard.lite_books {
-                                            if !lb.is_initialized() {
-                                                continue;
-                                            }
-                                            let statuses = coin_statuses.remove(coin).unwrap_or_default();
-                                            let diffs = coin_diffs.remove(coin).unwrap_or_default();
-                                            if let Err(err) = lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height) {
-                                                warn!(
-                                                    "L4Lite out of sync for {} at height {} during snapshot replay: {}. Waiting for next snapshot.",
-                                                    coin.value(),
-                                                    target_height,
-                                                    err
-                                                );
-                                                lb.reset();
-                                            }
-                                        }
                                     }
 
                                     if replay_failed {
                                         listener_guard.reset_after_drop();
+                                    } else {
+                                        listener_guard.rebuild_lite_from_state();
                                     }
                                     drop(listener_guard);
                                     if schedule_validation {
@@ -397,37 +383,12 @@ fn fetch_snapshot(
                                                 break;
                                             }
                                         }
-
-                                        let mut coin_statuses: HashMap<Coin, Vec<NodeDataOrderStatus>> = HashMap::new();
-                                        for status in order_statuses.clone().events() {
-                                            coin_statuses.entry(Coin::new(&status.order.coin)).or_default().push(status);
-                                        }
-                                        let mut coin_diffs: HashMap<Coin, Vec<NodeDataOrderDiff>> = HashMap::new();
-                                        for diff in order_diffs.clone().events() {
-                                            coin_diffs.entry(diff.coin()).or_default().push(diff);
-                                        }
-                                        let fills: Vec<NodeDataFill> = Vec::new();
-
-                                        for (coin, lb) in &mut listener_guard.lite_books {
-                                            if !lb.is_initialized() {
-                                                continue;
-                                            }
-                                            let statuses = coin_statuses.remove(coin).unwrap_or_default();
-                                            let diffs = coin_diffs.remove(coin).unwrap_or_default();
-                                            if let Err(err) = lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height) {
-                                                warn!(
-                                                    "L4Lite out of sync for {} at height {} during snapshot replay: {}. Waiting for next snapshot.",
-                                                    coin.value(),
-                                                    target_height,
-                                                    err
-                                                );
-                                                lb.reset();
-                                            }
-                                        }
                                     }
 
                                     if replay_failed {
                                         listener_guard.reset_after_drop();
+                                    } else {
+                                        listener_guard.rebuild_lite_from_state();
                                     }
                                     drop(listener_guard);
                                     if schedule_validation {
@@ -484,11 +445,14 @@ pub(crate) struct OrderBookListener {
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
     active_coins: Option<Arc<Mutex<HashMap<String, usize>>>>,
     pub lite_books: HashMap<Coin, lite::BookState>,
+    warmup_deadline: Arc<AtomicU64>,
 }
 
 const FIFO_QUEUE_MAX_LEN: usize = 255;
 const FIFO_BASE_DIR: &str = "/dev/shm/book_tmpfs";
 const MAIN_COINS: [&str; 2] = ["BTC", "ETH"];
+const PIPE_CAPACITY: usize = 16 * 1024 * 1024;
+const WARMUP_MS: u64 = 250;
 
 struct StreamMessage {
     event_source: EventSource,
@@ -501,6 +465,7 @@ impl OrderBookListener {
         active_coins: Option<Arc<Mutex<HashMap<String, usize>>>>,
         ignore_spot: bool
     ) -> Self {
+        let warmup_deadline = Arc::new(AtomicU64::new(now_millis() + WARMUP_MS));
         Self {
             ignore_spot,
             order_book_state: None,
@@ -514,6 +479,7 @@ impl OrderBookListener {
             fills_cache: BatchQueue::new(),
             active_coins,
             lite_books: HashMap::new(),
+            warmup_deadline,
         }
     }
 
@@ -534,6 +500,7 @@ impl OrderBookListener {
         self.fetched_snapshot_cache = None;
         self.pending_block_since = None;
         self.pending_block_height = None;
+        self.bump_warmup_deadline();
     }
 
     fn is_stalled(&self, threshold: Duration) -> bool {
@@ -545,6 +512,14 @@ impl OrderBookListener {
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
         self.order_book_state.as_ref().map_or_else(HashSet::new, OrderBookState::compute_universe)
+    }
+
+    fn warmup_deadline(&self) -> Arc<AtomicU64> {
+        self.warmup_deadline.clone()
+    }
+
+    fn bump_warmup_deadline(&self) {
+        self.warmup_deadline.store(now_millis() + WARMUP_MS, AtomicOrdering::SeqCst);
     }
 
     #[allow(clippy::type_complexity)]
@@ -869,6 +844,24 @@ impl OrderBookListener {
         }
     }
 
+    fn rebuild_lite_from_state(&mut self) {
+        let Some(book) = self.order_book_state.as_ref() else {
+            return;
+        };
+        let height = book.height();
+        let snapshot = book.compute_snapshot().snapshot;
+
+        self.lite_books.clear();
+        for (coin, orders) in snapshot.as_ref() {
+            if !MAIN_COINS.contains(&coin.value().as_str()) {
+                continue;
+            }
+            let mut lb = lite::BookState::new();
+            lb.init_from_snapshot(orders, height);
+            self.lite_books.insert(coin.clone(), lb);
+        }
+    }
+
     // forcibly grab current snapshot
     pub(crate) fn compute_snapshot(&mut self) -> Option<TimedSnapshots> {
         self.order_book_state.as_mut().map(|o| o.compute_snapshot())
@@ -898,6 +891,9 @@ impl OrderBookListener {
 
     fn process_stream_line(&mut self, line: String, event_source: EventSource) -> Result<()> {
         if line.is_empty() {
+            return Ok(());
+        }
+        if now_millis() < self.warmup_deadline.load(AtomicOrdering::SeqCst) {
             return Ok(());
         }
         self.last_event_time = Some(Instant::now());
@@ -975,11 +971,19 @@ fn fifo_path(event_source: EventSource) -> PathBuf {
     PathBuf::from(FIFO_BASE_DIR).join(name)
 }
 
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis() as u64
+}
+
 fn spawn_fifo_reader(
     event_source: EventSource,
     path: PathBuf,
     tx: MpscSender<StreamMessage>,
     dropped_updates: Arc<AtomicBool>,
+    warmup_deadline: Arc<AtomicU64>,
 ) {
     thread::spawn(move || loop {
         let file = match File::open(&path) {
@@ -990,6 +994,15 @@ fn spawn_fifo_reader(
                 continue;
             }
         };
+        let fd = file.as_raw_fd();
+        #[allow(unsafe_code)]
+        let set_ret = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_CAPACITY as i32) };
+        if set_ret == -1 {
+            warn!(
+                "Failed to set FIFO capacity for {event_source} at {}",
+                path.display()
+            );
+        }
         let mut reader = BufReader::new(file);
         let mut line = String::new();
         loop {
@@ -999,6 +1012,9 @@ fn spawn_fifo_reader(
                 Ok(_) => {
                     let trimmed = line.trim_end_matches('\n');
                     if trimmed.is_empty() {
+                        continue;
+                    }
+                    if now_millis() < warmup_deadline.load(AtomicOrdering::SeqCst) {
                         continue;
                     }
                     let message = StreamMessage {

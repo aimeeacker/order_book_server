@@ -192,7 +192,22 @@ async fn handle_socket(
                             info!("Client message: {text}");
 
                             if let Ok(value) = serde_json::from_str::<ClientMessage>(text) {
-                                receive_client_message(&mut socket, &mut manager, value, &universe, listener.clone(), active_symbols.clone()).await;
+                                match value {
+                                    ClientMessage::GetSnapshot { snapshot, req_id } => {
+                                        handle_snapshot_request(&mut socket, snapshot, req_id, listener.clone()).await;
+                                    }
+                                    other => {
+                                        receive_client_message(
+                                            &mut socket,
+                                            &mut manager,
+                                            other,
+                                            &universe,
+                                            listener.clone(),
+                                            active_symbols.clone(),
+                                        )
+                                        .await;
+                                    }
+                                }
                             }
                             else {
                                 let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
@@ -297,6 +312,11 @@ async fn receive_client_message(
                 (subs, valid_streams, req_id, false)
             }
         },
+        ClientMessage::GetSnapshot { .. } => {
+            let msg = ServerResponse::Error("Use getSnapshot with req_id on the request path".to_string());
+            send_socket_message(socket, msg).await;
+            return;
+        }
     };
 
     // Validate all subscriptions
@@ -406,6 +426,109 @@ async fn receive_client_message(
     // send any immediate snapshot messages
     for sm in snapshot_msgs {
         send_socket_message(socket, sm).await;
+    }
+}
+
+enum SnapshotKind {
+    L4Book,
+    L4Lite,
+}
+
+fn parse_snapshot_request(snapshot: &str) -> Option<(String, SnapshotKind, String)> {
+    let trimmed = snapshot.trim().trim_end_matches('/');
+    let mut parts = trimmed.splitn(2, '@');
+    let coin = parts.next()?.trim();
+    let kind = parts.next()?.trim().to_lowercase();
+    if coin.is_empty() {
+        return None;
+    }
+    let kind = match kind.as_str() {
+        "l4book" => SnapshotKind::L4Book,
+        "l4lite" => SnapshotKind::L4Lite,
+        _ => return None,
+    };
+    Some((coin.to_uppercase(), kind, trimmed.to_string()))
+}
+
+async fn handle_snapshot_request(
+    socket: &mut WebSocket,
+    snapshot: String,
+    req_id: Option<i64>,
+    listener: Arc<Mutex<OrderBookListener>>,
+) {
+    let trimmed = snapshot.trim().trim_end_matches('/');
+    let fallback_channel = if trimmed.is_empty() { "snapshot" } else { trimmed };
+    let (coin, kind, channel) = match parse_snapshot_request(trimmed) {
+        Some(parts) => parts,
+        None => {
+            let payload = serde_json::json!({ "error": "Invalid snapshot format" });
+            send_snapshot_response(socket, fallback_channel, req_id, payload).await;
+            return;
+        }
+    };
+
+    match kind {
+        SnapshotKind::L4Book => {
+            let snapshot = listener.lock().await.compute_snapshot();
+            if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
+                let snapshot =
+                    snapshot.value().into_iter().find(|(c, _)| *c == Coin::new(&coin));
+                if let Some((coin, snapshot)) = snapshot {
+                    let levels =
+                        snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
+                    let payload = L4Book::Snapshot {
+                        coin: coin.value(),
+                        time,
+                        height,
+                        levels,
+                    };
+                    if let Ok(data) = serde_json::to_value(payload) {
+                        send_snapshot_response(socket, &channel, req_id, data).await;
+                        return;
+                    }
+                }
+            }
+            let payload = serde_json::json!({ "error": "Snapshot not available" });
+            send_snapshot_response(socket, &channel, req_id, payload).await;
+        }
+        SnapshotKind::L4Lite => {
+            let listener = listener.lock().await;
+            if let Some(lb) = listener.lite_books.get(&Coin::new(&coin)) {
+                if !lb.is_initialized() {
+                    let payload = serde_json::json!({ "error": "Lite snapshot not initialized" });
+                    send_snapshot_response(socket, &channel, req_id, payload).await;
+                    return;
+                }
+                let snap = lb.get_snapshot();
+                if let Ok(data) = serde_json::to_value(snap) {
+                    send_snapshot_response(socket, &channel, req_id, data).await;
+                    return;
+                }
+            }
+            let payload = serde_json::json!({ "error": "Lite snapshot not available" });
+            send_snapshot_response(socket, &channel, req_id, payload).await;
+        }
+    }
+}
+
+async fn send_snapshot_response(
+    socket: &mut WebSocket,
+    channel: &str,
+    req_id: Option<i64>,
+    data: serde_json::Value,
+) {
+    let obj = serde_json::json!({
+        "channel": channel,
+        "req_id": req_id,
+        "data": data,
+    });
+    match serde_json::to_string(&obj) {
+        Ok(msg) => {
+            if let Err(err) = socket.send(FrameView::text(msg)).await {
+                error!("Failed to send: {err}");
+            }
+        }
+        Err(err) => error!("Server response serialization error: {err}"),
     }
 }
 
