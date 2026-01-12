@@ -96,6 +96,10 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
         listener.set_snapshot_requester(snapshot_request_tx);
         listener.snapshot_request_inflight()
     };
+    let snapshot_pending = {
+        let listener = listener.lock().await;
+        listener.snapshot_request_pending()
+    };
 
     // Initialize Scheduler
     let sched = JobScheduler::new().await.map_err(|e| format!("Failed to create scheduler: {e}"))?;
@@ -126,20 +130,42 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
         snapshot_inflight.clone(),
     );
 
-    let mut health_check = interval(Duration::from_secs(5));
+    let mut health_check = interval(Duration::from_secs(60));
     loop {
         tokio::select! {
             snapshot_fetch_res = snapshot_fetch_task_rx.recv() => {
                 match snapshot_fetch_res {
                     None => {
-                        return Err("Snapshot fetch task sender dropped".into());
+                        warn!("Snapshot fetch task sender dropped; backing off for 60s.");
+                        schedule_snapshot_retry(
+                            dir.clone(),
+                            listener.clone(),
+                            snapshot_fetch_task_tx.clone(),
+                            ignore_spot,
+                            snapshot_inflight.clone(),
+                        );
                     }
                     Some(Err(err)) => {
-                        snapshot_inflight.store(false, AtomicOrdering::SeqCst);
-                        return Err(format!("Abci state reading error: {err}").into());
+                        warn!("Snapshot fetch failed: {err}. Backing off for 60s.");
+                        schedule_snapshot_retry(
+                            dir.clone(),
+                            listener.clone(),
+                            snapshot_fetch_task_tx.clone(),
+                            ignore_spot,
+                            snapshot_inflight.clone(),
+                        );
                     }
                     Some(Ok(())) => {
                         snapshot_inflight.store(false, AtomicOrdering::SeqCst);
+                        if snapshot_pending.swap(false, AtomicOrdering::SeqCst) {
+                            trigger_snapshot_fetch(
+                                dir.clone(),
+                                listener.clone(),
+                                snapshot_fetch_task_tx.clone(),
+                                ignore_spot,
+                                snapshot_inflight.clone(),
+                            );
+                        }
                     }
                 }
             }
@@ -157,7 +183,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
             _ = health_check.tick() => {
                 let listener = listener.lock().await;
                 if listener.is_ready() && listener.is_stalled(Duration::from_secs(5)) {
-                    return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
+                    warn!("Stream has fallen behind ({HL_NODE} failed?). Continuing to wait.");
                 }
             }
         }
@@ -175,6 +201,20 @@ fn trigger_snapshot_fetch(
         return;
     }
     fetch_snapshot(dir, listener, tx, ignore_spot);
+}
+
+fn schedule_snapshot_retry(
+    dir: PathBuf,
+    listener: Arc<Mutex<OrderBookListener>>,
+    tx: UnboundedSender<Result<()>>,
+    ignore_spot: bool,
+    inflight: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(60)).await;
+        inflight.store(false, AtomicOrdering::SeqCst);
+        trigger_snapshot_fetch(dir, listener, tx, ignore_spot, inflight);
+    });
 }
 
 fn fetch_snapshot(
@@ -518,6 +558,7 @@ pub(crate) struct OrderBookListener {
     warmup_deadline: Arc<AtomicU64>,
     snapshot_request_tx: Option<UnboundedSender<()>>,
     snapshot_request_inflight: Arc<AtomicBool>,
+    snapshot_request_pending: Arc<AtomicBool>,
 }
 
 const FIFO_QUEUE_MAX_LEN: usize = 255;
@@ -539,6 +580,7 @@ impl OrderBookListener {
     ) -> Self {
         let warmup_deadline = Arc::new(AtomicU64::new(now_millis() + WARMUP_MS));
         let snapshot_request_inflight = Arc::new(AtomicBool::new(false));
+        let snapshot_request_pending = Arc::new(AtomicBool::new(false));
         Self {
             ignore_spot,
             order_book_state: None,
@@ -555,6 +597,7 @@ impl OrderBookListener {
             warmup_deadline,
             snapshot_request_tx: None,
             snapshot_request_inflight,
+            snapshot_request_pending,
         }
     }
 
@@ -605,6 +648,10 @@ impl OrderBookListener {
         self.snapshot_request_inflight.clone()
     }
 
+    fn snapshot_request_pending(&self) -> Arc<AtomicBool> {
+        self.snapshot_request_pending.clone()
+    }
+
     fn request_snapshot_rebuild(&self) -> bool {
         let Some(tx) = &self.snapshot_request_tx else {
             return false;
@@ -613,6 +660,7 @@ impl OrderBookListener {
             let _unused = tx.send(());
             return true;
         }
+        self.snapshot_request_pending.store(true, AtomicOrdering::SeqCst);
         false
     }
 
@@ -742,6 +790,10 @@ impl OrderBookListener {
                 let mut all_lite_updates = Vec::new();
                 let mut all_analysis_updates_b = Vec::new();
                 let mut all_analysis_updates_a = Vec::new();
+                let mut all_analysis_rollup_b = Vec::new();
+                let mut all_analysis_rollup_a = Vec::new();
+                let mut all_analysis_rollup_sum_b: Vec<(Coin, [String; 4])> = Vec::new();
+                let mut all_analysis_rollup_sum_a: Vec<(Coin, [String; 4])> = Vec::new();
 
                 let mut coin_statuses: HashMap<Coin, Vec<NodeDataOrderStatus>> = HashMap::new();
                 for status in state_statuses.clone().events() {
@@ -778,6 +830,18 @@ impl OrderBookListener {
                              if !block_event.analysis_updates_a.is_empty() {
                                  all_analysis_updates_a.extend(block_event.analysis_updates_a);
                              }
+                             if !block_event.analysis_rollup_b.is_empty() {
+                                 all_analysis_rollup_b.extend(block_event.analysis_rollup_b);
+                             }
+                             if !block_event.analysis_rollup_a.is_empty() {
+                                 all_analysis_rollup_a.extend(block_event.analysis_rollup_a);
+                             }
+                             if let Some(sum_b) = block_event.analysis_rollup_sum_b {
+                                 all_analysis_rollup_sum_b.push((coin.clone(), sum_b));
+                             }
+                             if let Some(sum_a) = block_event.analysis_rollup_sum_a {
+                                 all_analysis_rollup_sum_a.push((coin.clone(), sum_a));
+                             }
                          }
                          Err(err) => {
                              lite_errors.push((coin.clone(), target_height, err.to_string()));
@@ -798,7 +862,7 @@ impl OrderBookListener {
                             );
                         } else {
                             warn!(
-                                "L4Lite out of sync for {} at height {}: {}. Snapshot rebuild already in progress.",
+                                "L4Lite out of sync for {} at height {}: {}. Snapshot rebuild already queued.",
                                 coin.value(),
                                 target_height,
                                 err
@@ -810,10 +874,20 @@ impl OrderBookListener {
 
                 // Always send L4Lite message to propagate block height, even if empty
                 if let Some(tx) = &self.internal_message_tx {
+                    let analysis_rollup_height = if target_height % 10 == 0 {
+                        Some(target_height)
+                    } else {
+                        None
+                    };
                     let msg = Arc::new(InternalMessage::L4Lite { 
                         updates: all_lite_updates,
                         analysis_b: all_analysis_updates_b,
                         analysis_a: all_analysis_updates_a,
+                        analysis_rollup_b: all_analysis_rollup_b,
+                        analysis_rollup_a: all_analysis_rollup_a,
+                        analysis_rollup_sum_b: all_analysis_rollup_sum_b,
+                        analysis_rollup_sum_a: all_analysis_rollup_sum_a,
+                        analysis_rollup_height,
                         height: target_height,
                     });
                     // broadcast::Sender::send is synchronous and non-blocking.
@@ -831,7 +905,7 @@ impl OrderBookListener {
                     if requested {
                         warn!("L4Book out of sync: {}. Triggering snapshot rebuild.", err);
                     } else {
-                        warn!("L4Book out of sync: {}. Snapshot rebuild already in progress.", err);
+                        warn!("L4Book out of sync: {}. Snapshot rebuild already queued.", err);
                     }
                     return Err(err);
                 }
@@ -957,7 +1031,7 @@ impl OrderBookListener {
                         );
                     } else {
                         warn!(
-                            "L4Lite out of sync for {} at height {} during snapshot catch-up: {}. Snapshot rebuild already in progress.",
+                            "L4Lite out of sync for {} at height {} during snapshot catch-up: {}. Snapshot rebuild already queued.",
                             coin.value(),
                             target_height,
                             err
@@ -1148,7 +1222,17 @@ pub(crate) enum InternalMessage {
     },
     Fills { batch: Batch<NodeDataFill> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
-    L4Lite { updates: Vec<lite::L2BlockUpdate>, analysis_b: Vec<lite::AnalysisUpdate>, analysis_a: Vec<lite::AnalysisUpdate>, height: u64 },
+    L4Lite {
+        updates: Vec<lite::L2BlockUpdate>,
+        analysis_b: Vec<lite::AnalysisUpdate>,
+        analysis_a: Vec<lite::AnalysisUpdate>,
+        analysis_rollup_b: Vec<lite::AnalysisUpdate>,
+        analysis_rollup_a: Vec<lite::AnalysisUpdate>,
+        analysis_rollup_sum_b: Vec<(Coin, [String; 4])>,
+        analysis_rollup_sum_a: Vec<(Coin, [String; 4])>,
+        analysis_rollup_height: Option<u64>,
+        height: u64,
+    },
 }
 
 #[derive(Eq, PartialEq, Hash)]

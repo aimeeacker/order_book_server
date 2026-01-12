@@ -187,7 +187,7 @@ async fn handle_socket(
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
                                 }
                             },
-                            InternalMessage::L4Lite{ updates, analysis_b, analysis_a, height } => {
+                            InternalMessage::L4Lite{ updates, analysis_b, analysis_a, analysis_rollup_b, analysis_rollup_a, analysis_rollup_sum_b, analysis_rollup_sum_a, analysis_rollup_height, height } => {
                                 let mut updates_by_coin: HashMap<String, crate::listeners::order_book::lite::L2BlockUpdate> = HashMap::new();
                                 for u in updates {
                                     updates_by_coin.insert(u.coin.clone(), u.clone());
@@ -202,8 +202,37 @@ async fn handle_socket(
                                     analysis_by_coin_a.entry(a.coin.value()).or_default().push(a.clone());
                                 }
 
+                                let mut rollup_by_coin_b: HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>> = HashMap::new();
+                                for a in analysis_rollup_b {
+                                    rollup_by_coin_b.entry(a.coin.value()).or_default().push(a.clone());
+                                }
+                                let mut rollup_by_coin_a: HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>> = HashMap::new();
+                                for a in analysis_rollup_a {
+                                    rollup_by_coin_a.entry(a.coin.value()).or_default().push(a.clone());
+                                }
+                                let mut rollup_sum_by_coin_b: HashMap<String, [String; 4]> = HashMap::new();
+                                for (coin, sum) in analysis_rollup_sum_b {
+                                    rollup_sum_by_coin_b.insert(coin.value(), sum.clone());
+                                }
+                                let mut rollup_sum_by_coin_a: HashMap<String, [String; 4]> = HashMap::new();
+                                for (coin, sum) in analysis_rollup_sum_a {
+                                    rollup_sum_by_coin_a.insert(coin.value(), sum.clone());
+                                }
+
                                 for sub in manager.subscriptions() {
-                                    send_ws_data_from_lite_updates(&mut socket, sub, &mut updates_by_coin, &mut analysis_by_coin_b, &mut analysis_by_coin_a, *height).await;
+                                    send_ws_data_from_lite_updates(
+                                        &mut socket,
+                                        sub,
+                                        &mut updates_by_coin,
+                                        &mut analysis_by_coin_b,
+                                        &mut analysis_by_coin_a,
+                                        &mut rollup_by_coin_b,
+                                        &mut rollup_by_coin_a,
+                                        &mut rollup_sum_by_coin_b,
+                                        &mut rollup_sum_by_coin_a,
+                                        *analysis_rollup_height,
+                                        *height,
+                                    ).await;
                                 }
                             },
                         }
@@ -277,6 +306,7 @@ async fn handle_socket(
             Subscription::L2Book { coin, .. } => coin,
             Subscription::L4Book { coin } => coin,
             Subscription::L4Lite { coin } => coin,
+            Subscription::L4Anal { coin } => coin,
         };
         if let Some(count) = guard.get_mut(coin) {
             *count = count.saturating_sub(1);
@@ -302,6 +332,7 @@ async fn receive_client_message(
             Subscription::L2Book { coin, .. } => format!("{}@l2Book", coin.to_lowercase()),
             Subscription::L4Book { coin } => format!("{}@l4Book", coin.to_lowercase()),
             Subscription::L4Lite { coin } => format!("{}@l4Lite", coin.to_lowercase()),
+            Subscription::L4Anal { coin } => format!("{}@l4Anal", coin.to_lowercase()),
         }
     }
 
@@ -313,6 +344,7 @@ async fn receive_client_message(
         match kind.as_str() {
             "l4book" => Some(Subscription::L4Book { coin }),
             "l4lite" => Some(Subscription::L4Lite { coin }),
+            "l4anal" => Some(Subscription::L4Anal { coin }),
             "l2book" => Some(Subscription::L2Book { coin, n_sig_figs: None, n_levels: None, mantissa: None }),
             "trade" | "trades" => Some(Subscription::Trades { coin }),
             _ => None,
@@ -382,6 +414,7 @@ async fn receive_client_message(
                 Subscription::L2Book { coin, .. } => coin,
                 Subscription::L4Book { coin } => coin,
                 Subscription::L4Lite { coin } => coin,
+                Subscription::L4Anal { coin } => coin,
             };
             if is_subscribe {
                 *guard.entry(coin.clone()).or_insert(0) += 1;
@@ -592,6 +625,20 @@ async fn send_stream_snapshot_message(
     }
 }
 
+#[derive(serde::Serialize)]
+struct AnalysisRollupFrame<'a> {
+    #[serde(rename = "sum_a")]
+    sum_a: [String; 4],
+    #[serde(rename = "sum_b")]
+    sum_b: [String; 4],
+    #[serde(rename = "a")]
+    asks: &'a Vec<crate::listeners::order_book::lite::AnalysisUpdate>,
+    #[serde(rename = "b")]
+    bids: &'a Vec<crate::listeners::order_book::lite::AnalysisUpdate>,
+    #[serde(rename = "block_height")]
+    block_height: u64,
+}
+
 
 async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
     // Special-case subscription response so `req_id` is placed at top-level
@@ -709,37 +756,78 @@ async fn send_ws_data_from_lite_updates(
     updates: &mut HashMap<String, crate::listeners::order_book::lite::L2BlockUpdate>,
     analysis_b: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
     analysis_a: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
+    rollup_b: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
+    rollup_a: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
+    rollup_sum_b: &mut HashMap<String, [String; 4]>,
+    rollup_sum_a: &mut HashMap<String, [String; 4]>,
+    rollup_height: Option<u64>,
     block_height: u64,
 ) {
-    if let Subscription::L4Lite { coin } = subscription {
-        use crate::types::subscription::AnalysisData;
-        
-        let lite = updates.get(coin).cloned().unwrap_or_else(|| {
-             crate::listeners::order_book::lite::L2BlockUpdate {
-                 coin: coin.clone(),
-                 b: Vec::new(),
-                 a: Vec::new(),
-                 block_height
-             }
-        });
-        
-        // Send analysis frame 
-        let a_b = analysis_b.remove(coin).unwrap_or_default();
-        let a_a = analysis_a.remove(coin).unwrap_or_default();
+    match subscription {
+        Subscription::L4Lite { coin } => {
+            use crate::types::subscription::AnalysisData;
+            
+            let lite = updates.get(coin).cloned().unwrap_or_else(|| {
+                 crate::listeners::order_book::lite::L2BlockUpdate {
+                     coin: coin.clone(),
+                     b: Vec::new(),
+                     a: Vec::new(),
+                     block_height
+                 }
+            });
+            
+            // Send analysis frame 
+            let a_b = analysis_b.remove(coin).unwrap_or_default();
+            let a_a = analysis_a.remove(coin).unwrap_or_default();
 
-        let analysis = AnalysisData {
-             bids: a_b,
-             asks: a_a,
-             block_height,
-        };
-        
-        // Combined Update
-        let msg = ServerResponse::L4LiteUpdate {
-             lite,
-             analysis
-        };
-        
-        send_socket_message(socket, msg).await;
+            let analysis = AnalysisData {
+                 bids: a_b,
+                 asks: a_a,
+                 block_height,
+            };
+            
+            // Combined Update
+            let msg = ServerResponse::L4LiteUpdate {
+                 lite,
+                 analysis
+            };
+            
+            send_socket_message(socket, msg).await;
+        }
+        Subscription::L4Anal { coin } => {
+            if let Some(rollup_height) = rollup_height {
+                let r_b = rollup_b.remove(coin).unwrap_or_default();
+                let r_a = rollup_a.remove(coin).unwrap_or_default();
+                let sum_b = rollup_sum_b.remove(coin).unwrap_or_else(|| {
+                    [
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                    ]
+                });
+                let sum_a = rollup_sum_a.remove(coin).unwrap_or_else(|| {
+                    [
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                        "0".to_string(),
+                    ]
+                });
+                let frame = AnalysisRollupFrame {
+                    sum_a,
+                    sum_b,
+                    asks: &r_a,
+                    bids: &r_b,
+                    block_height: rollup_height,
+                };
+                if let Ok(val) = serde_json::to_value(frame) {
+                    let channel = format!("{}@l4Anal", coin.to_lowercase());
+                    send_stream_snapshot_message(socket, &channel, val).await;
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -804,6 +892,7 @@ impl Subscription {
                      return Err("LiteBook not ready".into());
                 }
             }
+            Self::L4Anal { .. } => Ok(None),
             _ => Ok(None)
         }
     }

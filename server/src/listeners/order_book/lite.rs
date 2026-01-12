@@ -5,9 +5,15 @@ use crate::types::inner::{InnerL4Order, InnerOrderDiff};
 use crate::types::node_data::{NodeDataOrderDiff, NodeDataOrderStatus, NodeDataFill};
 use serde::ser::{Serializer, SerializeTuple};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+const PRICE_SCALE: u64 = 100_000_000;
+const BTC_BUCKET_SIZE: u64 = 50 * PRICE_SCALE;
+const ETH_BUCKET_SIZE: u64 = 5 * PRICE_SCALE;
+const ANALYSIS_ROLLUP_BLOCKS: u64 = 10;
+const ANALYSIS_ROLLUP_WINDOWS: usize = 180;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +36,9 @@ pub(crate) struct AnalysisUpdate {
     pub side: Side,
     pub px: String,
     pub fill: String,
+    pub fill_notional: String,
     pub change: String,
+    pub change_notional: String,
 }
 
 impl Serialize for AnalysisUpdate {
@@ -38,10 +46,12 @@ impl Serialize for AnalysisUpdate {
     where
         S: Serializer,
     {
-        let mut seq = serializer.serialize_tuple(3)?;
+        let mut seq = serializer.serialize_tuple(5)?;
         seq.serialize_element(&self.px)?;
         seq.serialize_element(&self.fill)?;
+        seq.serialize_element(&self.fill_notional)?;
         seq.serialize_element(&self.change)?;
+        seq.serialize_element(&self.change_notional)?;
         seq.end()
     }
 }
@@ -68,11 +78,118 @@ fn fmt_sz_signed(v: i64) -> String {
     }
 }
 
+fn fmt_notional(v: u128) -> String {
+    if v == 0 {
+        return "0".to_string();
+    }
+    let rounded = (v + 500_000) / 1_000_000;
+    let int_part = rounded / 100;
+    let frac = rounded % 100;
+    format!("{}.{:02}", int_part, frac)
+}
+
+fn fmt_notional_signed(v: i128) -> String {
+    if v == 0 {
+        return "0".to_string();
+    }
+    let neg = v < 0;
+    let abs = if neg { -v } else { v } as u128;
+    let rounded = (abs + 500_000) / 1_000_000;
+    let int_part = rounded / 100;
+    let frac = rounded % 100;
+    if neg {
+        format!("-{}.{:02}", int_part, frac)
+    } else {
+        format!("+{}.{:02}", int_part, frac)
+    }
+}
+
+fn bucket_size_for_coin(coin: &Coin) -> u64 {
+    let coin_value = coin.value();
+    match coin_value.as_str() {
+        "BTC" => BTC_BUCKET_SIZE,
+        "ETH" => ETH_BUCKET_SIZE,
+        _ => PRICE_SCALE,
+    }
+}
+
+fn bucket_lower_px(coin: &Coin, px: u64) -> u64 {
+    let size = bucket_size_for_coin(coin);
+    if size == 0 {
+        return px;
+    }
+    (px / size) * size
+}
+
+fn merge_bucket_maps(target: &mut HashMap<u64, BucketAgg>, source: &HashMap<u64, BucketAgg>) {
+    for (px, agg) in source {
+        let entry = target.entry(*px).or_default();
+        entry.fill += agg.fill;
+        entry.change += agg.change;
+    }
+}
+
+fn sum_bucket_map(buckets: &HashMap<u64, BucketAgg>) -> (u64, u128, i64, i128) {
+    let mut fill = 0u64;
+    let mut fill_notional = 0u128;
+    let mut change = 0i64;
+    let mut change_notional = 0i128;
+    for (px, agg) in buckets {
+        fill = fill.saturating_add(agg.fill);
+        change = change.saturating_add(agg.change);
+        let px_u128 = u128::from(*px);
+        fill_notional = fill_notional.saturating_add((px_u128 * u128::from(agg.fill)) / u128::from(PRICE_SCALE));
+        let change_part = (i128::from(*px) * i128::from(agg.change)) / i128::from(PRICE_SCALE);
+        change_notional = change_notional.saturating_add(change_part);
+    }
+    (fill, fill_notional, change, change_notional)
+}
+
+fn format_sum_values(fill: u64, fill_notional: u128, change: i64, change_notional: i128) -> [String; 4] {
+    [
+        fmt_sz(fill),
+        fmt_notional(fill_notional),
+        fmt_sz_signed(change),
+        fmt_notional_signed(change_notional),
+    ]
+}
+
+fn bucket_map_to_updates(coin: &Coin, side: Side, buckets: &HashMap<u64, BucketAgg>) -> Vec<AnalysisUpdate> {
+    let mut levels: Vec<(&u64, &BucketAgg)> = buckets.iter().collect();
+    levels.sort_by_key(|(px, _)| *px);
+    if side == Side::Bid {
+        levels.reverse();
+    }
+
+    let mut updates = Vec::new();
+    for (px, agg) in levels {
+        if agg.fill == 0 && agg.change == 0 {
+            continue;
+        }
+        let fill_notional = (u128::from(*px) * u128::from(agg.fill)) / u128::from(PRICE_SCALE);
+        let change_notional = (i128::from(*px) * i128::from(agg.change)) / i128::from(PRICE_SCALE);
+        updates.push(AnalysisUpdate {
+            coin: coin.clone(),
+            side,
+            px: fmt_px(*px),
+            fill: fmt_sz(agg.fill),
+            fill_notional: fmt_notional(fill_notional),
+            change: fmt_sz_signed(agg.change),
+            change_notional: fmt_notional_signed(change_notional),
+        });
+    }
+    updates
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct L4LiteBlockEvent {
     pub depth_updates: Option<L2BlockUpdate>,
     pub analysis_updates_b: Vec<AnalysisUpdate>,
     pub analysis_updates_a: Vec<AnalysisUpdate>,
+    pub analysis_rollup_b: Vec<AnalysisUpdate>,
+    pub analysis_rollup_a: Vec<AnalysisUpdate>,
+    pub analysis_rollup_sum_b: Option<[String; 4]>,
+    pub analysis_rollup_sum_a: Option<[String; 4]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,7 +234,22 @@ pub(crate) struct BookState {
     pub oid_index: HashMap<Oid, OrderInfo>,
     pub dirty_levels: Vec<(Side, Px)>,
     pub last_block_height: u64,
+    analysis_window_b: HashMap<u64, BucketAgg>,
+    analysis_window_a: HashMap<u64, BucketAgg>,
+    analysis_rollups: VecDeque<BucketWindow>,
     initialized: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BucketAgg {
+    fill: u64,
+    change: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BucketWindow {
+    bids: HashMap<u64, BucketAgg>,
+    asks: HashMap<u64, BucketAgg>,
 }
 
 impl BookState {
@@ -128,6 +260,9 @@ impl BookState {
             oid_index: HashMap::new(),
             dirty_levels: Vec::new(),
             last_block_height: 0,
+            analysis_window_b: HashMap::new(),
+            analysis_window_a: HashMap::new(),
+            analysis_rollups: VecDeque::new(),
             initialized: false,
         }
     }
@@ -146,6 +281,8 @@ impl BookState {
         self.oid_index.clear();
         self.dirty_levels.clear();
         self.last_block_height = 0;
+        self.analysis_window_b.clear();
+        self.analysis_window_a.clear();
         self.initialized = false;
     }
 
@@ -178,6 +315,10 @@ impl BookState {
                 depth_updates: None,
                 analysis_updates_b: Vec::new(),
                 analysis_updates_a: Vec::new(),
+                analysis_rollup_b: Vec::new(),
+                analysis_rollup_a: Vec::new(),
+                analysis_rollup_sum_b: None,
+                analysis_rollup_sum_a: None,
             });
         }
         if block_height != self.last_block_height + 1 {
@@ -326,8 +467,8 @@ impl BookState {
         // 4. Generate Analysis & Updates
         let mut b_updates = Vec::new();
         let mut a_updates = Vec::new();
-        let mut analysis_b = Vec::new();
-        let mut analysis_a = Vec::new();
+        let mut block_buckets_b: HashMap<u64, BucketAgg> = HashMap::new();
+        let mut block_buckets_a: HashMap<u64, BucketAgg> = HashMap::new();
 
         for (side, px) in affected_levels {
              let filled_val = *filled_amts.get(&(side, px)).unwrap_or(&0);
@@ -338,17 +479,14 @@ impl BookState {
              let change = delta_total + (filled_val as i64);
              
              if filled_val > 0 || change != 0 {
-                 let update = AnalysisUpdate {
-                     coin: coin.clone(),
-                     side,
-                     px: fmt_px(px.value()),
-                     fill: fmt_sz(filled_val),
-                     change: fmt_sz_signed(change),
+                 let bucket_px = bucket_lower_px(&coin, px.value());
+                 let target = match side {
+                     Side::Bid => &mut block_buckets_b,
+                     Side::Ask => &mut block_buckets_a,
                  };
-                 match side {
-                     Side::Bid => analysis_b.push(update),
-                     Side::Ask => analysis_a.push(update),
-                 }
+                 let entry = target.entry(bucket_px).or_default();
+                 entry.fill += filled_val;
+                 entry.change += change;
              }
              
              let state = match side {
@@ -380,10 +518,48 @@ impl BookState {
              block_height,
         });
 
+        merge_bucket_maps(&mut self.analysis_window_b, &block_buckets_b);
+        merge_bucket_maps(&mut self.analysis_window_a, &block_buckets_a);
+
+        let analysis_b = bucket_map_to_updates(&coin, Side::Bid, &block_buckets_b);
+        let analysis_a = bucket_map_to_updates(&coin, Side::Ask, &block_buckets_a);
+
+        let mut analysis_rollup_b = Vec::new();
+        let mut analysis_rollup_a = Vec::new();
+        let mut analysis_rollup_sum_b = None;
+        let mut analysis_rollup_sum_a = None;
+        if block_height % ANALYSIS_ROLLUP_BLOCKS == 0 {
+            let window = BucketWindow {
+                bids: std::mem::take(&mut self.analysis_window_b),
+                asks: std::mem::take(&mut self.analysis_window_a),
+            };
+            self.analysis_rollups.push_back(window);
+            if self.analysis_rollups.len() > ANALYSIS_ROLLUP_WINDOWS {
+                self.analysis_rollups.pop_front();
+            }
+
+            let mut agg_b = HashMap::new();
+            let mut agg_a = HashMap::new();
+            for window in &self.analysis_rollups {
+                merge_bucket_maps(&mut agg_b, &window.bids);
+                merge_bucket_maps(&mut agg_a, &window.asks);
+            }
+            analysis_rollup_b = bucket_map_to_updates(&coin, Side::Bid, &agg_b);
+            analysis_rollup_a = bucket_map_to_updates(&coin, Side::Ask, &agg_a);
+            let (fill_b, fill_notional_b, change_b, change_notional_b) = sum_bucket_map(&agg_b);
+            let (fill_a, fill_notional_a, change_a, change_notional_a) = sum_bucket_map(&agg_a);
+            analysis_rollup_sum_b = Some(format_sum_values(fill_b, fill_notional_b, change_b, change_notional_b));
+            analysis_rollup_sum_a = Some(format_sum_values(fill_a, fill_notional_a, change_a, change_notional_a));
+        }
+
         let event = L4LiteBlockEvent {
             depth_updates,
             analysis_updates_b: analysis_b,
             analysis_updates_a: analysis_a,
+            analysis_rollup_b,
+            analysis_rollup_a,
+            analysis_rollup_sum_b,
+            analysis_rollup_sum_a,
         };
         self.last_block_height = block_height;
         Ok(event)
@@ -396,6 +572,8 @@ impl BookState {
         self.oid_index.clear();
         self.dirty_levels.clear();
         self.last_block_height = block_height;
+        self.analysis_window_b.clear();
+        self.analysis_window_a.clear();
         self.initialized = true;
 
         for orders in snapshot.as_ref() {
