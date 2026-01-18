@@ -1,5 +1,6 @@
-/target/
+**/target/
 *.log
 *.tmp
 .env
 .env.*
+fifo_listener/Cargo.lock
