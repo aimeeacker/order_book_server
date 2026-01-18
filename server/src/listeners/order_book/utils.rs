@@ -1,6 +1,7 @@
 use crate::{
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
     order_book::{
+        Coin,
         Snapshot,
         multi_book::{OrderBooks, Snapshots},
         types::InnerOrder,
@@ -11,10 +12,11 @@ use crate::{
         node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
+use log::warn;
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use reqwest::Client;
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::{
@@ -24,7 +26,7 @@ use std::{
 
 pub(super) async fn process_rmp_file(dir: &Path) -> Result<PathBuf> {
     let _unused = dir;
-    let output_path = PathBuf::from("/dev/shm/snapshot.json");
+    let output_path = PathBuf::from("/home/aimee/hl_runtime/hl_book/snapshot.json");
     let payload = json!({
         "type": "fileSnapshot",
         "request": {
@@ -65,6 +67,191 @@ fn hash_l4_order(order: &InnerL4Order, hasher: &mut DefaultHasher) {
     order.cloid.hash(hasher);
 }
 
+fn build_order_map<'a>(orders: &'a [InnerL4Order]) -> Result<BTreeMap<u64, &'a InnerL4Order>> {
+    let mut by_oid: BTreeMap<u64, &InnerL4Order> = BTreeMap::new();
+    for order in orders {
+        if by_oid.insert(order.oid, order).is_some() {
+            return Err(format!("Duplicate oid {} in snapshot", order.oid).into());
+        }
+    }
+    Ok(by_oid)
+}
+
+fn collect_mismatches(
+    snapshot: &Snapshots<InnerL4Order>,
+    expected: &Snapshots<InnerL4Order>,
+    ignore_spot: bool,
+) -> BTreeMap<String, Vec<String>> {
+    const MAX_MISMATCHES: usize = 10;
+    let mut all_mismatches: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    let mut coins: BTreeSet<Coin> = BTreeSet::new();
+    coins.extend(snapshot.as_ref().keys().cloned());
+    coins.extend(expected.as_ref().keys().cloned());
+
+    for coin in coins {
+        if ignore_spot && coin.is_spot() {
+            continue;
+        }
+        let mut mismatches = Vec::new();
+        let mut extra_count = 0usize;
+        let mut push_mismatch = |msg: String| {
+            if mismatches.len() < MAX_MISMATCHES {
+                mismatches.push(msg);
+            } else {
+                extra_count += 1;
+            }
+        };
+
+        match (snapshot.as_ref().get(&coin), expected.as_ref().get(&coin)) {
+            (None, None) => continue,
+            (Some(book1), None) => {
+                if !book1.as_ref()[0].is_empty() || !book1.as_ref()[1].is_empty() {
+                    push_mismatch(format!("coin {} missing in expected snapshot", coin.value()));
+                }
+            }
+            (None, Some(book2)) => {
+                if !book2.as_ref()[0].is_empty() || !book2.as_ref()[1].is_empty() {
+                    push_mismatch(format!("coin {} missing in local snapshot", coin.value()));
+                }
+            }
+            (Some(book1), Some(book2)) => {
+                for (idx, (orders1, orders2)) in book1.as_ref().iter().zip(book2.as_ref()).enumerate() {
+                    let side = if idx == 0 { "bids" } else { "asks" };
+                    let map1 = match build_order_map(orders1) {
+                        Ok(map) => map,
+                        Err(err) => {
+                            push_mismatch(format!("coin {} {side}: {err}", coin.value()));
+                            continue;
+                        }
+                    };
+                    let map2 = match build_order_map(orders2) {
+                        Ok(map) => map,
+                        Err(err) => {
+                            push_mismatch(format!("coin {} {side}: {err}", coin.value()));
+                            continue;
+                        }
+                    };
+
+                    for oid in map1.keys() {
+                        if !map2.contains_key(oid) {
+                            push_mismatch(format!(
+                                "coin {} {side}: oid {} missing in expected snapshot",
+                                coin.value(),
+                                oid
+                            ));
+                        }
+                    }
+                    for oid in map2.keys() {
+                        if !map1.contains_key(oid) {
+                            push_mismatch(format!(
+                                "coin {} {side}: oid {} missing in local snapshot",
+                                coin.value(),
+                                oid
+                            ));
+                        }
+                    }
+
+                    for (oid, order1) in &map1 {
+                        let Some(order2) = map2.get(oid) else {
+                            continue;
+                        };
+                        let core1 = (order1.side, order1.limit_px.to_str(), order1.sz.to_str());
+                        let core2 = (order2.side, order2.limit_px.to_str(), order2.sz.to_str());
+                        if core1 != core2 {
+                            push_mismatch(format!(
+                                "coin {} {side}: oid {} core mismatch local({:?}, px {}, sz {}) expected({:?}, px {}, sz {})",
+                                coin.value(),
+                                oid,
+                                core1.0,
+                                core1.1,
+                                core1.2,
+                                core2.0,
+                                core2.1,
+                                core2.2
+                            ));
+                            continue;
+                        }
+
+                        let mut diffs = Vec::new();
+                        if order1.timestamp != order2.timestamp {
+                            diffs.push(format!("timestamp {} vs {}", order1.timestamp, order2.timestamp));
+                        }
+                        if order1.is_trigger != order2.is_trigger {
+                            diffs.push(format!("is_trigger {} vs {}", order1.is_trigger, order2.is_trigger));
+                        }
+                        if order1.trigger_condition != order2.trigger_condition {
+                            diffs.push(format!(
+                                "trigger_condition {} vs {}",
+                                order1.trigger_condition, order2.trigger_condition
+                            ));
+                        }
+                        if order1.trigger_px != order2.trigger_px {
+                            diffs.push(format!("trigger_px {} vs {}", order1.trigger_px, order2.trigger_px));
+                        }
+                        if order1.is_position_tpsl != order2.is_position_tpsl {
+                            diffs.push(format!(
+                                "is_position_tpsl {} vs {}",
+                                order1.is_position_tpsl, order2.is_position_tpsl
+                            ));
+                        }
+                        if order1.reduce_only != order2.reduce_only {
+                            diffs.push(format!("reduce_only {} vs {}", order1.reduce_only, order2.reduce_only));
+                        }
+                        if order1.order_type != order2.order_type {
+                            diffs.push(format!("order_type {} vs {}", order1.order_type, order2.order_type));
+                        }
+                        if order1.tif != order2.tif {
+                            diffs.push(format!("tif {:?} vs {:?}", order1.tif, order2.tif));
+                        }
+                        if order1.user != order2.user {
+                            diffs.push(format!("user {:?} vs {:?}", order1.user, order2.user));
+                        }
+                        if order1.cloid != order2.cloid {
+                            diffs.push(format!("cloid {:?} vs {:?}", order1.cloid, order2.cloid));
+                        }
+                        if !diffs.is_empty() {
+                            push_mismatch(format!(
+                                "coin {} {side}: oid {} meta mismatch: {}",
+                                coin.value(),
+                                oid,
+                                diffs.join(", ")
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if extra_count > 0 && mismatches.len() < MAX_MISMATCHES {
+            mismatches.push(format!("... and {} more mismatches", extra_count));
+        }
+        if !mismatches.is_empty() {
+            all_mismatches.insert(coin.value(), mismatches);
+        }
+    }
+
+    all_mismatches
+}
+
+fn log_mismatch_diagnostics(
+    snapshot: &Snapshots<InnerL4Order>,
+    expected: &Snapshots<InnerL4Order>,
+    ignore_spot: bool,
+) {
+    let mismatches = collect_mismatches(snapshot, expected, ignore_spot);
+    if mismatches.is_empty() {
+        warn!("Snapshot mismatch detail: unable to locate differing order");
+        return;
+    }
+    for (coin, items) in mismatches {
+        warn!(
+            "Snapshot mismatch detail for {}: {}",
+            coin,
+            items.join("; ")
+        );
+    }
+}
 pub(super) fn validate_snapshot_hash(
     snapshot: &Snapshots<InnerL4Order>,
     expected: &Snapshots<InnerL4Order>,
@@ -72,6 +259,14 @@ pub(super) fn validate_snapshot_hash(
 ) -> Result<()> {
     let mut hasher_snapshot = DefaultHasher::new();
     let mut hasher_expected = DefaultHasher::new();
+
+    fn hash_orders_btree(orders: &[InnerL4Order], hasher: &mut DefaultHasher) -> Result<usize> {
+        let by_oid = build_order_map(orders)?;
+        for order in by_oid.values() {
+            hash_l4_order(order, hasher);
+        }
+        Ok(by_oid.len())
+    }
 
     let mut coins: Vec<_> = snapshot.as_ref().iter().collect();
     coins.sort_by_key(|(coin, _)| coin.value());
@@ -87,6 +282,7 @@ pub(super) fn validate_snapshot_hash(
 
             for (orders1, orders2) in book1.as_ref().iter().zip(book2.as_ref()) {
                 if orders1.len() != orders2.len() {
+                    log_mismatch_diagnostics(snapshot, expected, ignore_spot);
                     return Err(format!(
                         "Order count mismatch for {}: {} vs {}",
                         coin.value(),
@@ -94,12 +290,20 @@ pub(super) fn validate_snapshot_hash(
                         orders2.len()
                     ).into());
                 }
-                for (order1, order2) in orders1.iter().zip(orders2.iter()) {
-                    hash_l4_order(order1, &mut hasher_snapshot);
-                    hash_l4_order(order2, &mut hasher_expected);
+                let count1 = hash_orders_btree(orders1, &mut hasher_snapshot)?;
+                let count2 = hash_orders_btree(orders2, &mut hasher_expected)?;
+                if count1 != count2 {
+                    log_mismatch_diagnostics(snapshot, expected, ignore_spot);
+                    return Err(format!(
+                        "Order count mismatch for {} after sorting: {} vs {}",
+                        coin.value(),
+                        count1,
+                        count2
+                    ).into());
                 }
             }
         } else if !book1[0].is_empty() || !book1[1].is_empty() {
+            log_mismatch_diagnostics(snapshot, expected, ignore_spot);
             return Err(format!("Missing {} book in expected snapshot", coin.value()).into());
         }
     }
@@ -107,6 +311,7 @@ pub(super) fn validate_snapshot_hash(
     let hash_snapshot = hasher_snapshot.finish();
     let hash_expected = hasher_expected.finish();
     if hash_snapshot != hash_expected {
+        log_mismatch_diagnostics(snapshot, expected, ignore_spot);
         return Err(format!(
             "Snapshot hash mismatch: expected={}, actual={}",
             hash_expected, hash_snapshot
@@ -177,6 +382,13 @@ impl<T> BatchQueue<T> {
         if let Some(last_ts) = self.last_ts {
             if last_ts >= block.block_number() {
                 return false;
+            }
+            if block.block_number() > last_ts + 1 {
+                warn!(
+                    "Detected batch gap: last_block={}, current_block={}",
+                    last_ts,
+                    block.block_number()
+                );
             }
         }
         self.last_ts = Some(block.block_number());

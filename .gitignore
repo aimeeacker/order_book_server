@@ -1,1 +1,5 @@
-target/
+/target/
+*.log
+*.tmp
+.env
+.env.*

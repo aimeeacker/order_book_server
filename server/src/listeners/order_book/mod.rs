@@ -13,7 +13,7 @@ use crate::{
     },
 };
 use alloy::primitives::Address;
-use fs::File;
+use fs::OpenOptions;
 use log::{debug, error, info, warn};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -547,6 +547,9 @@ pub(crate) struct OrderBookListener {
     last_event_time: Option<Instant>,
     pending_block_since: Option<Instant>,
     pending_block_height: Option<u64>,
+    last_seen_status: Option<u64>,
+    last_seen_diff: Option<u64>,
+    last_seen_fill: Option<u64>,
     order_diff_cache: BatchQueue<NodeDataOrderDiff>,
     order_status_cache: BatchQueue<NodeDataOrderStatus>,
     fills_cache: BatchQueue<NodeDataFill>,
@@ -562,7 +565,7 @@ pub(crate) struct OrderBookListener {
 }
 
 const FIFO_QUEUE_MAX_LEN: usize = 255;
-const FIFO_BASE_DIR: &str = "/dev/shm/book_tmpfs";
+const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book";
 const MAIN_COINS: [&str; 2] = ["BTC", "ETH"];
 const PIPE_CAPACITY: usize = 16 * 1024 * 1024;
 const WARMUP_MS: u64 = 250;
@@ -587,6 +590,9 @@ impl OrderBookListener {
             last_event_time: None,
             pending_block_since: None,
             pending_block_height: None,
+            last_seen_status: None,
+            last_seen_diff: None,
+            last_seen_fill: None,
             fetched_snapshot_cache: None,
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
@@ -615,6 +621,9 @@ impl OrderBookListener {
         self.order_diff_cache = BatchQueue::new();
         self.order_status_cache = BatchQueue::new();
         self.fills_cache = BatchQueue::new();
+        self.last_seen_status = None;
+        self.last_seen_diff = None;
+        self.last_seen_fill = None;
         self.fetched_snapshot_cache = None;
         self.pending_block_since = None;
         self.pending_block_height = None;
@@ -650,6 +659,31 @@ impl OrderBookListener {
 
     fn snapshot_request_pending(&self) -> Arc<AtomicBool> {
         self.snapshot_request_pending.clone()
+    }
+
+    fn note_last_seen(&mut self, event_source: EventSource, height: u64) {
+        let slot = match event_source {
+            EventSource::OrderStatuses => &mut self.last_seen_status,
+            EventSource::OrderDiffs => &mut self.last_seen_diff,
+            EventSource::Fills => &mut self.last_seen_fill,
+        };
+        if let Some(last) = *slot {
+            if height > last + 1 {
+                warn!(
+                    "{event_source} stream gap: last_block={}, current_block={}",
+                    last,
+                    height
+                );
+            }
+        }
+        *slot = Some(height);
+    }
+
+    fn last_seen_summary(&self) -> String {
+        format!(
+            "last_seen status={:?}, diff={:?}, fill={:?}",
+            self.last_seen_status, self.last_seen_diff, self.last_seen_fill
+        )
     }
 
     fn request_snapshot_rebuild(&self) -> bool {
@@ -693,14 +727,26 @@ impl OrderBookListener {
 
                 // Discard batches from slower streams until they catch up or run out
                 if diff_n < max_n {
+                    warn!(
+                        "Aligning streams: dropping diff batch at {} (status {}, fill {}, target {})",
+                        diff_n, status_n, fill_n, max_n
+                    );
                     self.order_diff_cache.pop_front();
                     continue;
                 }
                 if status_n < max_n {
+                    warn!(
+                        "Aligning streams: dropping status batch at {} (diff {}, fill {}, target {})",
+                        status_n, diff_n, fill_n, max_n
+                    );
                     self.order_status_cache.pop_front();
                     continue;
                 }
                 if fill_n < max_n {
+                    warn!(
+                        "Aligning streams: dropping fill batch at {} (diff {}, status {}, target {})",
+                        fill_n, diff_n, status_n, max_n
+                    );
                     self.fills_cache.pop_front();
                     continue;
                 }
@@ -903,9 +949,17 @@ impl OrderBookListener {
                 {
                     let requested = self.request_snapshot_rebuild();
                     if requested {
-                        warn!("L4Book out of sync: {}. Triggering snapshot rebuild.", err);
+                        warn!(
+                            "L4Book out of sync: {}. Triggering snapshot rebuild. {}",
+                            err,
+                            self.last_seen_summary()
+                        );
                     } else {
-                        warn!("L4Book out of sync: {}. Snapshot rebuild already queued.", err);
+                        warn!(
+                            "L4Book out of sync: {}. Snapshot rebuild already queued. {}",
+                            err,
+                            self.last_seen_summary()
+                        );
                     }
                     return Err(err);
                 }
@@ -1171,6 +1225,7 @@ impl OrderBookListener {
                 return Ok(());
             }
         };
+        self.note_last_seen(event_source, height);
         if height % 100 == 0 {
             debug!("{event_source} block: {height}");
         }
@@ -1265,7 +1320,7 @@ fn spawn_fifo_reader(
     warmup_deadline: Arc<AtomicU64>,
 ) {
     thread::spawn(move || loop {
-        let file = match File::open(&path) {
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(file) => file,
             Err(err) => {
                 error!("Failed to open FIFO for {event_source} at {}: {err}", path.display());
@@ -1287,7 +1342,10 @@ fn spawn_fifo_reader(
         loop {
             line.clear();
             match reader.read_line(&mut line) {
-                Ok(0) => break,
+                Ok(0) => {
+                    warn!("FIFO EOF for {event_source} at {}; reopening", path.display());
+                    break;
+                }
                 Ok(_) => {
                     let trimmed = line.trim_end_matches('\n');
                     if trimmed.is_empty() {

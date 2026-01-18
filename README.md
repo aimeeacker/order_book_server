@@ -27,24 +27,30 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
 ## Setup
 
 1. Run a non-validating node (from [`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node)). Requires batching by block. Requires recording fills, order statuses, and raw book diffs.
-   - The node should write newline-delimited JSON batches into FIFOs at `/dev/shm/book_tmpfs`:
+   - The node should write newline-delimited JSON batches into FIFOs at `/home/aimee/hl_runtime/hl_book`:
      - `fills`
      - `order`
      - `diffs`
-   - Snapshot requests are written to `/dev/shm/snapshot.json`.
+   - Snapshot requests are written to `/home/aimee/hl_runtime/hl_book/snapshot.json`.
 
 2. Then run this local server:
 
 ```bash
-cargo run --release --bin websocket_server -- --address 0.0.0.0 --port 8000
+cargo run --release --bin websocket_server
 ```
 
 If this local server does not detect the node writing down any new events, it will automatically exit after some amount of time (currently set to 5 seconds).
 In addition, the local server periodically fetches order book snapshots from the node, and compares to its own internal state. If a difference is detected, it will exit.
 
 If you want logging, prepend the command with `RUST_LOG=info`.
+To override the default bind address/port, pass `--address` and `--port` explicitly.
 
 The WebSocket server comes with compression built-in. The compression ratio can be tuned using the `--websocket-compression-level` flag.
+
+## FIFO Utilities
+
+- `cargo run -p fifo_listener`: parse and filter FIFO streams, align on block height, and emit timing metrics.
+- `cargo run -p fifo_probe`: lightweight FIFO probe that scans `block_number` without full JSON parsing.
 
 ## Caveats
 

@@ -9,11 +9,11 @@ use env_logger::{Env, Builder};
 #[command(author, version, about)]
 struct Args {
     /// Server address (e.g., 0.0.0.0)
-    #[arg(long)]
+    #[arg(long, default_value_t = Ipv4Addr::new(0, 0, 0, 0))]
     address: Ipv4Addr,
 
     /// Server port (e.g., 8000)
-    #[arg(long)]
+    #[arg(long, default_value_t = 8443)]
     port: u16,
 
     /// Compression level for WebSocket connections.
