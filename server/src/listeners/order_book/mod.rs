@@ -7,18 +7,18 @@ use crate::{
     },
     prelude::*,
     types::{
-        L4Order,
+        SnapshotOrder,
         inner::{InnerL4Order, InnerLevel},
-        node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
 use alloy::primitives::Address;
-use fs::OpenOptions;
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader},
-    os::unix::io::AsRawFd,
+    mem::size_of,
+    os::unix::{net::UnixStream, io::AsRawFd},
     path::PathBuf,
     sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     sync::Arc,
@@ -34,7 +34,7 @@ use tokio::{
     time::{Instant, interval, sleep},
 };
 use tokio_cron_scheduler::{Job, JobScheduler};
-use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_hash};
+use utils::{process_rmp_file, validate_snapshot_hash};
 
 mod state;
 mod utils;
@@ -48,25 +48,14 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
         let listener = listener.lock().await;
         listener.warmup_deadline()
     };
-    let fifo_paths = [
-        (EventSource::OrderStatuses, fifo_path(EventSource::OrderStatuses)),
-        (EventSource::Fills, fifo_path(EventSource::Fills)),
-        (EventSource::OrderDiffs, fifo_path(EventSource::OrderDiffs)),
-    ];
-    for (source, path) in &fifo_paths {
-        info!("Monitoring FIFO for {source}: {}", path.display());
-    }
+    info!("Listening for merged stream at {}", UDS_PATH);
 
-    let (stream_tx, mut stream_rx) = channel::<StreamMessage>(FIFO_QUEUE_MAX_LEN);
-    for (source, path) in fifo_paths {
-        spawn_fifo_reader(
-            source,
-            path,
-            stream_tx.clone(),
-            dropped_updates.clone(),
-            warmup_deadline.clone(),
-        );
-    }
+    let (stream_tx, mut stream_rx) = channel::<AlignedMessage>(FIFO_QUEUE_MAX_LEN);
+    spawn_uds_reader(
+        stream_tx.clone(),
+        dropped_updates.clone(),
+        warmup_deadline.clone(),
+    );
     let parser_listener = listener.clone();
     let parser_dropped_updates = dropped_updates.clone();
     tokio::spawn(async move {
@@ -75,7 +64,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 let mut listener = parser_listener.lock().await;
                 listener.reset_after_drop();
             }
-            if let Err(err) = parser_listener.lock().await.process_stream_line(message.line, message.event_source) {
+            if let Err(err) = parser_listener.lock().await.process_aligned_lines(message) {
                 error!("Stream processing error: {err}");
             }
         }
@@ -120,15 +109,13 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
 
     info!("Cron scheduler started: snapshot validation set to run at xx:00:30 and xx:30:30.");
     
-    // Trigger initial snapshot fetch
+    // Trigger initial snapshot fetch (prefetch cache 200ms before request)
     info!("Triggering initial snapshot fetch");
-    trigger_snapshot_fetch(
-        dir.clone(),
-        listener.clone(),
-        snapshot_fetch_task_tx.clone(),
-        ignore_spot,
-        snapshot_inflight.clone(),
-    );
+    {
+        let mut listener = listener.lock().await;
+        listener.start_rebuild();
+        listener.request_snapshot_rebuild();
+    }
 
     let mut health_check = interval(Duration::from_secs(60));
     loop {
@@ -158,7 +145,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                     Some(Ok(())) => {
                         snapshot_inflight.store(false, AtomicOrdering::SeqCst);
                         if snapshot_pending.swap(false, AtomicOrdering::SeqCst) {
-                            trigger_snapshot_fetch(
+                            trigger_snapshot_fetch_after_delay(
                                 dir.clone(),
                                 listener.clone(),
                                 snapshot_fetch_task_tx.clone(),
@@ -171,13 +158,17 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
             }
             snapshot_request = snapshot_request_rx.recv() => {
                 if snapshot_request.is_some() {
-                    trigger_snapshot_fetch(
-                        dir.clone(),
-                        listener.clone(),
-                        snapshot_fetch_task_tx.clone(),
-                        ignore_spot,
-                        snapshot_inflight.clone(),
-                    );
+                    if snapshot_inflight.load(AtomicOrdering::SeqCst) {
+                        snapshot_pending.store(true, AtomicOrdering::SeqCst);
+                    } else {
+                        trigger_snapshot_fetch_after_delay(
+                            dir.clone(),
+                            listener.clone(),
+                            snapshot_fetch_task_tx.clone(),
+                            ignore_spot,
+                            snapshot_inflight.clone(),
+                        );
+                    }
                 }
             }
             _ = health_check.tick() => {
@@ -203,6 +194,19 @@ fn trigger_snapshot_fetch(
     fetch_snapshot(dir, listener, tx, ignore_spot);
 }
 
+fn trigger_snapshot_fetch_after_delay(
+    dir: PathBuf,
+    listener: Arc<Mutex<OrderBookListener>>,
+    tx: UnboundedSender<Result<()>>,
+    ignore_spot: bool,
+    inflight: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(INITIAL_SNAPSHOT_PREFETCH_MS)).await;
+        trigger_snapshot_fetch(dir, listener, tx, ignore_spot, inflight);
+    });
+}
+
 fn schedule_snapshot_retry(
     dir: PathBuf,
     listener: Arc<Mutex<OrderBookListener>>,
@@ -225,28 +229,66 @@ fn fetch_snapshot(
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
+        let request_start = Instant::now();
         let res = match process_rmp_file(&dir).await {
             Ok(output_fln) => {
+                let request_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+                info!("Snapshot request completed in {:.3} ms", request_ms);
                 let state = {
                     let mut listener = listener.lock().await;
-                    listener.begin_caching();
-                    listener.clone_state()
+                    if listener.initializing || listener.order_book_state.is_none() {
+                        None
+                    } else {
+                        listener.begin_caching();
+                        listener.clone_state()
+                    }
                 };
+                let parse_start = Instant::now();
                 let snapshot =
-                    load_snapshots_from_json_filtered::<InnerL4Order, (Address, L4Order)>(&output_fln, &MAIN_COINS)
+                    load_snapshots_from_json_filtered::<InnerL4Order, (Address, SnapshotOrder)>(&output_fln, &MAIN_COINS)
                         .await;
-                // info!("Snapshot file fetched; parsing snapshot");
-                // sleep to let some updates build up.
-                sleep(Duration::from_millis(200)).await;
-                let mut cache = {
-                    let mut listener = listener.lock().await;
-                    listener.take_cache()
+                let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
+                info!("Snapshot parse completed in {:.3} ms", parse_ms);
+                let initializing = {
+                    let listener = listener.lock().await;
+                    listener.initializing || listener.order_book_state.is_none()
                 };
-                info!("Cache has {} elements", cache.len());
+                let mut cache = VecDeque::new();
+                if state.is_some() && !initializing {
+                    // sleep to let some updates build up for validation
+                    sleep(Duration::from_millis(200)).await;
+                    cache = {
+                        let mut listener = listener.lock().await;
+                        listener.take_cache()
+                    };
+                    info!("Cache has {} elements", cache.len());
+                } else if state.is_some() {
+                    let mut listener = listener.lock().await;
+                    let _unused = listener.take_cache();
+                }
                 match snapshot {
                     Ok((height, expected_snapshot)) => {
                         info!("Snapshot parsed at height {}", height);
-                        if let Some(mut state) = state {
+                        if initializing || state.is_none() {
+                            let initialized = {
+                                let mut listener = listener.lock().await;
+                                listener.init_from_snapshot(expected_snapshot, height)
+                            };
+                            if initialized {
+                                let inflight = {
+                                    let listener = listener.lock().await;
+                                    listener.snapshot_request_inflight()
+                                };
+                                schedule_snapshot_validation(
+                                    dir.clone(),
+                                    listener.clone(),
+                                    tx.clone(),
+                                    ignore_spot,
+                                    inflight,
+                                );
+                            }
+                            Ok(())
+                        } else if let Some(mut state) = state {
                             let mut validation_cache = cache.clone();
                             while state.height() < height {
                                 if let Some((order_statuses, order_diffs)) = validation_cache.pop_front() {
@@ -294,6 +336,7 @@ fn fetch_snapshot(
                                         let lite_state = listener.order_book_state.clone();
                                         (lite_inputs, lite_state)
                                     };
+                                    let lite_coin_keys: Vec<Coin> = lite_inputs.keys().cloned().collect();
 
                                     if !lite_inputs.is_empty() {
                                         match lite_state {
@@ -334,16 +377,23 @@ fn fetch_snapshot(
                                                     Ok(Ok((validation_height, issues))) => {
                                                         if issues.is_empty() {
                                                             info!("L4Lite snapshots validated successfully at height {}", validation_height);
+                                                            for coin in &lite_coin_keys {
+                                                                info!(
+                                                                    "L4Lite snapshot status for {}: OK",
+                                                                    coin.value()
+                                                                );
+                                                            }
                                                         } else {
+                                                            let mut issue_coins = HashSet::new();
                                                             let mut rebuilds = Vec::new();
                                                             for issue in issues {
+                                                                issue_coins.insert(issue.coin.clone());
                                                                 match issue.snapshot {
                                                                     Some(snapshot) => {
                                                                         let expected_hash = issue.expected_hash.unwrap_or_default();
                                                                         warn!(
-                                                                            "L4Lite snapshot mismatch for {} at height {}: expected hash {}, actual hash {}, initialized {}. Rebuilding from L4Book state.",
+                                                                            "L4Lite snapshot status for {}: FAIL: expected hash {}, actual hash {}, initialized {}. Rebuilding from L4Book state.",
                                                                             issue.coin.value(),
-                                                                            validation_height,
                                                                             expected_hash,
                                                                             issue.actual_hash,
                                                                             issue.initialized
@@ -352,12 +402,20 @@ fn fetch_snapshot(
                                                                     }
                                                                     None => {
                                                                         warn!(
-                                                                            "Missing L4Book snapshot for {} at height {}; skipping L4Lite validation",
+                                                                            "L4Lite snapshot status for {}: FAIL: missing L4Book snapshot",
                                                                             issue.coin.value(),
-                                                                            validation_height
                                                                         );
                                                                     }
                                                                 }
+                                                            }
+                                                            for coin in &lite_coin_keys {
+                                                                if issue_coins.contains(coin) {
+                                                                    continue;
+                                                                }
+                                                                info!(
+                                                                    "L4Lite snapshot status for {}: OK",
+                                                                    coin.value()
+                                                                );
                                                             }
 
                                                             if !rebuilds.is_empty() {
@@ -408,6 +466,7 @@ fn fetch_snapshot(
                                     warn!("L4Book snapshot hash mismatch at height {}: {}", height, err);
                                     let mut listener_guard = listener.lock().await;
                                     let schedule_validation = listener_guard.init_from_snapshot(expected_snapshot, height);
+                                    let rebuilt_from_snapshot = listener_guard.order_book_state.is_some();
 
                                     let mut replay_failed = false;
                                     while let Some((order_statuses, order_diffs)) = cache.pop_front() {
@@ -435,7 +494,7 @@ fn fetch_snapshot(
                                     let inflight = listener_guard.snapshot_request_inflight();
                                     if replay_failed {
                                         listener_guard.reset_after_drop();
-                                    } else {
+                                    } else if rebuilt_from_snapshot {
                                         listener_guard.rebuild_lite_from_state();
                                     }
                                     drop(listener_guard);
@@ -454,6 +513,7 @@ fn fetch_snapshot(
                                     warn!("L4Book snapshot validation task failed at height {}: {}", height, err);
                                     let mut listener_guard = listener.lock().await;
                                     let schedule_validation = listener_guard.init_from_snapshot(expected_snapshot, height);
+                                    let rebuilt_from_snapshot = listener_guard.order_book_state.is_some();
                                     let mut replay_failed = false;
                                     while let Some((order_statuses, order_diffs)) = cache.pop_front() {
                                         let target_height = order_statuses.block_number();
@@ -480,7 +540,7 @@ fn fetch_snapshot(
                                     let inflight = listener_guard.snapshot_request_inflight();
                                     if replay_failed {
                                         listener_guard.reset_after_drop();
-                                    } else {
+                                    } else if rebuilt_from_snapshot {
                                         listener_guard.rebuild_lite_from_state();
                                     }
                                     drop(listener_guard);
@@ -497,30 +557,29 @@ fn fetch_snapshot(
                                 }
                             }
                         } else {
-                            let schedule_validation = {
-                                let mut listener = listener.lock().await;
-                                listener.init_from_snapshot(expected_snapshot, height)
-                            };
-                            if schedule_validation {
-                                let inflight = {
-                                    let listener = listener.lock().await;
-                                    listener.snapshot_request_inflight()
-                                };
-                                schedule_snapshot_validation(
-                                    dir.clone(),
-                                    listener.clone(),
-                                    tx.clone(),
-                                    ignore_spot,
-                                    inflight,
-                                );
-                            }
                             Ok(())
                         }
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        if initializing {
+                            let mut listener = listener.lock().await;
+                            listener.clear_pending_aligned();
+                        }
+                        Err(err)
+                    }
                 }
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                let initializing = {
+                    let listener = listener.lock().await;
+                    listener.initializing || listener.order_book_state.is_none()
+                };
+                if initializing {
+                    let mut listener = listener.lock().await;
+                    listener.clear_pending_aligned();
+                }
+                Err(err)
+            }
         };
         let _unused = tx.send(res);
         Ok(())
@@ -545,16 +604,14 @@ pub(crate) struct OrderBookListener {
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
     last_event_time: Option<Instant>,
-    pending_block_since: Option<Instant>,
-    pending_block_height: Option<u64>,
-    last_seen_status: Option<u64>,
-    last_seen_diff: Option<u64>,
-    last_seen_fill: Option<u64>,
-    order_diff_cache: BatchQueue<NodeDataOrderDiff>,
-    order_status_cache: BatchQueue<NodeDataOrderStatus>,
-    fills_cache: BatchQueue<NodeDataFill>,
+    pending_aligned: VecDeque<AlignedTriple>,
+    pending_window_start: Option<u64>,
+    pending_drop_warned: bool,
+    last_stream_height: Option<u64>,
+    initializing: bool,
     // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
+    snapshot_cache_dropped: bool,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
     active_coins: Option<Arc<Mutex<HashMap<String, usize>>>>,
     pub lite_books: HashMap<Coin, lite::BookState>,
@@ -565,14 +622,24 @@ pub(crate) struct OrderBookListener {
 }
 
 const FIFO_QUEUE_MAX_LEN: usize = 255;
-const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book";
+const PENDING_ALIGNED_MAX_LEN: usize = 512;
+const SNAPSHOT_CACHE_MAX_LEN: usize = 512;
+const UDS_PATH: &str = "/home/aimee/hl_runtime/hl_book/fifo_listener.sock";
+const UDS_SOCKET_BUFFER: i32 = 16 * 1024 * 1024;
 const MAIN_COINS: [&str; 2] = ["BTC", "ETH"];
-const PIPE_CAPACITY: usize = 16 * 1024 * 1024;
 const WARMUP_MS: u64 = 250;
+const INITIAL_SNAPSHOT_PREFETCH_MS: u64 = 200;
 
-struct StreamMessage {
-    event_source: EventSource,
-    line: String,
+type AlignedTriple = (
+    Batch<NodeDataOrderStatus>,
+    Batch<NodeDataOrderDiff>,
+    Batch<NodeDataFill>,
+);
+
+struct AlignedMessage {
+    fills_line: String,
+    diffs_line: String,
+    order_line: String,
 }
 
 impl OrderBookListener {
@@ -588,16 +655,14 @@ impl OrderBookListener {
             ignore_spot,
             order_book_state: None,
             last_event_time: None,
-            pending_block_since: None,
-            pending_block_height: None,
-            last_seen_status: None,
-            last_seen_diff: None,
-            last_seen_fill: None,
             fetched_snapshot_cache: None,
+            snapshot_cache_dropped: false,
             internal_message_tx,
-            order_diff_cache: BatchQueue::new(),
-            order_status_cache: BatchQueue::new(),
-            fills_cache: BatchQueue::new(),
+            pending_aligned: VecDeque::new(),
+            pending_window_start: None,
+            pending_drop_warned: false,
+            last_stream_height: None,
+            initializing: false,
             active_coins,
             lite_books: HashMap::new(),
             warmup_deadline,
@@ -618,16 +683,13 @@ impl OrderBookListener {
     fn reset_after_drop(&mut self) {
         warn!("Dropped FIFO messages; resetting state and waiting for next snapshot.");
         self.order_book_state = None;
-        self.order_diff_cache = BatchQueue::new();
-        self.order_status_cache = BatchQueue::new();
-        self.fills_cache = BatchQueue::new();
-        self.last_seen_status = None;
-        self.last_seen_diff = None;
-        self.last_seen_fill = None;
+        self.initializing = true;
+        self.clear_pending_aligned();
+        self.last_stream_height = None;
         self.fetched_snapshot_cache = None;
-        self.pending_block_since = None;
-        self.pending_block_height = None;
+        self.snapshot_cache_dropped = false;
         self.bump_warmup_deadline();
+        self.request_snapshot_rebuild();
     }
 
     fn is_stalled(&self, threshold: Duration) -> bool {
@@ -661,31 +723,6 @@ impl OrderBookListener {
         self.snapshot_request_pending.clone()
     }
 
-    fn note_last_seen(&mut self, event_source: EventSource, height: u64) {
-        let slot = match event_source {
-            EventSource::OrderStatuses => &mut self.last_seen_status,
-            EventSource::OrderDiffs => &mut self.last_seen_diff,
-            EventSource::Fills => &mut self.last_seen_fill,
-        };
-        if let Some(last) = *slot {
-            if height > last + 1 {
-                warn!(
-                    "{event_source} stream gap: last_block={}, current_block={}",
-                    last,
-                    height
-                );
-            }
-        }
-        *slot = Some(height);
-    }
-
-    fn last_seen_summary(&self) -> String {
-        format!(
-            "last_seen status={:?}, diff={:?}, fill={:?}",
-            self.last_seen_status, self.last_seen_diff, self.last_seen_fill
-        )
-    }
-
     fn request_snapshot_rebuild(&self) -> bool {
         let Some(tx) = &self.snapshot_request_tx else {
             return false;
@@ -698,311 +735,344 @@ impl OrderBookListener {
         false
     }
 
+    fn start_rebuild(&mut self) -> bool {
+        if self.initializing {
+            return false;
+        }
+        self.initializing = true;
+        self.order_book_state = None;
+        self.clear_pending_aligned();
+        self.fetched_snapshot_cache = None;
+        self.snapshot_cache_dropped = false;
+        true
+    }
 
-    #[allow(clippy::type_complexity)]
-    // pops triplets of cached updates that have the same block height
-    // discards trailing batches from slower streams to achieve alignment
-    fn pop_cache(&mut self) -> Option<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>, Batch<NodeDataFill>)> {
-        // Keep discarding from slower streams until all three align or one runs out
-        loop {
-            if let (Some(diff), Some(status), Some(fill)) = (
-                self.order_diff_cache.front(),
-                self.order_status_cache.front(),
-                self.fills_cache.front(),
-            ) {
-                let diff_n = diff.block_number();
-                let status_n = status.block_number();
-                let fill_n = fill.block_number();
+    fn clear_pending_aligned(&mut self) {
+        self.pending_aligned.clear();
+        self.pending_window_start = None;
+        self.pending_drop_warned = false;
+    }
 
-                // Check if all three are aligned
-                if diff_n == status_n && status_n == fill_n {
-                    let status_batch = self.order_status_cache.pop_front().unwrap();
-                    let diff_batch = self.order_diff_cache.pop_front().unwrap();
-                    let fill_batch = self.fills_cache.pop_front().unwrap();
-                    return Some((status_batch, diff_batch, fill_batch));
-                }
 
-                // Find the maximum block height among the three streams
-                let max_n = diff_n.max(status_n).max(fill_n);
-
-                // Discard batches from slower streams until they catch up or run out
-                if diff_n < max_n {
+    fn queue_pending_aligned(&mut self, aligned: AlignedTriple) {
+        if let Some(window_start) = self.pending_window_start {
+            if aligned.0.block_number() < window_start {
+                if !self.pending_drop_warned {
                     warn!(
-                        "Aligning streams: dropping diff batch at {} (status {}, fill {}, target {})",
-                        diff_n, status_n, fill_n, max_n
+                        "Pending aligned window advanced; dropping batches below height {window_start}"
                     );
-                    self.order_diff_cache.pop_front();
-                    continue;
+                    self.pending_drop_warned = true;
                 }
-                if status_n < max_n {
-                    warn!(
-                        "Aligning streams: dropping status batch at {} (diff {}, fill {}, target {})",
-                        status_n, diff_n, fill_n, max_n
-                    );
-                    self.order_status_cache.pop_front();
-                    continue;
-                }
-                if fill_n < max_n {
-                    warn!(
-                        "Aligning streams: dropping fill batch at {} (diff {}, status {}, target {})",
-                        fill_n, diff_n, status_n, max_n
-                    );
-                    self.fills_cache.pop_front();
-                    continue;
-                }
-
-                // This line should be unreachable since alignment was already checked above
-                return None;
+                return;
             }
-            
-            // At least one queue is empty, cannot proceed
-            return None;
+        }
+        self.pending_aligned.push_back(aligned);
+    }
+
+    fn update_pending_window(&mut self, height: u64) {
+        self.last_stream_height = Some(height);
+        if self.order_book_state.is_some() {
+            return;
+        }
+        let window = PENDING_ALIGNED_MAX_LEN.saturating_sub(1) as u64;
+        let window_start = height.saturating_sub(window);
+        self.pending_window_start = Some(window_start);
+        let mut dropped = false;
+        while matches!(
+            self.pending_aligned.front(),
+            Some(front) if front.0.block_number() < window_start
+        ) {
+            self.pending_aligned.pop_front();
+            dropped = true;
+        }
+        if dropped && !self.pending_drop_warned {
+            warn!(
+                "Pending aligned window advanced; dropping batches below height {window_start}"
+            );
+            self.pending_drop_warned = true;
         }
     }
 
-    fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
-        match updates {
-            EventBatch::Orders(mut batch) => {
-                let active_coins = if let Some(am) = &self.active_coins {
-                    match am.try_lock() {
-                        Ok(g) => g.clone(),
-                        Err(_) => HashMap::new(),
-                    }
-                } else {
-                    HashMap::new()
-                };
-                batch.retain(|ev| {
-                    let coin = &ev.order.coin;
-                    MAIN_COINS.contains(&coin.as_str()) || active_coins.contains_key(coin)
-                });
-                if !self.order_status_cache.push(batch) {
-                    warn!("Order status stream out of order; resetting state.");
-                    self.reset_after_drop();
-                }
+    fn process_aligned_lines(&mut self, message: AlignedMessage) -> Result<()> {
+        if now_millis() < self.warmup_deadline.load(AtomicOrdering::SeqCst) {
+            return Ok(());
+        }
+        self.last_event_time = Some(Instant::now());
+
+        let order_statuses = match serde_json::from_str::<Batch<NodeDataOrderStatus>>(&message.order_line) {
+            Ok(batch) => batch,
+            Err(err) => {
+                warn!(
+                    "OrderStatuses serialization error {err}, height: {:?}, drop bad stream: {:?}",
+                    self.order_book_state.as_ref().map(OrderBookState::height),
+                    &message.order_line[..message.order_line.len().min(100)],
+                );
+                return Ok(());
             }
-            EventBatch::BookDiffs(mut batch) => {
-                let active_coins = if let Some(am) = &self.active_coins {
-                    match am.try_lock() {
-                        Ok(g) => g.clone(),
-                        Err(_) => HashMap::new(),
-                    }
-                } else {
-                    HashMap::new()
-                };
-                batch.retain(|ev| {
-                    let coin = ev.coin();
-                    MAIN_COINS.contains(&coin.value().as_str()) || active_coins.contains_key(coin.value().as_str())
-                });
-                if !self.order_diff_cache.push(batch) {
-                    warn!("Order diff stream out of order; resetting state.");
-                    self.reset_after_drop();
-                }
+        };
+        let order_diffs = match serde_json::from_str::<Batch<NodeDataOrderDiff>>(&message.diffs_line) {
+            Ok(batch) => batch,
+            Err(err) => {
+                warn!(
+                    "OrderDiffs serialization error {err}, height: {:?}, drop bad stream: {:?}",
+                    self.order_book_state.as_ref().map(OrderBookState::height),
+                    &message.diffs_line[..message.diffs_line.len().min(100)],
+                );
+                return Ok(());
             }
-            EventBatch::Fills(mut batch) => {
-                let active_coins = if let Some(am) = &self.active_coins {
-                    match am.try_lock() {
-                        Ok(g) => g.clone(),
-                        Err(_) => HashMap::new(),
-                    }
-                } else {
-                    HashMap::new()
-                };
-                batch.retain(|ev| {
-                     // NodeDataFill(pub Address, pub Fill) -> ev.1 is Fill
-                     let coin = &ev.1.coin;
-                     MAIN_COINS.contains(&coin.as_str()) || active_coins.contains_key(coin)
-                });
-                if !self.fills_cache.push(batch) {
-                    warn!("Fills stream out of order; resetting state.");
-                    self.reset_after_drop();
-                }
+        };
+        let fills = match serde_json::from_str::<Batch<NodeDataFill>>(&message.fills_line) {
+            Ok(batch) => batch,
+            Err(err) => {
+                warn!(
+                    "Fills serialization error {err}, height: {:?}, drop bad stream: {:?}",
+                    self.order_book_state.as_ref().map(OrderBookState::height),
+                    &message.fills_line[..message.fills_line.len().min(100)],
+                );
+                return Ok(());
             }
-        }    
-        if self.is_ready() {
-            while let Some((order_statuses, order_diffs, fills)) = self.pop_cache() {
-                // Get aligned block height (target)
-                // pop_cache aligns all to same target
-                let target_height = order_statuses.block_number();
+        };
 
-                // Main coins update state
-                // We clone the batches for state update, keeping only Main coins
-                let mut state_statuses = order_statuses.clone();
-                state_statuses.retain(|ev| MAIN_COINS.contains(&ev.order.coin.as_str()));
-                
-                let mut state_diffs = order_diffs.clone();
-                state_diffs.retain(|ev| MAIN_COINS.contains(&ev.coin().value().as_str()));
+        let height = order_statuses.block_number();
+        if order_diffs.block_number() != height || fills.block_number() != height {
+            warn!(
+                "Aligned payload height mismatch: order {}, diffs {}, fills {}",
+                height,
+                order_diffs.block_number(),
+                fills.block_number()
+            );
+            return Ok(());
+        }
+        self.update_pending_window(height);
 
-                // L4Lite Updates
-                let mut all_lite_updates = Vec::new();
-                let mut all_analysis_updates_b = Vec::new();
-                let mut all_analysis_updates_a = Vec::new();
-                let mut all_analysis_rollup_b = Vec::new();
-                let mut all_analysis_rollup_a = Vec::new();
-                let mut all_analysis_rollup_sum_b: Vec<(Coin, [String; 4])> = Vec::new();
-                let mut all_analysis_rollup_sum_a: Vec<(Coin, [String; 4])> = Vec::new();
+        self.process_aligned_batches(order_statuses, order_diffs, fills)
+    }
 
-                let mut coin_statuses: HashMap<Coin, Vec<NodeDataOrderStatus>> = HashMap::new();
-                for status in state_statuses.clone().events() {
-                    coin_statuses.entry(Coin::new(&status.order.coin)).or_default().push(status);
-                }
-                
-                let mut coin_diffs: HashMap<Coin, Vec<NodeDataOrderDiff>> = HashMap::new();
-                for diff in state_diffs.clone().events() {
-                    coin_diffs.entry(diff.coin()).or_default().push(diff);
-                }
-                
-                let mut coin_fills: HashMap<Coin, Vec<NodeDataFill>> = HashMap::new();
-                for fill in fills.clone().events() {
-                     coin_fills.entry(Coin::new(&fill.1.coin)).or_default().push(fill);
-                }
+    fn process_aligned_batches(
+        &mut self,
+        mut order_statuses: Batch<NodeDataOrderStatus>,
+        mut order_diffs: Batch<NodeDataOrderDiff>,
+        mut fills: Batch<NodeDataFill>,
+    ) -> Result<()> {
+        let active_coins = if let Some(am) = &self.active_coins {
+            match am.try_lock() {
+                Ok(g) => g.clone(),
+                Err(_) => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
+        order_statuses.retain(|ev| {
+            let coin = &ev.order.coin;
+            MAIN_COINS.contains(&coin.as_str()) || active_coins.contains_key(coin)
+        });
+        order_diffs.retain(|ev| {
+            let coin = ev.coin();
+            MAIN_COINS.contains(&coin.value().as_str()) || active_coins.contains_key(coin.value().as_str())
+        });
+        fills.retain(|ev| {
+            // NodeDataFill(pub Address, pub Fill) -> ev.1 is Fill
+            let coin = &ev.1.coin;
+            MAIN_COINS.contains(&coin.as_str()) || active_coins.contains_key(coin)
+        });
 
-                let mut lite_errors: Vec<(Coin, u64, String)> = Vec::new();
-                for (coin, lb) in &mut self.lite_books {
-                     if !lb.is_initialized() {
-                         continue;
-                     }
-                     let statuses = coin_statuses.remove(coin).unwrap_or_default();
-                     let diffs = coin_diffs.remove(coin).unwrap_or_default();
-                     let fills = coin_fills.remove(coin).unwrap_or_default();
-                     
-                     match lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height) {
-                         Ok(block_event) => {
-                             if let Some(du) = block_event.depth_updates {
-                                 all_lite_updates.push(du);
-                             }
-                             if !block_event.analysis_updates_b.is_empty() {
-                                 all_analysis_updates_b.extend(block_event.analysis_updates_b);
-                             }
-                             if !block_event.analysis_updates_a.is_empty() {
-                                 all_analysis_updates_a.extend(block_event.analysis_updates_a);
-                             }
-                             if !block_event.analysis_rollup_b.is_empty() {
-                                 all_analysis_rollup_b.extend(block_event.analysis_rollup_b);
-                             }
-                             if !block_event.analysis_rollup_a.is_empty() {
-                                 all_analysis_rollup_a.extend(block_event.analysis_rollup_a);
-                             }
-                             if let Some(sum_b) = block_event.analysis_rollup_sum_b {
-                                 all_analysis_rollup_sum_b.push((coin.clone(), sum_b));
-                             }
-                             if let Some(sum_a) = block_event.analysis_rollup_sum_a {
-                                 all_analysis_rollup_sum_a.push((coin.clone(), sum_a));
-                             }
-                         }
-                         Err(err) => {
-                             lite_errors.push((coin.clone(), target_height, err.to_string()));
-                             lb.reset();
-                         }
-                     }
-                }
+        if self.initializing || self.order_book_state.is_none() {
+            self.queue_pending_aligned((order_statuses, order_diffs, fills));
+            return Ok(());
+        }
 
-                if !lite_errors.is_empty() {
-                    let requested = self.request_snapshot_rebuild();
-                    for (coin, target_height, err) in lite_errors {
-                        if requested {
-                            warn!(
-                                "L4Lite out of sync for {} at height {}: {}. Triggering snapshot rebuild.",
-                                coin.value(),
-                                target_height,
-                                err
-                            );
-                        } else {
-                            warn!(
-                                "L4Lite out of sync for {} at height {}: {}. Snapshot rebuild already queued.",
-                                coin.value(),
-                                target_height,
-                                err
-                            );
-                        }
+        self.apply_aligned_batches(order_statuses, order_diffs, fills)
+    }
+
+    fn apply_aligned_batches(
+        &mut self,
+        order_statuses: Batch<NodeDataOrderStatus>,
+        order_diffs: Batch<NodeDataOrderDiff>,
+        fills: Batch<NodeDataFill>,
+    ) -> Result<()> {
+        let target_height = order_statuses.block_number();
+
+        // Main coins update state
+        let mut state_statuses = order_statuses.clone();
+        state_statuses.retain(|ev| MAIN_COINS.contains(&ev.order.coin.as_str()));
+
+        let mut state_diffs = order_diffs.clone();
+        state_diffs.retain(|ev| MAIN_COINS.contains(&ev.coin().value().as_str()));
+
+        // L4Lite Updates
+        let mut all_lite_updates = Vec::new();
+        let mut all_analysis_updates_b = Vec::new();
+        let mut all_analysis_updates_a = Vec::new();
+        let mut all_analysis_rollup_b = Vec::new();
+        let mut all_analysis_rollup_a = Vec::new();
+        let mut all_analysis_rollup_sum_b: Vec<(Coin, [String; 4])> = Vec::new();
+        let mut all_analysis_rollup_sum_a: Vec<(Coin, [String; 4])> = Vec::new();
+
+        let mut coin_statuses: HashMap<Coin, Vec<NodeDataOrderStatus>> = HashMap::new();
+        for status in state_statuses.clone().events() {
+            coin_statuses.entry(Coin::new(&status.order.coin)).or_default().push(status);
+        }
+
+        let mut coin_diffs: HashMap<Coin, Vec<NodeDataOrderDiff>> = HashMap::new();
+        for diff in state_diffs.clone().events() {
+            coin_diffs.entry(diff.coin()).or_default().push(diff);
+        }
+
+        let mut coin_fills: HashMap<Coin, Vec<NodeDataFill>> = HashMap::new();
+        for fill in fills.clone().events() {
+            coin_fills.entry(Coin::new(&fill.1.coin)).or_default().push(fill);
+        }
+
+        let mut lite_errors: Vec<(Coin, u64, String)> = Vec::new();
+        let mut lite_needs_rebuild = false;
+        for (coin, lb) in &mut self.lite_books {
+            if !lb.is_initialized() {
+                continue;
+            }
+            let statuses = coin_statuses.remove(coin).unwrap_or_default();
+            let diffs = coin_diffs.remove(coin).unwrap_or_default();
+            let fills = coin_fills.remove(coin).unwrap_or_default();
+
+            match lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height) {
+                Ok(block_event) => {
+                    if let Some(du) = block_event.depth_updates {
+                        all_lite_updates.push(du);
+                    }
+                    if !block_event.analysis_updates_b.is_empty() {
+                        all_analysis_updates_b.extend(block_event.analysis_updates_b);
+                    }
+                    if !block_event.analysis_updates_a.is_empty() {
+                        all_analysis_updates_a.extend(block_event.analysis_updates_a);
+                    }
+                    if !block_event.analysis_rollup_b.is_empty() {
+                        all_analysis_rollup_b.extend(block_event.analysis_rollup_b);
+                    }
+                    if !block_event.analysis_rollup_a.is_empty() {
+                        all_analysis_rollup_a.extend(block_event.analysis_rollup_a);
+                    }
+                    if let Some(sum_b) = block_event.analysis_rollup_sum_b {
+                        all_analysis_rollup_sum_b.push((coin.clone(), sum_b));
+                    }
+                    if let Some(sum_a) = block_event.analysis_rollup_sum_a {
+                        all_analysis_rollup_sum_a.push((coin.clone(), sum_a));
                     }
                 }
-
-
-                // Always send L4Lite message to propagate block height, even if empty
-                if let Some(tx) = &self.internal_message_tx {
-                    let analysis_rollup_height = if target_height % 10 == 0 {
-                        Some(target_height)
-                    } else {
-                        None
-                    };
-                    let msg = Arc::new(InternalMessage::L4Lite { 
-                        updates: all_lite_updates,
-                        analysis_b: all_analysis_updates_b,
-                        analysis_a: all_analysis_updates_a,
-                        analysis_rollup_b: all_analysis_rollup_b,
-                        analysis_rollup_a: all_analysis_rollup_a,
-                        analysis_rollup_sum_b: all_analysis_rollup_sum_b,
-                        analysis_rollup_sum_a: all_analysis_rollup_sum_a,
-                        analysis_rollup_height,
-                        height: target_height,
-                    });
-                    // broadcast::Sender::send is synchronous and non-blocking.
-                    // Do NOT spawn a task here, or messages will be reordered.
-                    let _unused = tx.send(msg);
-                }
-
-                if let Err(err) = self
-                    .order_book_state
-                    .as_mut()
-                    .map(|book| book.apply_updates(state_statuses, state_diffs))
-                    .transpose()
-                {
-                    let requested = self.request_snapshot_rebuild();
-                    if requested {
-                        warn!(
-                            "L4Book out of sync: {}. Triggering snapshot rebuild. {}",
-                            err,
-                            self.last_seen_summary()
-                        );
-                    } else {
-                        warn!(
-                            "L4Book out of sync: {}. Snapshot rebuild already queued. {}",
-                            err,
-                            self.last_seen_summary()
-                        );
-                    }
-                    return Err(err);
-                }
-                
-                if let Some(cache) = &mut self.fetched_snapshot_cache {
-                    // Cache full updates (Filtered by Active | Main already) for snapshot catch-up
-                    // The cache is used to replay state when fetching a new snapshot
-                    // Since we only maintain MAIN_COIN state, we should only cache MAIN_COIN updates for replay.
-                    
-                    let mut cache_statuses = order_statuses.clone();
-                    cache_statuses.retain(|ev| MAIN_COINS.contains(&ev.order.coin.as_str()));
-                    
-                    let mut cache_diffs = order_diffs.clone();
-                    cache_diffs.retain(|ev| MAIN_COINS.contains(&ev.coin().value().as_str()));
-                    
-                    cache.push_back((cache_statuses, cache_diffs));
-                }
-
-                // Forward Active | Main updates to Websocket
-                // order_statuses/diffs are already filtered by (Active | Main) at the top of receive_batch
-                if let Some(tx) = &self.internal_message_tx {
-                    let updates = Arc::new(InternalMessage::L4BookUpdates {
-                        diff_batch: order_diffs,
-                        status_batch: order_statuses,
-                    });
-                    let _unused = tx.send(updates);
-
-                    let fills_msg = Arc::new(InternalMessage::Fills {
-                        batch: fills,
-                    });
-                    let _unused = tx.send(fills_msg);
+                Err(err) => {
+                    lite_errors.push((coin.clone(), target_height, err.to_string()));
+                    lb.reset();
                 }
             }
         }
+
+        if !lite_errors.is_empty() {
+            lite_needs_rebuild = true;
+            for (coin, target_height, err) in &lite_errors {
+                warn!(
+                    "L4Lite out of sync for {} at height {}: {}. Rebuilding from L4Book state.",
+                    coin.value(),
+                    target_height,
+                    err
+                );
+            }
+            // Skip sending partial L4Lite updates; rebuild after L4Book applies this block.
+        }
+
+        // Always send L4Lite message to propagate block height, even if empty
+        if lite_errors.is_empty() {
+            if let Some(tx) = &self.internal_message_tx {
+                let analysis_rollup_height = if target_height % 10 == 0 {
+                    Some(target_height)
+                } else {
+                    None
+                };
+                let msg = Arc::new(InternalMessage::L4Lite {
+                    updates: all_lite_updates,
+                    analysis_b: all_analysis_updates_b,
+                    analysis_a: all_analysis_updates_a,
+                    analysis_rollup_b: all_analysis_rollup_b,
+                    analysis_rollup_a: all_analysis_rollup_a,
+                    analysis_rollup_sum_b: all_analysis_rollup_sum_b,
+                    analysis_rollup_sum_a: all_analysis_rollup_sum_a,
+                    analysis_rollup_height,
+                    height: target_height,
+                });
+                let _unused = tx.send(msg);
+            }
+        }
+
+        if let Err(err) = self
+            .order_book_state
+            .as_mut()
+            .map(|book| book.apply_updates(state_statuses, state_diffs))
+            .transpose()
+        {
+            let started = self.start_rebuild();
+            let requested = if started {
+                self.request_snapshot_rebuild()
+            } else {
+                false
+            };
+            if started && requested {
+                warn!("L4Book out of sync: {}. Triggering snapshot rebuild.", err);
+            } else {
+                warn!("L4Book out of sync: {}. Snapshot rebuild already queued.", err);
+            }
+            self.queue_pending_aligned((order_statuses, order_diffs, fills));
+            return Ok(());
+        }
+
+        if lite_needs_rebuild {
+            self.rebuild_lite_from_state();
+        }
+
+        if let Some(cache) = &mut self.fetched_snapshot_cache {
+            let mut cache_statuses = order_statuses.clone();
+            cache_statuses.retain(|ev| MAIN_COINS.contains(&ev.order.coin.as_str()));
+
+            let mut cache_diffs = order_diffs.clone();
+            cache_diffs.retain(|ev| MAIN_COINS.contains(&ev.coin().value().as_str()));
+
+            if cache.len() >= SNAPSHOT_CACHE_MAX_LEN {
+                cache.pop_front();
+                if !self.snapshot_cache_dropped {
+                    warn!(
+                        "Snapshot cache exceeded {SNAPSHOT_CACHE_MAX_LEN} entries; dropping oldest updates"
+                    );
+                    self.snapshot_cache_dropped = true;
+                }
+            }
+            cache.push_back((cache_statuses, cache_diffs));
+        }
+
+        if let Some(tx) = &self.internal_message_tx {
+            let updates = Arc::new(InternalMessage::L4BookUpdates {
+                diff_batch: order_diffs,
+                status_batch: order_statuses,
+            });
+            let _unused = tx.send(updates);
+
+            let fills_msg = Arc::new(InternalMessage::Fills { batch: fills });
+            let _unused = tx.send(fills_msg);
+        }
+
         Ok(())
     }
 
     fn begin_caching(&mut self) {
+        if self.fetched_snapshot_cache.is_some() {
+            return;
+        }
         self.fetched_snapshot_cache = Some(VecDeque::new());
+        self.snapshot_cache_dropped = false;
+        if let Some(height) = self.last_stream_height {
+            let window = PENDING_ALIGNED_MAX_LEN.saturating_sub(1) as u64;
+            self.pending_window_start = Some(height.saturating_sub(window));
+        }
     }
 
     // tkae the cached updates and stop collecting updates
     fn take_cache(&mut self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
+        self.snapshot_cache_dropped = false;
         self.fetched_snapshot_cache.take().unwrap_or_default()
     }
 
@@ -1012,23 +1082,45 @@ impl OrderBookListener {
         let mut books = snapshot.value();
         books.retain(|coin, _| MAIN_COINS.contains(&coin.value().as_str()));
 
+        info!("No existing snapshot");
+        while matches!(
+            self.pending_aligned.front(),
+            Some(front) if front.0.block_number() <= height
+        ) {
+            self.pending_aligned.pop_front();
+        }
+        let mut init_height = height;
+        if let Some(front) = self.pending_aligned.front() {
+            let expected = height.saturating_add(1);
+            let first = front.0.block_number();
+            if first > expected {
+                info!(
+                    "Pending aligned gap after snapshot: expected {}, found {}. Fast-forwarding init height to {}",
+                    expected,
+                    first,
+                    first.saturating_sub(1)
+                );
+                init_height = first.saturating_sub(1);
+            }
+        }
+
         // Initialize Lite books
         self.lite_books.clear();
         for (coin, orders) in &books {
             let mut lb = lite::BookState::new();
-            lb.init_from_snapshot(orders, height);
+            lb.init_from_snapshot(orders, init_height);
             self.lite_books.insert(coin.clone(), lb);
         }
 
         let snapshot = Snapshots::new(books);
 
-        info!("No existing snapshot");
-        let mut new_order_book = OrderBookState::from_snapshot(snapshot, height, 0, true, self.ignore_spot);
+        let mut new_order_book =
+            OrderBookState::from_snapshot(snapshot, init_height, 0, true, self.ignore_spot);
         let mut retry = false;
-        while let Some((order_statuses, order_diffs, fills)) = self.pop_cache() {
-            // Filter cache updates for MAIN_COINS before applying to initial state.
-            // Pop cache returns full batches (active | main). 
-            // We need to filter them the same way we do in receive_batch before apply_updates.
+        let mut lite_needs_rebuild = false;
+        while let Some((order_statuses, order_diffs, fills)) = self.pending_aligned.pop_front() {
+            // Filter cached updates for MAIN_COINS before applying to initial state.
+            // pending_aligned already stores Active | Main batches.
             
             let mut state_statuses = order_statuses.clone();
             state_statuses.retain(|ev| MAIN_COINS.contains(&ev.order.coin.as_str()));
@@ -1074,23 +1166,14 @@ impl OrderBookListener {
             }
 
             if !lite_errors.is_empty() {
-                let requested = self.request_snapshot_rebuild();
+                lite_needs_rebuild = true;
                 for (coin, target_height, err) in lite_errors {
-                    if requested {
-                        warn!(
-                            "L4Lite out of sync for {} at height {} during snapshot catch-up: {}. Triggering snapshot rebuild.",
-                            coin.value(),
-                            target_height,
-                            err
-                        );
-                    } else {
-                        warn!(
-                            "L4Lite out of sync for {} at height {} during snapshot catch-up: {}. Snapshot rebuild already queued.",
-                            coin.value(),
-                            target_height,
-                            err
-                        );
-                    }
+                    warn!(
+                        "L4Lite out of sync for {} at height {} during snapshot catch-up: {}. Rebuilding from L4Book state.",
+                        coin.value(),
+                        target_height,
+                        err
+                    );
                 }
             }
 
@@ -1102,14 +1185,21 @@ impl OrderBookListener {
                 break;
             }
         }
-        if !retry {
+        let initialized = !retry;
+        self.clear_pending_aligned();
+        self.initializing = !initialized;
+        if initialized {
             self.order_book_state = Some(new_order_book);
             info!("Order book ready");
-            self.broadcast_rebuilt_snapshots();
-            true
+            if lite_needs_rebuild {
+                self.rebuild_lite_from_state();
+            } else {
+                self.broadcast_rebuilt_snapshots();
+            }
         } else {
-            false
+            self.request_snapshot_rebuild();
         }
+        initialized
     }
 
     fn rebuild_lite_from_state(&mut self) {
@@ -1191,66 +1281,6 @@ impl OrderBookListener {
     }
 }
 
-impl OrderBookListener {
-    fn parse_batch_line(&self, line: &str, event_source: EventSource) -> Result<(u64, EventBatch)> {
-        match event_source {
-            EventSource::Fills => serde_json::from_str::<Batch<NodeDataFill>>(line)
-                .map(|batch| (batch.block_number(), EventBatch::Fills(batch)))
-                .map_err(Into::into),
-            EventSource::OrderStatuses => serde_json::from_str::<Batch<NodeDataOrderStatus>>(line)
-                .map(|batch| (batch.block_number(), EventBatch::Orders(batch)))
-                .map_err(Into::into),
-            EventSource::OrderDiffs => serde_json::from_str::<Batch<NodeDataOrderDiff>>(line)
-                .map(|batch| (batch.block_number(), EventBatch::BookDiffs(batch)))
-                .map_err(Into::into),
-        }
-    }
-
-    fn process_stream_line(&mut self, line: String, event_source: EventSource) -> Result<()> {
-        if line.is_empty() {
-            return Ok(());
-        }
-        if now_millis() < self.warmup_deadline.load(AtomicOrdering::SeqCst) {
-            return Ok(());
-        }
-        self.last_event_time = Some(Instant::now());
-        let (height, event_batch) = match self.parse_batch_line(&line, event_source) {
-            Ok(data) => data,
-            Err(err) => {
-                warn!(
-                    "{event_source} serialization error {err}, height: {:?}, drop bad stream: {:?}",
-                    self.order_book_state.as_ref().map(OrderBookState::height),
-                    &line[..line.len().min(100)],
-                );
-                return Ok(());
-            }
-        };
-        self.note_last_seen(event_source, height);
-        if height % 100 == 0 {
-            debug!("{event_source} block: {height}");
-        }
-        if let Err(err) = self.receive_batch(event_batch) {
-            self.order_book_state = None;
-            return Err(err);
-        }
-        // global L2Book logic disabled for now
-        /*
-        let snapshot = self.l2_snapshots(true);
-        if let Some(snapshot) = snapshot {
-            if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                    let _unused = tx.send(snapshot);
-                });
-            }
-        }
-        */
-        Ok(())
-    }
-
-}
-
 pub(crate) struct L2Snapshots(HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>);
 
 impl L2Snapshots {
@@ -1296,15 +1326,6 @@ pub(crate) struct L2SnapshotParams {
     mantissa: Option<u64>,
 }
 
-fn fifo_path(event_source: EventSource) -> PathBuf {
-    let name = match event_source {
-        EventSource::Fills => "fills",
-        EventSource::OrderStatuses => "order",
-        EventSource::OrderDiffs => "diffs",
-    };
-    PathBuf::from(FIFO_BASE_DIR).join(name)
-}
-
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1312,63 +1333,176 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn spawn_fifo_reader(
-    event_source: EventSource,
-    path: PathBuf,
-    tx: MpscSender<StreamMessage>,
+fn split_merged_array(payload: &[u8]) -> Option<[&[u8]; 3]> {
+    let mut idx = 0;
+    while idx < payload.len() && payload[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if idx >= payload.len() || payload[idx] != b'[' {
+        return None;
+    }
+    idx += 1;
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(3);
+    while parts.len() < 3 {
+        while idx < payload.len()
+            && (payload[idx].is_ascii_whitespace() || payload[idx] == b',')
+        {
+            idx += 1;
+        }
+        if idx >= payload.len() || payload[idx] != b'{' {
+            return None;
+        }
+        let start = idx;
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        while idx < payload.len() {
+            let b = payload[idx];
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                idx += 1;
+                continue;
+            }
+            match b {
+                b'"' => {
+                    in_str = true;
+                    idx += 1;
+                }
+                b'{' => {
+                    depth += 1;
+                    idx += 1;
+                }
+                b'}' => {
+                    depth -= 1;
+                    idx += 1;
+                    if depth == 0 {
+                        parts.push(&payload[start..idx]);
+                        break;
+                    }
+                }
+                _ => idx += 1,
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+    }
+    if parts.len() == 3 {
+        Some([parts[0], parts[1], parts[2]])
+    } else {
+        None
+    }
+}
+
+#[allow(unsafe_code)]
+fn spawn_uds_reader(
+    tx: MpscSender<AlignedMessage>,
     dropped_updates: Arc<AtomicBool>,
     warmup_deadline: Arc<AtomicU64>,
 ) {
     thread::spawn(move || loop {
-        let file = match OpenOptions::new().read(true).write(true).open(&path) {
-            Ok(file) => file,
-            Err(err) => {
-                error!("Failed to open FIFO for {event_source} at {}: {err}", path.display());
+        // 1. Connect using UnixStream (Stream mode)
+        let stream = match UnixStream::connect(UDS_PATH) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to connect to UDS {UDS_PATH}: {e}");
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
-        let fd = file.as_raw_fd();
-        #[allow(unsafe_code)]
-        let set_ret = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_CAPACITY as i32) };
-        if set_ret == -1 {
-            warn!(
-                "Failed to set FIFO capacity for {event_source} at {}",
-                path.display()
-            );
+
+        if let Err(e) = stream.set_nonblocking(false) {
+            error!("Failed to set UDS blocking mode: {e}");
         }
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
+
+        let fd = stream.as_raw_fd();
+        let buf_size = UDS_SOCKET_BUFFER;
+        let buf_ptr: *const i32 = &buf_size;
+        let buf_ptr = buf_ptr.cast::<libc::c_void>();
+        let buf_len = size_of::<i32>() as libc::socklen_t;
+
+        // 2. Set Receive Buffer
+        unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, buf_ptr, buf_len);
+        }
+        
+        info!("Connected to merged stream at {UDS_PATH}");
+        
+        let mut reader = BufReader::new(stream);
+        let mut line_buffer = Vec::new();
+
+        // 3. Reader Loop
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
+            // Check warmup deadline
+            let is_warmup = now_millis() < warmup_deadline.load(AtomicOrdering::SeqCst);
+
+            line_buffer.clear();
+            match reader.read_until(b'\n', &mut line_buffer) {
                 Ok(0) => {
-                    warn!("FIFO EOF for {event_source} at {}; reopening", path.display());
+                    warn!("UDS connection closed (EOF); reconnecting");
                     break;
                 }
                 Ok(_) => {
-                    let trimmed = line.trim_end_matches('\n');
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if now_millis() < warmup_deadline.load(AtomicOrdering::SeqCst) {
-                        continue;
-                    }
-                    let message = StreamMessage {
-                        event_source,
-                        line: trimmed.to_string(),
-                    };
-                    if let Err(err) = tx.try_send(message) {
-                        dropped_updates.store(true, AtomicOrdering::SeqCst);
-                        warn!("FIFO queue full for {event_source}. Dropping message: {err}");
-                    }
+                    process_message(&line_buffer, &tx, &dropped_updates, is_warmup);
                 }
-                Err(err) => {
-                    error!("FIFO read error for {event_source}: {err}");
+                Err(e) => {
+                    error!("UDS read error: {e}");
                     break;
                 }
             }
         }
-        thread::sleep(Duration::from_millis(100));
+
+        thread::sleep(Duration::from_secs(1));
     });
+}
+
+fn process_message(
+    buffer: &[u8], 
+    tx: &MpscSender<AlignedMessage>, 
+    dropped_updates: &Arc<AtomicBool>,
+    is_warmup: bool,
+) {
+    // Remove trailing newline if present for parsing
+    let payload = if buffer.ends_with(&[b'\n']) {
+        &buffer[..buffer.len()-1]
+    } else {
+        buffer
+    };
+
+    if payload.is_empty() { return; }
+
+    let Some(parts) = split_merged_array(payload) else {
+        // Log only if it's not a trivial empty line or something, acts as filter
+        if payload.len() > 10 {
+            warn!("Failed to split merged payload (len={})", payload.len());
+        }
+        return;
+    };
+
+    let message = AlignedMessage {
+        fills_line: String::from_utf8_lossy(parts[0]).to_string(),
+        diffs_line: String::from_utf8_lossy(parts[1]).to_string(),
+        order_line: String::from_utf8_lossy(parts[2]).to_string(),
+    };
+
+    if !is_warmup {
+         // Optimization: check drop flag loosely before trying (already present in original logic)
+         if dropped_updates.load(AtomicOrdering::SeqCst) {
+             // In original logic, once dropped, it seemed to persist? 
+             // Or maybe it was just a transient aligned batch drop.
+             // We'll mimic sending attempt which can update the flag.
+         }
+         
+         if let Err(err) = tx.try_send(message) {
+            if !dropped_updates.swap(true, AtomicOrdering::SeqCst) {
+                 warn!("UDS queue full; dropping aligned batch: {err}");
+            }
+         }
+    }
 }

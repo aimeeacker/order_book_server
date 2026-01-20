@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use lexical_core;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
 use std::ops::Add;
@@ -115,7 +116,9 @@ impl Px {
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
     pub(crate) fn parse_from_str(value: &str) -> Result<Self> {
-        let value = (value.parse::<f64>()? * MULTIPLIER).round() as u64;
+        let parsed = lexical_core::parse::<f64>(value.as_bytes())
+            .map_err(|err| -> Error { Box::new(err) })?;
+        let value = (parsed * MULTIPLIER).round() as u64;
         Ok(Self::new(value))
     }
 
@@ -138,7 +141,9 @@ impl Sz {
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
     pub(crate) fn parse_from_str(value: &str) -> Result<Self> {
-        let value = (value.parse::<f64>()? * MULTIPLIER).round() as u64;
+        let parsed = lexical_core::parse::<f64>(value.as_bytes())
+            .map_err(|err| -> Error { Box::new(err) })?;
+        let value = (parsed * MULTIPLIER).round() as u64;
         Ok(Self::new(value))
     }
 

@@ -50,6 +50,7 @@ impl NodeDataOrderStatus {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, strum_macros::Display)]
 pub(crate) enum EventSource {
     Fills,
@@ -57,9 +58,9 @@ pub(crate) enum EventSource {
     OrderDiffs,
 }
 
+#[cfg(test)]
 impl EventSource {
     #[must_use]
-    #[cfg(test)]
     pub(crate) fn event_source_dir(self, dir: &Path) -> PathBuf {
         match self {
             Self::Fills => dir.join("hl/data/node_fills_by_block"),

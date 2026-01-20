@@ -1,13 +1,13 @@
 [package]
-name = "fifo_listener"
+name = "snapshot_bench"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-env_logger = "0.11"
-libc = "0.2"
-log = "0.4"
 memchr = "2.7.4"
+rayon = "1.10"
+memmap2 = "0.9.5"
+simd-json = "0.14.3"
 
 [lints]
 workspace = true

@@ -2,11 +2,15 @@ use crate::{
     order_book::{Coin, InnerOrder, Oid, OrderBook, Snapshot, Sz},
     prelude::*,
 };
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use log::{info, warn};
+use memchr::memmem;
+use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
+    sync::{Mutex, OnceLock},
+    time::Instant,
 };
 use tokio::fs::read;
 
@@ -76,7 +80,7 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
 pub(crate) fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error>,
-    R: Serialize + for<'a> Deserialize<'a>,
+    R: Serialize + for<'a> Deserialize<'a> + Send,
 {
     #[allow(clippy::type_complexity)]
     let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = serde_json::from_str(str)?;
@@ -101,12 +105,56 @@ pub(crate) async fn load_snapshots_from_json_filtered<O, R>(
 ) -> Result<(u64, Snapshots<O>)>
 where
     O: TryFrom<R, Error = Error> + Clone,
-    R: Serialize + for<'a> Deserialize<'a>,
+    R: Serialize + for<'a> Deserialize<'a> + Send,
 {
     let mut file_contents = read(path).await?;
-    #[allow(clippy::type_complexity)]
-    let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = simd_json::from_slice(&mut file_contents)?;
-    build_snapshots_filtered(height, snapshot, allowed_coins)
+    if allowed_coins.is_empty() {
+        #[allow(clippy::type_complexity)]
+        let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) =
+            simd_json::from_slice(&mut file_contents)?;
+        return build_snapshots_filtered(height, snapshot, allowed_coins);
+    }
+
+    let (height, snapshots_start) = parse_snapshot_header(&file_contents)?;
+    let allowed_set: HashSet<&str> = allowed_coins.iter().copied().collect();
+    let scan_start = Instant::now();
+    let entries_bytes = match fast_extract_snapshot_entries(&file_contents, snapshots_start, allowed_coins) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn!("Fast snapshot scan failed: {err}; falling back to full scan");
+            extract_snapshot_entries(&file_contents, snapshots_start, &allowed_set)?
+        }
+    };
+    let scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
+    update_snapshot_index(&entries_bytes);
+    let entries: Vec<ParsedEntry<R>> = entries_bytes
+        .into_par_iter()
+        .map(|entry| parse_snapshot_entry(entry))
+        .collect::<Result<Vec<_>>>()?;
+    let mut out = HashMap::new();
+    let mut timings = Vec::with_capacity(entries.len());
+    for ParsedEntry { coin, orders, slice_ms, parse_ms } in entries {
+        let build_start = Instant::now();
+        let [bids, asks] = orders;
+        let bids: Vec<O> = bids.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+        let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
+        let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
+        out.insert(Coin::new(&coin), Snapshot([bids, asks]));
+        timings.push(SnapshotTiming {
+            coin,
+            scan_ms,
+            slice_ms,
+            parse_ms,
+            build_ms,
+        });
+    }
+    for timing in timings {
+        info!(
+            "Snapshot timing coin={} scan_ms={:.3} slice_ms={:.3} parse_ms={:.3} build_ms={:.3}",
+            timing.coin, timing.scan_ms, timing.slice_ms, timing.parse_ms, timing.build_ms
+        );
+    }
+    Ok((height, Snapshots::new(out)))
 }
 
 #[cfg(test)]
@@ -153,6 +201,518 @@ where
     Ok(out)
 }
 
+fn parse_snapshot_header(bytes: &[u8]) -> Result<(u64, usize)> {
+    let mut idx = 0;
+    skip_ws(bytes, &mut idx);
+    if idx >= bytes.len() || bytes[idx] != b'[' {
+        return Err("snapshot json missing opening [".into());
+    }
+    idx += 1;
+    skip_ws(bytes, &mut idx);
+    let height_start = idx;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx == height_start {
+        return Err("snapshot json missing height".into());
+    }
+    let height = std::str::from_utf8(&bytes[height_start..idx])?.parse::<u64>()?;
+    skip_ws(bytes, &mut idx);
+    if idx >= bytes.len() || bytes[idx] != b',' {
+        return Err("snapshot json missing height separator".into());
+    }
+    idx += 1;
+    skip_ws(bytes, &mut idx);
+    if idx >= bytes.len() || bytes[idx] != b'[' {
+        return Err("snapshot json missing snapshots array".into());
+    }
+    Ok((height, idx))
+}
+
+fn skip_ws(bytes: &[u8], idx: &mut usize) {
+    while *idx < bytes.len() && bytes[*idx].is_ascii_whitespace() {
+        *idx += 1;
+    }
+}
+
+struct SnapshotEntryParts {
+    coin: String,
+    bids: Vec<u8>,
+    asks: Vec<u8>,
+    slice_ms: f64,
+    entry_start: usize,
+    entry_len: usize,
+}
+
+const INDEX_WINDOW_MARGIN: usize = 4 * 1024 * 1024;
+const INDEX_WINDOW_MIN: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct EntryHint {
+    start: usize,
+    len: usize,
+}
+
+fn snapshot_index() -> &'static Mutex<HashMap<String, EntryHint>> {
+    static INDEX: OnceLock<Mutex<HashMap<String, EntryHint>>> = OnceLock::new();
+    INDEX.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn update_snapshot_index(entries: &[SnapshotEntryParts]) {
+    let mut map = snapshot_index().lock().expect("snapshot index poisoned");
+    for entry in entries {
+        map.insert(
+            entry.coin.clone(),
+            EntryHint {
+                start: entry.entry_start,
+                len: entry.entry_len,
+            },
+        );
+    }
+}
+
+fn fast_extract_snapshot_entries(
+    bytes: &[u8],
+    snapshots_start: usize,
+    allowed: &[&str],
+) -> Result<Vec<SnapshotEntryParts>> {
+    let mut entries = Vec::with_capacity(allowed.len());
+    let mut search_start = snapshots_start;
+
+    for coin in allowed {
+        let pattern = build_coin_pattern(coin);
+        let mut entry_start = None;
+        if let Some(hint) = {
+            let map = snapshot_index().lock().expect("snapshot index poisoned");
+            map.get(*coin).copied()
+        } {
+            if entry_header_matches(bytes, hint.start, coin) {
+                entry_start = Some(hint.start);
+            } else {
+            let mut window = hint.len.saturating_add(INDEX_WINDOW_MARGIN);
+            if window < INDEX_WINDOW_MIN {
+                window = INDEX_WINDOW_MIN;
+            }
+            let start = hint.start.saturating_sub(window);
+            let end = (hint.start + hint.len + window).min(bytes.len());
+            entry_start = find_entry_start_in_range(bytes, start, end, &pattern);
+            }
+        }
+        if entry_start.is_none() {
+            entry_start = find_entry_start_in_range(bytes, search_start, bytes.len(), &pattern);
+        }
+
+        let Some(start) = entry_start else {
+            return Err(format!("fast scan could not locate coin {}", coin).into());
+        };
+        let slice_start = Instant::now();
+        let (bids, asks, end) = extract_entry_orders_and_end(bytes, start)?;
+        let slice_ms = slice_start.elapsed().as_secs_f64() * 1000.0;
+        let entry_len = end.saturating_sub(start).saturating_add(1);
+        entries.push(SnapshotEntryParts {
+            coin: coin.to_string(),
+            bids,
+            asks,
+            slice_ms,
+            entry_start: start,
+            entry_len,
+        });
+        search_start = end;
+    }
+
+    Ok(entries)
+}
+
+fn build_coin_pattern(coin: &str) -> Vec<u8> {
+    let mut pattern = Vec::with_capacity(coin.len() + 3);
+    pattern.push(b'"');
+    pattern.extend_from_slice(coin.as_bytes());
+    pattern.push(b'"');
+    pattern.push(b',');
+    pattern
+}
+
+fn entry_header_matches(bytes: &[u8], start: usize, coin: &str) -> bool {
+    if start >= bytes.len() || bytes[start] != b'[' {
+        return false;
+    }
+    let mut idx = start + 1;
+    skip_ws(bytes, &mut idx);
+    if idx >= bytes.len() || bytes[idx] != b'"' {
+        return false;
+    }
+    idx += 1;
+    let coin_start = idx;
+    while idx < bytes.len() && bytes[idx] != b'"' {
+        idx += 1;
+    }
+    if idx >= bytes.len() {
+        return false;
+    }
+    if &bytes[coin_start..idx] != coin.as_bytes() {
+        return false;
+    }
+    idx += 1;
+    skip_ws(bytes, &mut idx);
+    if idx >= bytes.len() || bytes[idx] != b',' {
+        return false;
+    }
+    idx += 1;
+    skip_ws(bytes, &mut idx);
+    idx < bytes.len() && bytes[idx] == b'['
+}
+
+fn entry_start_from_match(bytes: &[u8], quote_pos: usize, pattern_len: usize) -> Option<usize> {
+    if quote_pos == 0 || quote_pos + pattern_len > bytes.len() {
+        return None;
+    }
+    let mut idx = quote_pos;
+    while idx > 0 && bytes[idx - 1].is_ascii_whitespace() {
+        idx -= 1;
+    }
+    if idx == 0 || bytes[idx - 1] != b'[' {
+        return None;
+    }
+    let mut tail = quote_pos + pattern_len;
+    while tail < bytes.len() && bytes[tail].is_ascii_whitespace() {
+        tail += 1;
+    }
+    if tail >= bytes.len() || bytes[tail] != b'[' {
+        return None;
+    }
+    Some(idx - 1)
+}
+
+fn find_entry_start_in_range(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    pattern: &[u8],
+) -> Option<usize> {
+    let mut cursor = start.min(bytes.len());
+    let end = end.min(bytes.len());
+    while cursor < end {
+        let slice = &bytes[cursor..end];
+        let Some(pos) = memmem::find(slice, pattern) else {
+            return None;
+        };
+        let abs_pos = cursor + pos;
+        if let Some(entry_start) = entry_start_from_match(bytes, abs_pos, pattern.len()) {
+            return Some(entry_start);
+        }
+        cursor = abs_pos + pattern.len();
+    }
+    None
+}
+
+fn extract_snapshot_entries(
+    bytes: &[u8],
+    snapshots_start: usize,
+    allowed: &HashSet<&str>,
+) -> Result<Vec<SnapshotEntryParts>> {
+    let mut entries = Vec::new();
+    let mut found = HashSet::new();
+    let mut idx = snapshots_start + 1;
+    let mut array_depth = 0usize;
+    let mut entry_start: Option<usize> = None;
+    let mut entry_coin_allowed = false;
+    let mut entry_coin: Option<String> = None;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut string_start = 0usize;
+
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if in_string {
+            if escape {
+                escape = false;
+                idx += 1;
+                continue;
+            }
+            if b == b'\\' {
+                escape = true;
+                idx += 1;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+                if entry_start.is_some() && array_depth == 1 && entry_coin.is_none() {
+                    let coin_slice = &bytes[string_start..idx];
+                    let coin = std::str::from_utf8(coin_slice)?;
+                    entry_coin = Some(coin.to_string());
+                    if allowed.contains(coin) {
+                        entry_coin_allowed = true;
+                    }
+                }
+            }
+            idx += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => {
+                in_string = true;
+                string_start = idx + 1;
+            }
+            b'[' => {
+                array_depth += 1;
+                if array_depth == 1 {
+                    entry_start = Some(idx);
+                    entry_coin_allowed = false;
+                    entry_coin = None;
+                }
+            }
+            b']' => {
+                if array_depth == 0 {
+                    break;
+                }
+                if array_depth == 1 {
+                    if let Some(start) = entry_start {
+                        if entry_coin_allowed {
+                            let coin = entry_coin
+                                .take()
+                                .ok_or_else(|| "snapshot entry missing coin".to_string())?;
+                            let slice_start = Instant::now();
+                            let entry_slice = &bytes[start..=idx];
+                            let (bids, asks) = extract_entry_orders(entry_slice)?;
+                            let slice_ms = slice_start.elapsed().as_secs_f64() * 1000.0;
+                            let entry_len = idx.saturating_sub(start).saturating_add(1);
+                            entries.push(SnapshotEntryParts {
+                                coin: coin.clone(),
+                                bids,
+                                asks,
+                                slice_ms,
+                                entry_start: start,
+                                entry_len,
+                            });
+                            found.insert(coin);
+                            if found.len() == allowed.len() {
+                                return Ok(entries);
+                            }
+                        }
+                    }
+                    entry_start = None;
+                    entry_coin_allowed = false;
+                    entry_coin = None;
+                }
+                array_depth = array_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    if in_string || array_depth != 0 {
+        return Err("snapshot json truncated while scanning entries".into());
+    }
+    Ok(entries)
+}
+
+struct ParsedEntry<R> {
+    coin: String,
+    orders: [Vec<R>; 2],
+    slice_ms: f64,
+    parse_ms: f64,
+}
+
+struct SnapshotTiming {
+    coin: String,
+    scan_ms: f64,
+    slice_ms: f64,
+    parse_ms: f64,
+    build_ms: f64,
+}
+
+fn parse_snapshot_entry<R>(entry: SnapshotEntryParts) -> Result<ParsedEntry<R>>
+where
+    R: Serialize + for<'a> Deserialize<'a> + Send,
+{
+    let SnapshotEntryParts {
+        coin,
+        mut bids,
+        mut asks,
+        slice_ms,
+        entry_start: _,
+        entry_len: _,
+    } = entry;
+    let parse_start = Instant::now();
+    let (bids_res, asks_res) = rayon::join(
+        || simd_json::from_slice::<Vec<R>>(&mut bids),
+        || simd_json::from_slice::<Vec<R>>(&mut asks),
+    );
+    let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
+    let bids = bids_res?;
+    let asks = asks_res?;
+    Ok(ParsedEntry {
+        coin,
+        orders: [bids, asks],
+        slice_ms,
+        parse_ms,
+    })
+}
+
+fn extract_entry_orders(entry: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut idx = 0usize;
+    let mut depth = 0usize;
+    let mut orders_depth: Option<usize> = None;
+    let mut bids_start: Option<usize> = None;
+    let mut bids_end: Option<usize> = None;
+    let mut asks_start: Option<usize> = None;
+    let mut asks_end: Option<usize> = None;
+    let mut in_string = false;
+    let mut escape = false;
+
+    while idx < entry.len() {
+        let b = entry[idx];
+        if in_string {
+            if escape {
+                escape = false;
+                idx += 1;
+                continue;
+            }
+            if b == b'\\' {
+                escape = true;
+                idx += 1;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            idx += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'[' => {
+                depth += 1;
+                if orders_depth.is_none() && depth == 2 {
+                    orders_depth = Some(2);
+                } else if orders_depth == Some(2) && depth == 3 {
+                    if bids_start.is_none() {
+                        bids_start = Some(idx);
+                    } else if asks_start.is_none() {
+                        asks_start = Some(idx);
+                    }
+                }
+            }
+            b']' => {
+                if orders_depth == Some(2) && depth == 3 {
+                    if bids_start.is_some() && bids_end.is_none() {
+                        bids_end = Some(idx);
+                    } else if asks_start.is_some() && asks_end.is_none() {
+                        asks_end = Some(idx);
+                    }
+                }
+                if depth == 0 {
+                    return Err("snapshot entry has unmatched ']'".into());
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    if in_string || depth != 0 {
+        return Err("snapshot entry truncated while scanning orders".into());
+    }
+    let bids_start = bids_start.ok_or_else(|| "snapshot entry missing bids array".to_string())?;
+    let bids_end = bids_end.ok_or_else(|| "snapshot entry missing bids end".to_string())?;
+    let asks_start = asks_start.ok_or_else(|| "snapshot entry missing asks array".to_string())?;
+    let asks_end = asks_end.ok_or_else(|| "snapshot entry missing asks end".to_string())?;
+    if bids_end < bids_start || asks_end < asks_start {
+        return Err("snapshot entry invalid bids/asks array bounds".into());
+    }
+    let bids = entry[bids_start..=bids_end].to_vec();
+    let asks = entry[asks_start..=asks_end].to_vec();
+    Ok((bids, asks))
+}
+
+fn extract_entry_orders_and_end(bytes: &[u8], start: usize) -> Result<(Vec<u8>, Vec<u8>, usize)> {
+    let mut idx = start;
+    let mut depth = 0usize;
+    let mut orders_depth: Option<usize> = None;
+    let mut bids_start: Option<usize> = None;
+    let mut bids_end: Option<usize> = None;
+    let mut asks_start: Option<usize> = None;
+    let mut asks_end: Option<usize> = None;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut entry_end: Option<usize> = None;
+
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if in_string {
+            if escape {
+                escape = false;
+                idx += 1;
+                continue;
+            }
+            if b == b'\\' {
+                escape = true;
+                idx += 1;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            idx += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'[' => {
+                depth += 1;
+                if orders_depth.is_none() && depth == 2 {
+                    orders_depth = Some(2);
+                } else if orders_depth == Some(2) && depth == 3 {
+                    if bids_start.is_none() {
+                        bids_start = Some(idx);
+                    } else if asks_start.is_none() {
+                        asks_start = Some(idx);
+                    }
+                }
+            }
+            b']' => {
+                if orders_depth == Some(2) && depth == 3 {
+                    if bids_start.is_some() && bids_end.is_none() {
+                        bids_end = Some(idx);
+                    } else if asks_start.is_some() && asks_end.is_none() {
+                        asks_end = Some(idx);
+                    }
+                }
+                if depth == 0 {
+                    return Err("snapshot entry has unmatched ']'".into());
+                }
+                depth -= 1;
+                if depth == 0 {
+                    entry_end = Some(idx);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+
+    if in_string || depth != 0 {
+        return Err("snapshot entry truncated while scanning orders".into());
+    }
+    let bids_start = bids_start.ok_or_else(|| "snapshot entry missing bids array".to_string())?;
+    let bids_end = bids_end.ok_or_else(|| "snapshot entry missing bids end".to_string())?;
+    let asks_start = asks_start.ok_or_else(|| "snapshot entry missing asks array".to_string())?;
+    let asks_end = asks_end.ok_or_else(|| "snapshot entry missing asks end".to_string())?;
+    let entry_end = entry_end.ok_or_else(|| "snapshot entry missing closing ']'".to_string())?;
+    if bids_end < bids_start || asks_end < asks_start {
+        return Err("snapshot entry invalid bids/asks array bounds".into());
+    }
+    let bids = bytes[bids_start..=bids_end].to_vec();
+    let asks = bytes[asks_start..=asks_end].to_vec();
+    Ok((bids, asks, entry_end))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
@@ -169,7 +729,7 @@ mod tests {
     };
     use alloy::primitives::Address;
     use itertools::Itertools;
-    use std::{fs::create_dir_all, path::PathBuf};
+    use std::{fs::{create_dir_all, write}, path::PathBuf};
 
     #[must_use]
     fn snapshot_to_l2_snapshot<O: InnerOrder>(
@@ -328,7 +888,7 @@ mod tests {
     #[tokio::test]
     async fn test_deserialization_from_json() -> Result<()> {
         create_dir_all("tmp/deserialization_test")?;
-        fs::write("tmp/deserialization_test/out.json", SNAPSHOT_JSON)?;
+        write("tmp/deserialization_test/out.json", SNAPSHOT_JSON)?;
         load_snapshots_from_json::<InnerL4Order, (Address, L4Order)>(&PathBuf::from(
             "tmp/deserialization_test/out.json",
         ))

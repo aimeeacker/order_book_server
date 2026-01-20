@@ -7,7 +7,7 @@ use crate::{
         types::{Coin, InnerOrder, Px, Side, Sz},
     },
     prelude::*,
-    types::{L4Order, OrderDiff, node_data::NodeDataOrderStatus},
+    types::{L4Order, OrderDiff, SnapshotOrder, node_data::NodeDataOrderStatus},
 };
 
 // L4Order: the struct we keep in the orderbook (computationally better)
@@ -104,6 +104,47 @@ impl TryFrom<(Address, L4Order)> for InnerL4Order {
         Ok(Self {
             user,
             coin: Coin::new(&coin),
+            side,
+            limit_px,
+            sz,
+            oid,
+            timestamp,
+            trigger_condition,
+            is_trigger,
+            trigger_px,
+            is_position_tpsl,
+            reduce_only,
+            order_type,
+            tif,
+            cloid,
+        })
+    }
+}
+
+impl TryFrom<(Address, SnapshotOrder)> for InnerL4Order {
+    type Error = Error;
+
+    fn try_from(value: (Address, SnapshotOrder)) -> Result<Self> {
+        let SnapshotOrder {
+            coin,
+            side,
+            limit_px,
+            sz,
+            oid,
+            timestamp,
+            trigger_condition,
+            is_trigger,
+            trigger_px,
+            is_position_tpsl,
+            reduce_only,
+            order_type,
+            tif,
+            cloid,
+        } = value.1;
+        let user = value.0;
+        Ok(Self {
+            user,
+            coin,
             side,
             limit_px,
             sz,

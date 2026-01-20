@@ -7,16 +7,13 @@ use crate::{
         types::InnerOrder,
     },
     prelude::*,
-    types::{
-        inner::{InnerL4Order, InnerLevel},
-        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
-    },
+    types::inner::{InnerL4Order, InnerLevel},
 };
-use log::warn;
+use log::{info, warn};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use reqwest::Client;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::{
@@ -240,16 +237,49 @@ fn log_mismatch_diagnostics(
     ignore_spot: bool,
 ) {
     let mismatches = collect_mismatches(snapshot, expected, ignore_spot);
-    if mismatches.is_empty() {
-        warn!("Snapshot mismatch detail: unable to locate differing order");
+    let mut coins: BTreeSet<Coin> = BTreeSet::new();
+    coins.extend(snapshot.as_ref().keys().cloned());
+    coins.extend(expected.as_ref().keys().cloned());
+
+    if coins.is_empty() {
+        warn!("Snapshot mismatch detail: no coins to compare");
         return;
     }
-    for (coin, items) in mismatches {
-        warn!(
-            "Snapshot mismatch detail for {}: {}",
-            coin,
-            items.join("; ")
-        );
+    if mismatches.is_empty() {
+        warn!("Snapshot mismatch detail: unable to locate differing order");
+    }
+
+    for coin in coins {
+        if ignore_spot && coin.is_spot() {
+            continue;
+        }
+        let key = coin.value();
+        if let Some(items) = mismatches.get(&key) {
+            warn!(
+                "L4Book snapshot status for {}: FAIL: {}",
+                key,
+                items.join("; ")
+            );
+        } else if mismatches.is_empty() {
+            warn!(
+                "L4Book snapshot status for {}: FAIL: unable to locate differing order",
+                key
+            );
+        } else {
+            info!("L4Book snapshot status for {}: OK", key);
+        }
+    }
+}
+
+fn log_snapshot_success(snapshot: &Snapshots<InnerL4Order>, expected: &Snapshots<InnerL4Order>, ignore_spot: bool) {
+    let mut coins: BTreeSet<Coin> = BTreeSet::new();
+    coins.extend(snapshot.as_ref().keys().cloned());
+    coins.extend(expected.as_ref().keys().cloned());
+    for coin in coins {
+        if ignore_spot && coin.is_spot() {
+            continue;
+        }
+        info!("L4Book snapshot status for {}: OK", coin.value());
     }
 }
 pub(super) fn validate_snapshot_hash(
@@ -317,6 +347,7 @@ pub(super) fn validate_snapshot_hash(
             hash_expected, hash_snapshot
         ).into());
     }
+    log_snapshot_success(snapshot, expected, ignore_spot);
     Ok(())
 }
 
@@ -360,47 +391,4 @@ pub(super) fn compute_l2_snapshots<O: InnerOrder + Send + Sync>(order_books: &Or
             })
             .collect(),
     )
-}
-
-pub(super) enum EventBatch {
-    Orders(Batch<NodeDataOrderStatus>),
-    BookDiffs(Batch<NodeDataOrderDiff>),
-    Fills(Batch<NodeDataFill>),
-}
-
-pub(super) struct BatchQueue<T> {
-    deque: VecDeque<Batch<T>>,
-    last_ts: Option<u64>,
-}
-
-impl<T> BatchQueue<T> {
-    pub(super) const fn new() -> Self {
-        Self { deque: VecDeque::new(), last_ts: None }
-    }
-
-    pub(super) fn push(&mut self, block: Batch<T>) -> bool {
-        if let Some(last_ts) = self.last_ts {
-            if last_ts >= block.block_number() {
-                return false;
-            }
-            if block.block_number() > last_ts + 1 {
-                warn!(
-                    "Detected batch gap: last_block={}, current_block={}",
-                    last_ts,
-                    block.block_number()
-                );
-            }
-        }
-        self.last_ts = Some(block.block_number());
-        self.deque.push_back(block);
-        true
-    }
-
-    pub(super) fn pop_front(&mut self) -> Option<Batch<T>> {
-        self.deque.pop_front()
-    }
-
-    pub(super) fn front(&self) -> Option<&Batch<T>> {
-        self.deque.front()
-    }
 }

@@ -1,23 +1,26 @@
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
+use std::mem::size_of;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
 
-use chrono::{NaiveDateTime, TimeZone, Utc};
 use log::{info, warn};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use memchr::memmem;
 
 const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book";
 const PIPE_CAPACITY: i32 = 16 * 1024 * 1024;
 const MAX_PENDING_HEIGHTS: usize = 200;
-const MAIN_COINS: [&str; 2] = ["BTC", "ETH"];
+const UDS_PATH: &str = "/home/aimee/hl_runtime/hl_book/fifo_listener.sock";
+const SOCKET_BUFFER: i32 = 16 * 1024 * 1024;
+const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
+const DROP_LOG_THRESHOLD: u64 = 50;
 
 #[derive(Copy, Clone, Debug)]
 enum FifoSource {
@@ -34,14 +37,14 @@ impl FifoSource {
             Self::Diffs => "diffs",
         }
     }
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BatchEnvelope {
-    local_time: NaiveDateTime,
-    block_time: NaiveDateTime,
-    block_number: u64,
-    events: Vec<Value>,
+    fn idx(self) -> usize {
+        match self {
+            Self::Order => 0,
+            Self::Diffs => 1,
+            Self::Fills => 2,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -49,14 +52,13 @@ struct StreamLine {
     source: FifoSource,
     block_number: u64,
     line: Vec<u8>,
-    received_at: Instant,
 }
 
-#[derive(Debug, Default)]
 struct StreamQueues {
     order: VecDeque<StreamLine>,
     fills: VecDeque<StreamLine>,
     diffs: VecDeque<StreamLine>,
+    drops: DropLog,
 }
 
 impl StreamQueues {
@@ -65,6 +67,7 @@ impl StreamQueues {
             order: VecDeque::new(),
             fills: VecDeque::new(),
             diffs: VecDeque::new(),
+            drops: DropLog::new(),
         }
     }
 
@@ -87,106 +90,403 @@ impl StreamQueues {
 
             let max_height = order_height.max(diff_height).max(fill_height);
             if order_height < max_height {
-                warn!(
-                    "Aligning streams: dropping order batch at {} (diff {}, fill {}, target {})",
-                    order_height, diff_height, fill_height, max_height
+                self.drops.record_align_drop(
+                    FifoSource::Order,
+                    AlignDropDetail {
+                        order: order_height,
+                        diff: diff_height,
+                        fill: fill_height,
+                        target: max_height,
+                    },
                 );
                 self.order.pop_front();
                 continue;
             }
             if diff_height < max_height {
-                warn!(
-                    "Aligning streams: dropping diff batch at {} (order {}, fill {}, target {})",
-                    diff_height, order_height, fill_height, max_height
+                self.drops.record_align_drop(
+                    FifoSource::Diffs,
+                    AlignDropDetail {
+                        order: order_height,
+                        diff: diff_height,
+                        fill: fill_height,
+                        target: max_height,
+                    },
                 );
                 self.diffs.pop_front();
                 continue;
             }
             if fill_height < max_height {
-                warn!(
-                    "Aligning streams: dropping fill batch at {} (order {}, diff {}, target {})",
-                    fill_height, order_height, diff_height, max_height
+                self.drops.record_align_drop(
+                    FifoSource::Fills,
+                    AlignDropDetail {
+                        order: order_height,
+                        diff: diff_height,
+                        fill: fill_height,
+                        target: max_height,
+                    },
                 );
                 self.fills.pop_front();
                 continue;
             }
+
             return None;
         }
     }
+
+    fn record_window_drop(&mut self, source: FifoSource, height: u64) {
+        self.drops.record_window_drop(source, height);
+    }
 }
 
-#[derive(Debug, Serialize)]
-struct MergedBatch {
-    block_number: u64,
-    last_local_time: NaiveDateTime,
-    order: BatchEnvelope,
-    diffs: BatchEnvelope,
-    fills: BatchEnvelope,
+#[derive(Clone, Copy)]
+struct AlignDropDetail {
+    order: u64,
+    diff: u64,
+    fill: u64,
+    target: u64,
+}
+
+struct DropLog {
+    last_align_log: std::time::Instant,
+    align_counts: [u64; 3],
+    align_last: [Option<AlignDropDetail>; 3],
+    last_window_log: std::time::Instant,
+    window_counts: [u64; 3],
+    window_last: [Option<u64>; 3],
+}
+
+impl DropLog {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            last_align_log: now,
+            align_counts: [0; 3],
+            align_last: [None, None, None],
+            last_window_log: now,
+            window_counts: [0; 3],
+            window_last: [None, None, None],
+        }
+    }
+
+    fn record_align_drop(&mut self, source: FifoSource, detail: AlignDropDetail) {
+        let idx = source.idx();
+        self.align_counts[idx] += 1;
+        self.align_last[idx] = Some(detail);
+        self.maybe_log_align();
+    }
+
+    fn record_window_drop(&mut self, source: FifoSource, height: u64) {
+        let idx = source.idx();
+        self.window_counts[idx] += 1;
+        self.window_last[idx] = Some(height);
+        self.maybe_log_window();
+    }
+
+    fn maybe_log_align(&mut self) {
+        let total: u64 = self.align_counts.iter().sum();
+        if total == 0 {
+            return;
+        }
+        if total < DROP_LOG_THRESHOLD && self.last_align_log.elapsed() < DROP_LOG_INTERVAL {
+            return;
+        }
+        let elapsed_ms = self.last_align_log.elapsed().as_secs_f64() * 1000.0;
+        warn!(
+            "Align drops last {:.0}ms: order={} (last {}) diffs={} (last {}) fills={} (last {})",
+            elapsed_ms,
+            self.align_counts[0],
+            format_align_detail(self.align_last[0]),
+            self.align_counts[1],
+            format_align_detail(self.align_last[1]),
+            self.align_counts[2],
+            format_align_detail(self.align_last[2]),
+        );
+        self.align_counts = [0; 3];
+        self.align_last = [None, None, None];
+        self.last_align_log = std::time::Instant::now();
+    }
+
+    fn maybe_log_window(&mut self) {
+        let total: u64 = self.window_counts.iter().sum();
+        if total == 0 {
+            return;
+        }
+        if total < DROP_LOG_THRESHOLD && self.last_window_log.elapsed() < DROP_LOG_INTERVAL {
+            return;
+        }
+        let elapsed_ms = self.last_window_log.elapsed().as_secs_f64() * 1000.0;
+        warn!(
+            "Window drops last {:.0}ms: order={} (last {}) diffs={} (last {}) fills={} (last {})",
+            elapsed_ms,
+            self.window_counts[0],
+            format_window_detail(self.window_last[0]),
+            self.window_counts[1],
+            format_window_detail(self.window_last[1]),
+            self.window_counts[2],
+            format_window_detail(self.window_last[2]),
+        );
+        self.window_counts = [0; 3];
+        self.window_last = [None, None, None];
+        self.last_window_log = std::time::Instant::now();
+    }
+}
+
+fn format_align_detail(detail: Option<AlignDropDetail>) -> String {
+    match detail {
+        Some(detail) => format!(
+            "o={} d={} f={} target={}",
+            detail.order, detail.diff, detail.fill, detail.target
+        ),
+        None => "n/a".to_string(),
+    }
+}
+
+fn format_window_detail(height: Option<u64>) -> String {
+    match height {
+        Some(height) => height.to_string(),
+        None => "n/a".to_string(),
+    }
+}
+
+struct UdsServer {
+    listener_fd: i32,
+    client_fd: Option<i32>,
+    path: PathBuf,
+    pending_payload: Option<Vec<u8>>,
+}
+
+impl UdsServer {
+    #[allow(unsafe_code)]
+    fn bind(path: PathBuf) -> std::io::Result<Self> {
+        let _unused = std::fs::remove_file(&path);
+        // Use SOCK_STREAM for byte stream (no message size limits)
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() >= addr.sun_path.len() {
+            close_fd(fd);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UDS path too long",
+            ));
+        }
+        for (dst, src) in addr.sun_path.iter_mut().zip(bytes.iter()) {
+            *dst = *src as libc::c_char;
+        }
+
+        let addr_len = size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        let addr_ptr: *const libc::sockaddr_un = &addr;
+        let addr_ptr = addr_ptr.cast::<libc::sockaddr>();
+        let bind_rc = unsafe {
+            libc::bind(
+                fd,
+                addr_ptr,
+                addr_len,
+            )
+        };
+        if bind_rc < 0 {
+            close_fd(fd);
+            return Err(std::io::Error::last_os_error());
+        }
+
+        if unsafe { libc::listen(fd, 1) } < 0 {
+            close_fd(fd);
+            return Err(std::io::Error::last_os_error());
+        }
+
+        set_fd_nonblocking(fd)?;
+        set_socket_buffers(fd)?;
+
+        Ok(Self {
+            listener_fd: fd,
+            client_fd: None,
+            path,
+            pending_payload: None,
+        })
+    }
+
+    fn try_accept(&mut self) {
+        if self.client_fd.is_some() {
+            return;
+        }
+        #[allow(unsafe_code)]
+        let fd = unsafe {
+            libc::accept(self.listener_fd, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        if fd < 0 {
+            return;
+        }
+        if let Err(err) = set_fd_nonblocking(fd) {
+            warn!("Failed to set UDS client nonblocking: {err}");
+        }
+        if let Err(err) = set_socket_buffers(fd) {
+            warn!("Failed to set UDS client buffers: {err}");
+        }
+        info!("UDS client connected at {}", self.path.display());
+        self.client_fd = Some(fd);
+        self.flush_pending();
+    }
+
+    fn send(&mut self, payload: &[u8]) {
+        if self.client_fd.is_none() {
+            self.pending_payload = Some(payload.to_vec());
+            return;
+        }
+        if self.pending_payload.is_some() {
+            self.pending_payload = Some(payload.to_vec());
+            self.flush_pending();
+            return;
+        }
+        if !self.send_now(payload) {
+            self.pending_payload = Some(payload.to_vec());
+        }
+    }
+
+    fn flush_pending(&mut self) {
+        let Some(payload) = self.pending_payload.take() else {
+            return;
+        };
+        if !self.send_now(&payload) {
+            self.pending_payload = Some(payload);
+        }
+    }
+
+    fn send_now(&mut self, payload: &[u8]) -> bool {
+        let Some(fd) = self.client_fd else {
+            return false;
+        };
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::send(
+                fd,
+                payload.as_ptr() as *const libc::c_void,
+                payload.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                info!("UDS client disconnected (Broken Pipe); closing connection");
+                close_fd(fd);
+                self.client_fd = None;
+                return false;
+            }
+
+            let mut queued: i32 = 0;
+            // TIOCOUTQ gets the amount of data in the output buffer
+            #[allow(unsafe_code)]
+            unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut queued) };
+
+            let mut sndbuf: i32 = 0;
+            let mut len = size_of::<i32>() as libc::socklen_t;
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    std::ptr::addr_of_mut!(sndbuf) as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+
+            warn!(
+                "UDS send failed: {err} (queued: {:.3} MB, sndbuf: {:.3} MB, payload: {:.3} MB); dropping payload",
+                queued as f64 / 1024.0 / 1024.0,
+                sndbuf as f64 / 1024.0 / 1024.0,
+                payload.len() as f64 / 1024.0 / 1024.0
+            );
+            return false;
+        }
+        if rc as usize != payload.len() {
+            warn!(
+                "UDS send short write: {}/{} bytes; closing connection to avoid stream corruption",
+                rc,
+                payload.len()
+            );
+            close_fd(fd);
+            self.client_fd = None;
+            return false;
+        }
+        true
+    }
+}
+
+impl Drop for UdsServer {
+    fn drop(&mut self) {
+        if let Some(fd) = self.client_fd.take() {
+            close_fd(fd);
+        }
+        close_fd(self.listener_fd);
+        let _unused = std::fs::remove_file(&self.path);
+    }
+}
+
+#[allow(unsafe_code)]
+fn close_fd(fd: i32) {
+    unsafe { libc::close(fd) };
+}
+
+#[allow(unsafe_code)]
+fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+fn set_socket_buffers(fd: i32) -> std::io::Result<()> {
+    let size = SOCKET_BUFFER;
+    let size_ptr: *const i32 = &size;
+    let size_ptr = size_ptr.cast::<libc::c_void>();
+    let size_len = size_of::<i32>() as libc::socklen_t;
+    
+    // Set Send Buffer
+    let snd_rc = unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, size_ptr, size_len)
+    };
+    if snd_rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // Set Receive Buffer
+    let rcv_rc = unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size_ptr, size_len)
+    };
+    if rcv_rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    
+    Ok(())
 }
 
 fn fifo_path(source: FifoSource) -> PathBuf {
     PathBuf::from(FIFO_BASE_DIR).join(source.name())
 }
 
-fn set_pipe_capacity(fd: i32, source: FifoSource) {
+fn set_pipe_capacity(fd: i32) -> std::io::Result<i32> {
     #[allow(unsafe_code)]
     let ret = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_CAPACITY) };
     if ret == -1 {
-        warn!("Failed to set FIFO capacity");
-    } else {
-        info!(
-            "Set FIFO capacity for {:?} to {} bytes",
-            source, PIPE_CAPACITY
-        );
+        return Err(std::io::Error::last_os_error());
     }
-}
-
-fn is_main_coin(coin: &str) -> bool {
-    MAIN_COINS.iter().any(|main| coin.eq_ignore_ascii_case(main))
-}
-
-fn filter_batch(batch: &mut BatchEnvelope, source: FifoSource) {
-    batch.events.retain(|event| match source {
-        FifoSource::Order => event
-            .get("order")
-            .and_then(|order| order.get("coin"))
-            .and_then(Value::as_str)
-            .is_some_and(is_main_coin),
-        FifoSource::Diffs => event
-            .get("coin")
-            .and_then(Value::as_str)
-            .is_some_and(is_main_coin),
-        FifoSource::Fills => event
-            .as_array()
-            .and_then(|arr| arr.get(1))
-            .and_then(|fill| fill.get("coin"))
-            .and_then(Value::as_str)
-            .is_some_and(is_main_coin),
-    });
-}
-
-fn parse_batch_line(source: FifoSource, bytes: &mut [u8]) -> Option<(BatchEnvelope, f64, f64)> {
-    let parse_start = Instant::now();
-    let mut batch: BatchEnvelope = match simd_json::serde::from_slice(bytes) {
-        Ok(batch) => batch,
-        Err(err) => {
-            let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(120)]);
-            warn!("{source:?} parse error {err}, payload head: {preview:?}");
-            return None;
-        }
-    };
-    let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
-    let filter_start = Instant::now();
-    filter_batch(&mut batch, source);
-    let filter_ms = filter_start.elapsed().as_secs_f64() * 1000.0;
-    Some((batch, parse_ms, filter_ms))
+    Ok(ret)
 }
 
 fn extract_block_number(bytes: &[u8]) -> Option<u64> {
     const NEEDLE: &[u8] = b"\"block_number\":";
-    let pos = bytes
-        .windows(NEEDLE.len())
-        .position(|window| window == NEEDLE)?;
+    let pos = memmem::find(bytes, NEEDLE)?;
     let mut idx = pos + NEEDLE.len();
     while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
         idx += 1;
@@ -224,11 +524,47 @@ fn listen_fifo(
                 continue;
             }
         };
-        info!("Listening FIFO {:?} at {}", source, path.display());
-        set_pipe_capacity(file.as_raw_fd(), source);
+        match set_pipe_capacity(file.as_raw_fd()) {
+            Ok(size) => info!(
+                "Listening FIFO {:?} at {} (pipe_capacity={} bytes)",
+                source,
+                path.display(),
+                size
+            ),
+            Err(err) => warn!(
+                "Listening FIFO {:?} at {} (pipe_capacity=failed: {err})",
+                source,
+                path.display()
+            ),
+        }
+        let warmup_deadline = std::time::Instant::now() + Duration::from_millis(200);
         let mut reader = BufReader::new(file);
         let mut line: Vec<u8> = Vec::new();
         let mut last_height: Option<u64> = None;
+        let mut reopen = false;
+        while std::time::Instant::now() < warmup_deadline {
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => {
+                    warn!("FIFO EOF for {:?} at {}; reopening", source, path.display());
+                    reopen = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(err) => {
+                    warn!("FIFO read error for {:?} at {}: {err}", source, path.display());
+                    reopen = true;
+                    break;
+                }
+            }
+        }
+        if reopen {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
         loop {
             if stop.load(Ordering::SeqCst) {
                 return;
@@ -246,12 +582,9 @@ fn listen_fifo(
                     if line.is_empty() {
                         continue;
                     }
-                    let received_at = Instant::now();
                     let Some(height) = extract_block_number(&line) else {
                         let preview = String::from_utf8_lossy(&line[..line.len().min(120)]);
-                        warn!(
-                            "{source:?} missing block_number; payload head: {preview:?}"
-                        );
+                        warn!("{source:?} missing block_number; payload head: {preview:?}");
                         continue;
                     };
                     if last_height.is_some_and(|last| height <= last) {
@@ -261,16 +594,18 @@ fn listen_fifo(
                         continue;
                     }
                     last_height = Some(height);
+                    let msg_line = std::mem::take(&mut line);
+                    let next_capacity = msg_line.capacity().max(4096);
                     let msg = StreamLine {
                         source,
                         block_number: height,
-                        line: line.clone(),
-                        received_at,
+                        line: msg_line,
                     };
                     if tx.send(msg).is_err() {
                         warn!("Aggregator dropped; exiting {source:?} listener");
                         return;
                     }
+                    line = Vec::with_capacity(next_capacity);
                 }
                 Err(err) => {
                     warn!("FIFO read error for {:?} at {}: {err}", source, path.display());
@@ -284,14 +619,16 @@ fn listen_fifo(
 
 fn run_aggregator(rx: Receiver<StreamLine>) {
     let mut queues = StreamQueues::new();
-    let mut last_emitted: Option<u64> = None;
+    let uds_path = PathBuf::from(UDS_PATH);
+    let mut uds = match bind_uds_with_retry(uds_path) {
+        Some(server) => Some(server),
+        None => {
+            warn!("Failed to bind UDS {} after 3 attempts; exiting", UDS_PATH);
+            return;
+        }
+    };
 
     while let Ok(msg) = rx.recv() {
-        let height = msg.block_number;
-        if last_emitted.is_some_and(|last| height <= last) {
-            warn!("Dropping out-of-order batch at height {height}");
-            continue;
-        }
         match msg.source {
             FifoSource::Order => queues.order.push_back(msg),
             FifoSource::Diffs => queues.diffs.push_back(msg),
@@ -300,103 +637,64 @@ fn run_aggregator(rx: Receiver<StreamLine>) {
 
         while queues.order.len() > MAX_PENDING_HEIGHTS {
             if let Some(dropped) = queues.order.pop_front() {
-                warn!(
-                    "Dropping order batch at height {} (window limit)",
-                    dropped.block_number
-                );
+                queues.record_window_drop(FifoSource::Order, dropped.block_number);
             }
         }
         while queues.diffs.len() > MAX_PENDING_HEIGHTS {
             if let Some(dropped) = queues.diffs.pop_front() {
-                warn!(
-                    "Dropping diff batch at height {} (window limit)",
-                    dropped.block_number
-                );
+                queues.record_window_drop(FifoSource::Diffs, dropped.block_number);
             }
         }
         while queues.fills.len() > MAX_PENDING_HEIGHTS {
             if let Some(dropped) = queues.fills.pop_front() {
-                warn!(
-                    "Dropping fill batch at height {} (window limit)",
-                    dropped.block_number
-                );
+                queues.record_window_drop(FifoSource::Fills, dropped.block_number);
             }
         }
 
         while let Some((order, diffs, fills)) = queues.pop_aligned() {
             let height = order.block_number;
-            let mut order_line = order.line;
-            let mut diffs_line = diffs.line;
-            let mut fills_line = fills.line;
-
-            let Some((order_batch, order_parse_ms, order_filter_ms)) =
-                parse_batch_line(FifoSource::Order, &mut order_line)
-            else {
-                warn!("Failed to parse order batch at height {height}");
-                continue;
-            };
-            let Some((diffs_batch, diffs_parse_ms, diffs_filter_ms)) =
-                parse_batch_line(FifoSource::Diffs, &mut diffs_line)
-            else {
-                warn!("Failed to parse diff batch at height {height}");
-                continue;
-            };
-            let Some((fills_batch, fills_parse_ms, fills_filter_ms)) =
-                parse_batch_line(FifoSource::Fills, &mut fills_line)
-            else {
-                warn!("Failed to parse fill batch at height {height}");
-                continue;
-            };
-
-            let last_local_time = order_batch
-                .local_time
-                .max(diffs_batch.local_time)
-                .max(fills_batch.local_time);
-            let earliest = order
-                .received_at
-                .min(diffs.received_at)
-                .min(fills.received_at);
-            let latest = order
-                .received_at
-                .max(diffs.received_at)
-                .max(fills.received_at);
-            let align_wait_ms = (latest - earliest).as_secs_f64() * 1000.0;
-
-            let merge_start = Instant::now();
-            let merged = MergedBatch {
-                block_number: height,
-                last_local_time,
-                order: order_batch,
-                diffs: diffs_batch,
-                fills: fills_batch,
-            };
-            let encode_start = Instant::now();
-            let _encoded = match serde_json::to_string(&merged) {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    warn!("Failed to encode merged batch at height {height}: {err}");
-                    continue;
-                }
-            };
-            let json_encode_ms = encode_start.elapsed().as_secs_f64() * 1000.0;
-            let merge_total_ms = merge_start.elapsed().as_secs_f64() * 1000.0;
-            let merge_delay_ms = (merge_start - latest).as_secs_f64() * 1000.0;
-            let end_to_end_ms = localtime_to_now_ms(last_local_time).unwrap_or(-1.0);
-            let merge_overhead_ms = (merge_total_ms - json_encode_ms).max(0.0);
-
-            info!(
-                "Merged height {height} parse_ms={{order:{order_parse_ms:.3},diffs:{diffs_parse_ms:.3},fills:{fills_parse_ms:.3}}} filter_ms={{order:{order_filter_ms:.3},diffs:{diffs_filter_ms:.3},fills:{fills_filter_ms:.3}}} align_wait_ms={align_wait_ms:.3} merge_delay_ms={merge_delay_ms:.3} json_encode_ms={json_encode_ms:.3} merge_overhead_ms={merge_overhead_ms:.3} end_to_end_ms={end_to_end_ms:.3}",
+            
+            let mut merged = Vec::with_capacity(
+                fills.line.len() + diffs.line.len() + order.line.len() + 3,
             );
-            last_emitted = Some(height);
+            merged.push(b'[');
+            merged.extend_from_slice(&fills.line);
+            merged.push(b',');
+            merged.extend_from_slice(&diffs.line);
+            merged.push(b',');
+            merged.extend_from_slice(&order.line);
+            merged.push(b']');
+            merged.push(b'\n'); // Newline delimiter for stream mode
+
+            if let Some(server) = uds.as_mut() {
+                server.try_accept();
+                server.send(&merged);
+            }
+
+            if height % 2000 == 0 {
+                info!("Processed block height {}", height);
+            }
         }
     }
 }
 
-fn localtime_to_now_ms(local_time: NaiveDateTime) -> Option<f64> {
-    let utc_dt = Utc.from_utc_datetime(&local_time);
-    let delta = Utc::now().signed_duration_since(utc_dt);
-    let micros = delta.num_microseconds()?;
-    Some(micros as f64 / 1000.0)
+fn bind_uds_with_retry(path: PathBuf) -> Option<UdsServer> {
+    for attempt in 1..=3 {
+        match UdsServer::bind(path.clone()) {
+            Ok(server) => return Some(server),
+            Err(err) => {
+                warn!(
+                    "Failed to bind UDS {} (attempt {}/3): {err}",
+                    path.display(),
+                    attempt
+                );
+                if attempt < 3 {
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn main() {
@@ -408,20 +706,15 @@ fn main() {
 
     let (tx, rx) = sync_channel(512);
     let stop = Arc::new(AtomicBool::new(false));
-    let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
     for source in [FifoSource::Order, FifoSource::Fills, FifoSource::Diffs] {
         let stop = stop.clone();
         let tx = tx.clone();
         let path = fifo_path(source);
-        let handle = thread::spawn(move || listen_fifo(source, path, stop, tx));
-        handles.push(handle);
+        thread::spawn(move || listen_fifo(source, path, stop, tx));
     }
 
     run_aggregator(rx);
 
     stop.store(true, Ordering::SeqCst);
-    for handle in handles {
-        let _unused = handle.join();
-    }
 }

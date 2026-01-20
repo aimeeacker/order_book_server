@@ -1,7 +1,5 @@
 use crate::{prelude::*, types::node_data::EventSource};
-use fs::File;
-use io::Read;
-use std::path::PathBuf;
+use std::{fs::File, io::Read, path::PathBuf};
 
 // We want all of these functions to be synchronous just for ease of use since they are fast (for now)
 // Asynchronous stuff can be done in the listen function (waiting for next file event)
@@ -30,7 +28,7 @@ mod tests {
         listeners::directory::{DirectoryListener, EventSource},
         prelude::*,
     };
-    use fs::{File, create_dir_all, read_dir, remove_dir_all, remove_file};
+    use std::fs::{File, create_dir_all, read_dir, remove_dir_all, remove_file};
     use log::{error, info};
     use notify::{RecursiveMode, Watcher, recommended_watcher};
     use rand::{Rng, SeedableRng, rngs::StdRng};
