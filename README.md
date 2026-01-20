@@ -33,7 +33,13 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
      - `diffs`
    - Snapshot requests are written to `/home/aimee/hl_runtime/hl_book/snapshot.json`.
 
-2. Then run this local server:
+2. Start the FIFO merge utility (exposes the merged UDS stream at `/home/aimee/hl_runtime/hl_book/fifo_listener.sock`):
+
+```bash
+cargo run -p fifo_listener
+```
+
+3. Then run this local server:
 
 ```bash
 cargo run --release --bin websocket_server
@@ -50,7 +56,6 @@ The WebSocket server comes with compression built-in. The compression ratio can 
 ## FIFO Utilities
 
 - `cargo run -p fifo_listener`: parse and filter FIFO streams, align on block height, and emit timing metrics.
-- `cargo run -p fifo_probe`: lightweight FIFO probe that scans `block_number` without full JSON parsing.
 
 ## Caveats
 

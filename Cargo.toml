@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "binaries", "fifo_listener", "fifo_probe"]
+members = ["server", "binaries", "fifo_listener", "snapshot_bench"]
 
 resolver = "3"
 
