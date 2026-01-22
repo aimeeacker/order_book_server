@@ -41,6 +41,6 @@ This repository hosts a Rust workspace for a local WebSocket server that mirrors
 
 ## Security & Configuration Tips
 
-- The node writes FIFOs at `/home/aimee/hl_runtime/hl_book/{fills,order,diffs}`; `fifo_listener` must be running to expose `/home/aimee/hl_runtime/hl_book/fifo_listener.sock`.
+- The node writes FIFOs at `/home/aimee/hl_runtime/hl_book/node_fifo/{fills,order,diffs}`; `fifo_listener` must be running to expose `/home/aimee/hl_runtime/hl_book/fifo_listener.sock`.
 - Snapshot requests are written to `/home/aimee/hl_runtime/hl_book/snapshot.json`.
 - The process exits if inputs stop arriving or snapshots diverge; treat this as a consistency check, not a crash.

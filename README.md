@@ -27,7 +27,7 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
 ## Setup
 
 1. Run a non-validating node (from [`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node)). Requires batching by block. Requires recording fills, order statuses, and raw book diffs.
-   - The node should write newline-delimited JSON batches into FIFOs at `/home/aimee/hl_runtime/hl_book`:
+   - The node should write newline-delimited JSON batches into FIFOs at `/home/aimee/hl_runtime/hl_book/node_fifo`:
      - `fills`
      - `order`
      - `diffs`
@@ -56,6 +56,7 @@ The WebSocket server comes with compression built-in. The compression ratio can 
 ## FIFO Utilities
 
 - `cargo run -p fifo_listener`: parse and filter FIFO streams, align on block height, and emit timing metrics.
+- Python bindings: build `fifo_listener` as a `cdylib` and see `fifo_listener/python_example.py`.
 
 ## Caveats
 

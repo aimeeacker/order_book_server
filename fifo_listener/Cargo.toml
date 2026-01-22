@@ -3,11 +3,16 @@ name = "fifo_listener"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "fifo_listener"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 env_logger = "0.11"
 libc = "0.2"
 log = "0.4"
 memchr = "2.7.4"
+pyo3 = { version = "0.22.6", features = ["extension-module"] }
 
 [lints]
 workspace = true
