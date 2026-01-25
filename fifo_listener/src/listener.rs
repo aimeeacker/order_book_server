@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader};
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -12,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use log::{info, warn};
-use memchr::memmem;
+use memchr::{memchr, memmem};
 
 const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book/node_fifo";
 const ORDER_PIPE_CAPACITY: i32 = 16 * 1024 * 1024;
@@ -26,77 +25,6 @@ const DROP_LOG_THRESHOLD: u64 = 50;
 static LOG_INIT: Once = Once::new();
 
 pub type HeightCallback = Arc<dyn Fn(u64) + Send + Sync + 'static>;
-
-struct FifoControl {
-    fd: Mutex<Option<RawFd>>,
-    closing: AtomicBool,
-}
-
-impl FifoControl {
-    fn new() -> Self {
-        Self {
-            fd: Mutex::new(None),
-            closing: AtomicBool::new(false),
-        }
-    }
-
-    fn set_fd(&self, fd: RawFd) {
-        if let Ok(mut guard) = self.fd.lock() {
-            *guard = Some(fd);
-        }
-    }
-
-    fn clear_fd(&self, fd: RawFd) {
-        if let Ok(mut guard) = self.fd.lock() {
-            if guard.map_or(false, |current| current == fd) {
-                *guard = None;
-            }
-        }
-    }
-
-    fn close(&self) {
-        self.closing.store(true, Ordering::SeqCst);
-        let fd = self.fd.lock().ok().and_then(|mut guard| guard.take());
-        if let Some(fd) = fd {
-            close_fd(fd);
-        }
-    }
-
-    fn is_closing(&self) -> bool {
-        self.closing.load(Ordering::SeqCst)
-    }
-}
-
-#[derive(Clone)]
-struct FifoControls {
-    order: Arc<FifoControl>,
-    fills: Arc<FifoControl>,
-    diffs: Arc<FifoControl>,
-}
-
-impl FifoControls {
-    fn new() -> Self {
-        Self {
-            order: Arc::new(FifoControl::new()),
-            fills: Arc::new(FifoControl::new()),
-            diffs: Arc::new(FifoControl::new()),
-        }
-    }
-
-    fn for_source(&self, source: FifoSource) -> Arc<FifoControl> {
-        match source {
-            FifoSource::Order => self.order.clone(),
-            FifoSource::Fills => self.fills.clone(),
-            FifoSource::Diffs => self.diffs.clone(),
-        }
-    }
-
-    fn close_all(&self) {
-        self.order.close();
-        self.fills.close();
-        self.diffs.close();
-    }
-}
 
 struct RollbackTracker {
     state: Mutex<RollbackState>,
@@ -141,17 +69,18 @@ impl RollbackTracker {
 
 pub struct ListenerHandle {
     stop: Arc<AtomicBool>,
-    controls: FifoControls,
+    stop_eventfd: RawFd,
     threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl ListenerHandle {
     pub fn stop(self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.controls.close_all();
+        signal_eventfd(self.stop_eventfd);
         for thread in self.threads {
             let _unused = thread.join();
         }
+        close_fd(self.stop_eventfd);
     }
 }
 
@@ -576,6 +505,45 @@ fn close_fd(fd: i32) {
 }
 
 #[allow(unsafe_code)]
+fn create_eventfd() -> std::io::Result<RawFd> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+fn signal_eventfd(fd: RawFd) {
+    let value: u64 = 1;
+    #[allow(unsafe_code)]
+    let rc = unsafe {
+        libc::write(
+            fd,
+            std::ptr::addr_of!(value).cast::<libc::c_void>(),
+            size_of::<u64>(),
+        )
+    };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::WouldBlock {
+            warn!("Failed to signal eventfd: {err}");
+        }
+    }
+}
+
+fn drain_eventfd(fd: RawFd) {
+    let mut value: u64 = 0;
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::read(
+            fd,
+            std::ptr::addr_of_mut!(value).cast::<libc::c_void>(),
+            size_of::<u64>(),
+        )
+    };
+}
+
+#[allow(unsafe_code)]
 fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
@@ -659,10 +627,11 @@ fn listen_fifo(
     source: FifoSource,
     path: PathBuf,
     stop: Arc<AtomicBool>,
-    control: Arc<FifoControl>,
+    stop_eventfd: RawFd,
     rollback: Arc<RollbackTracker>,
     tx: SyncSender<StreamLine>,
 ) {
+    let mut scratch = [0u8; 8192];
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -676,7 +645,10 @@ fn listen_fifo(
                 continue;
             }
         };
-        control.set_fd(file.as_raw_fd());
+
+        if let Err(err) = set_fd_nonblocking(file.as_raw_fd()) {
+            warn!("Failed to set FIFO {:?} nonblocking at {}: {err}", source, path.display());
+        }
         match set_pipe_capacity(file.as_raw_fd(), pipe_capacity_for(source)) {
             Ok(size) => info!(
                 "Listening FIFO {:?} at {} (pipe_capacity={:.2} MB)",
@@ -690,159 +662,143 @@ fn listen_fifo(
                 path.display()
             ),
         }
+
         let warmup_deadline = std::time::Instant::now() + Duration::from_millis(500);
-        let mut reader = BufReader::new(file);
-        let mut line: Vec<u8> = Vec::new();
+        let mut warmup_active = true;
+        let mut pending: Vec<u8> = Vec::new();
         let mut last_height: Option<u64> = None;
         let mut rollback_generation = rollback.generation().unwrap_or(0);
-        let mut reopen = false;
-        while std::time::Instant::now() < warmup_deadline {
-            if stop.load(Ordering::SeqCst) {
-                let file = reader.into_inner();
-                control.clear_fd(file.as_raw_fd());
-                if control.is_closing() {
-                    std::mem::forget(file);
-                }
-                return;
-            }
-            line.clear();
-            match reader.read_until(b'\n', &mut line) {
-                Ok(0) => {
-                    if stop.load(Ordering::SeqCst) {
-                        let file = reader.into_inner();
-                        control.clear_fd(file.as_raw_fd());
-                        if control.is_closing() {
-                            std::mem::forget(file);
-                        }
-                        return;
-                    }
-                    warn!("FIFO EOF for {:?} at {}; reopening", source, path.display());
-                    reopen = true;
-                    break;
-                }
-                Ok(_) => continue,
-                Err(err) => {
-                    if stop.load(Ordering::SeqCst) {
-                        let file = reader.into_inner();
-                        control.clear_fd(file.as_raw_fd());
-                        if control.is_closing() {
-                            std::mem::forget(file);
-                        }
-                        return;
-                    }
-                    warn!("FIFO read error for {:?} at {}: {err}", source, path.display());
-                    reopen = true;
-                    break;
-                }
-            }
-        }
-        if reopen {
-            let file = reader.into_inner();
-            control.clear_fd(file.as_raw_fd());
-            if control.is_closing() {
-                std::mem::forget(file);
-                return;
-            }
-            thread::sleep(Duration::from_millis(100));
-            continue;
-        }
+
         loop {
             if stop.load(Ordering::SeqCst) {
-                let file = reader.into_inner();
-                control.clear_fd(file.as_raw_fd());
-                if control.is_closing() {
-                    std::mem::forget(file);
-                }
                 return;
             }
-            line.clear();
-            match reader.read_until(b'\n', &mut line) {
-                Ok(0) => {
-                    if stop.load(Ordering::SeqCst) {
-                        let file = reader.into_inner();
-                        control.clear_fd(file.as_raw_fd());
-                        if control.is_closing() {
-                            std::mem::forget(file);
-                        }
-                        return;
-                    }
-                    warn!("FIFO EOF for {:?} at {}; reopening", source, path.display());
-                    break;
+            if warmup_active && std::time::Instant::now() >= warmup_deadline {
+                warmup_active = false;
+                pending.clear();
+            }
+
+            let mut fds = [
+                libc::pollfd {
+                    fd: file.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stop_eventfd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            #[allow(unsafe_code)]
+            let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
                 }
-                Ok(_) => {
-                    while matches!(line.last(), Some(b'\n' | b'\r')) {
-                        line.pop();
-                    }
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let Some(height) = extract_block_number(&line) else {
-                        let preview = String::from_utf8_lossy(&line[..line.len().min(120)]);
-                        warn!("{source:?} missing block_number; payload head: {preview:?}");
-                        continue;
-                    };
-                    if let Some(generation) = rollback.generation() {
-                        if generation != rollback_generation {
-                            rollback_generation = generation;
-                            last_height = None;
+                warn!("FIFO poll error for {:?} at {}: {err}", source, path.display());
+                break;
+            }
+
+            if (fds[1].revents & libc::POLLIN) != 0 {
+                drain_eventfd(stop_eventfd);
+                return;
+            }
+
+            if (fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) == 0 {
+                continue;
+            }
+
+            let mut reopen = false;
+            loop {
+                #[allow(unsafe_code)]
+                let n = unsafe {
+                    libc::read(
+                        file.as_raw_fd(),
+                        scratch.as_mut_ptr().cast::<libc::c_void>(),
+                        scratch.len(),
+                    )
+                };
+                if n > 0 {
+                    pending.extend_from_slice(&scratch[..n as usize]);
+                    while let Some(pos) = memchr(b'\n', &pending) {
+                        let mut line = pending.drain(..=pos).collect::<Vec<u8>>();
+                        if line.last() == Some(&b'\n') {
+                            line.pop();
                         }
-                    }
-                    if last_height.is_some_and(|last| height <= last) {
-                        let mut reset = false;
-                        if let Some(generation) = rollback.record_rollback(source) {
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        if warmup_active {
+                            continue;
+                        }
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let Some(height) = extract_block_number(&line) else {
+                            let preview = String::from_utf8_lossy(&line[..line.len().min(120)]);
+                            warn!("{source:?} missing block_number; payload head: {preview:?}");
+                            continue;
+                        };
+                        if let Some(generation) = rollback.generation() {
                             if generation != rollback_generation {
                                 rollback_generation = generation;
                                 last_height = None;
-                                reset = true;
                             }
                         }
-                        if !reset {
-                            warn!(
-                                "Dropping out-of-order {source:?} batch at height {height} (last {last_height:?})"
-                            );
-                            continue;
+                        if last_height.is_some_and(|last| height <= last) {
+                            let mut reset = false;
+                            if let Some(generation) = rollback.record_rollback(source) {
+                                if generation != rollback_generation {
+                                    rollback_generation = generation;
+                                    last_height = None;
+                                    reset = true;
+                                }
+                            }
+                            if !reset {
+                                warn!(
+                                    "Dropping out-of-order {source:?} batch at height {height} (last {last_height:?})"
+                                );
+                                continue;
+                            }
+                        }
+                        last_height = Some(height);
+                        rollback.clear_rollback(source);
+                        let msg = StreamLine {
+                            source,
+                            block_number: height,
+                            line,
+                        };
+                        if tx.send(msg).is_err() {
+                            warn!("Aggregator dropped; exiting {source:?} listener");
+                            return;
                         }
                     }
-                    last_height = Some(height);
-                    rollback.clear_rollback(source);
-                    let msg_line = std::mem::take(&mut line);
-                    let next_capacity = msg_line.capacity().max(4096);
-                    let msg = StreamLine {
-                        source,
-                        block_number: height,
-                        line: msg_line,
-                    };
-                    if tx.send(msg).is_err() {
-                        warn!("Aggregator dropped; exiting {source:?} listener");
-                        let file = reader.into_inner();
-                        control.clear_fd(file.as_raw_fd());
-                        if control.is_closing() {
-                            std::mem::forget(file);
-                        }
-                        return;
-                    }
-                    line = Vec::with_capacity(next_capacity);
+                    continue;
                 }
-                Err(err) => {
-                    if stop.load(Ordering::SeqCst) {
-                        let file = reader.into_inner();
-                        control.clear_fd(file.as_raw_fd());
-                        if control.is_closing() {
-                            std::mem::forget(file);
-                        }
-                        return;
-                    }
-                    warn!("FIFO read error for {:?} at {}: {err}", source, path.display());
+                if n == 0 {
+                    warn!("FIFO EOF for {:?} at {}; reopening", source, path.display());
+                    reopen = true;
                     break;
                 }
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    break;
+                }
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                warn!("FIFO read error for {:?} at {}: {err}", source, path.display());
+                reopen = true;
+                break;
+            }
+
+            if reopen {
+                break;
             }
         }
-        let file = reader.into_inner();
-        control.clear_fd(file.as_raw_fd());
-        if control.is_closing() {
-            std::mem::forget(file);
-            return;
-        }
+
         thread::sleep(Duration::from_millis(100));
     }
 }
@@ -947,49 +903,64 @@ pub fn run_forever() {
 
     let (tx, rx) = sync_channel(512);
     let stop = Arc::new(AtomicBool::new(false));
-    let controls = FifoControls::new();
     let rollback = Arc::new(RollbackTracker::new());
+    let stop_eventfd = match create_eventfd() {
+        Ok(fd) => fd,
+        Err(err) => {
+            warn!("Failed to create eventfd for fifo_listener: {err}");
+            return;
+        }
+    };
+    let mut threads = Vec::new();
 
     for source in [FifoSource::Order, FifoSource::Fills, FifoSource::Diffs] {
         let stop = stop.clone();
         let tx = tx.clone();
         let path = fifo_path(source);
-        let control = controls.for_source(source);
         let rollback = rollback.clone();
-        thread::spawn(move || listen_fifo(source, path, stop, control, rollback, tx));
+        let stop_eventfd = stop_eventfd;
+        threads.push(thread::spawn(move || {
+            listen_fifo(source, path, stop, stop_eventfd, rollback, tx);
+        }));
     }
 
     run_aggregator(rx, stop.clone(), None);
 
     stop.store(true, Ordering::SeqCst);
-    controls.close_all();
+    signal_eventfd(stop_eventfd);
+    for thread in threads {
+        let _unused = thread.join();
+    }
+    close_fd(stop_eventfd);
 }
 
-pub fn start_listener(callback: Option<HeightCallback>) -> ListenerHandle {
+pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<ListenerHandle> {
     init_cli_logging();
     info!("fifo_listener starting");
 
     let (tx, rx) = sync_channel(512);
     let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
-    let controls = FifoControls::new();
     let rollback = Arc::new(RollbackTracker::new());
+    let stop_eventfd = create_eventfd()?;
 
     for source in [FifoSource::Order, FifoSource::Fills, FifoSource::Diffs] {
         let stop = stop.clone();
         let tx = tx.clone();
         let path = fifo_path(source);
-        let control = controls.for_source(source);
         let rollback = rollback.clone();
-        threads.push(thread::spawn(move || listen_fifo(source, path, stop, control, rollback, tx)));
+        let stop_eventfd = stop_eventfd;
+        threads.push(thread::spawn(move || {
+            listen_fifo(source, path, stop, stop_eventfd, rollback, tx);
+        }));
     }
 
     let agg_stop = stop.clone();
     threads.push(thread::spawn(move || run_aggregator(rx, agg_stop, callback)));
 
-    ListenerHandle {
+    Ok(ListenerHandle {
         stop,
-        controls,
+        stop_eventfd,
         threads,
-    }
+    })
 }

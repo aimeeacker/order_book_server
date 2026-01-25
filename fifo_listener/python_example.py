@@ -18,10 +18,11 @@ import fifo_listener
 async def main():
     listener = fifo_listener.FifoListener()
 
-    def on_height(height: int) -> None:
+    async def on_height(height: int) -> None:
         print(f"height={height}")
 
-    listener.start(on_height)
+    loop = asyncio.get_running_loop()
+    listener.start(on_height, event_loop=loop)
 
     print("fifo_listener running for 5 seconds...")
     await asyncio.sleep(5)
