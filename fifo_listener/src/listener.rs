@@ -98,6 +98,47 @@ impl FifoControls {
     }
 }
 
+struct RollbackTracker {
+    state: Mutex<RollbackState>,
+}
+
+struct RollbackState {
+    flags: [bool; 3],
+    generation: u64,
+}
+
+impl RollbackTracker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RollbackState {
+                flags: [false; 3],
+                generation: 0,
+            }),
+        }
+    }
+
+    fn generation(&self) -> Option<u64> {
+        self.state.lock().ok().map(|state| state.generation)
+    }
+
+    fn record_rollback(&self, source: FifoSource) -> Option<u64> {
+        self.state.lock().ok().map(|mut state| {
+            state.flags[source.idx()] = true;
+            if state.flags.iter().all(|flag| *flag) {
+                state.flags = [false; 3];
+                state.generation += 1;
+            }
+            state.generation
+        })
+    }
+
+    fn clear_rollback(&self, source: FifoSource) {
+        if let Ok(mut state) = self.state.lock() {
+            state.flags[source.idx()] = false;
+        }
+    }
+}
+
 pub struct ListenerHandle {
     stop: Arc<AtomicBool>,
     controls: FifoControls,
@@ -619,6 +660,7 @@ fn listen_fifo(
     path: PathBuf,
     stop: Arc<AtomicBool>,
     control: Arc<FifoControl>,
+    rollback: Arc<RollbackTracker>,
     tx: SyncSender<StreamLine>,
 ) {
     loop {
@@ -652,6 +694,7 @@ fn listen_fifo(
         let mut reader = BufReader::new(file);
         let mut line: Vec<u8> = Vec::new();
         let mut last_height: Option<u64> = None;
+        let mut rollback_generation = rollback.generation().unwrap_or(0);
         let mut reopen = false;
         while std::time::Instant::now() < warmup_deadline {
             if stop.load(Ordering::SeqCst) {
@@ -738,13 +781,30 @@ fn listen_fifo(
                         warn!("{source:?} missing block_number; payload head: {preview:?}");
                         continue;
                     };
+                    if let Some(generation) = rollback.generation() {
+                        if generation != rollback_generation {
+                            rollback_generation = generation;
+                            last_height = None;
+                        }
+                    }
                     if last_height.is_some_and(|last| height <= last) {
-                        warn!(
-                            "Dropping out-of-order {source:?} batch at height {height} (last {last_height:?})"
-                        );
-                        continue;
+                        let mut reset = false;
+                        if let Some(generation) = rollback.record_rollback(source) {
+                            if generation != rollback_generation {
+                                rollback_generation = generation;
+                                last_height = None;
+                                reset = true;
+                            }
+                        }
+                        if !reset {
+                            warn!(
+                                "Dropping out-of-order {source:?} batch at height {height} (last {last_height:?})"
+                            );
+                            continue;
+                        }
                     }
                     last_height = Some(height);
+                    rollback.clear_rollback(source);
                     let msg_line = std::mem::take(&mut line);
                     let next_capacity = msg_line.capacity().max(4096);
                     let msg = StreamLine {
@@ -888,13 +948,15 @@ pub fn run_forever() {
     let (tx, rx) = sync_channel(512);
     let stop = Arc::new(AtomicBool::new(false));
     let controls = FifoControls::new();
+    let rollback = Arc::new(RollbackTracker::new());
 
     for source in [FifoSource::Order, FifoSource::Fills, FifoSource::Diffs] {
         let stop = stop.clone();
         let tx = tx.clone();
         let path = fifo_path(source);
         let control = controls.for_source(source);
-        thread::spawn(move || listen_fifo(source, path, stop, control, tx));
+        let rollback = rollback.clone();
+        thread::spawn(move || listen_fifo(source, path, stop, control, rollback, tx));
     }
 
     run_aggregator(rx, stop.clone(), None);
@@ -911,13 +973,15 @@ pub fn start_listener(callback: Option<HeightCallback>) -> ListenerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     let controls = FifoControls::new();
+    let rollback = Arc::new(RollbackTracker::new());
 
     for source in [FifoSource::Order, FifoSource::Fills, FifoSource::Diffs] {
         let stop = stop.clone();
         let tx = tx.clone();
         let path = fifo_path(source);
         let control = controls.for_source(source);
-        threads.push(thread::spawn(move || listen_fifo(source, path, stop, control, tx)));
+        let rollback = rollback.clone();
+        threads.push(thread::spawn(move || listen_fifo(source, path, stop, control, rollback, tx)));
     }
 
     let agg_stop = stop.clone();
