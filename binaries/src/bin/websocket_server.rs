@@ -13,7 +13,7 @@ struct Args {
     address: Ipv4Addr,
 
     /// Server port (e.g., 8000)
-    #[arg(long, default_value_t = 8443)]
+    #[arg(long, default_value_t = 8080)]
     port: u16,
 
     /// Compression level for WebSocket connections.

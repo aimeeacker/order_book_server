@@ -93,29 +93,75 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     // Initialize Scheduler
     let sched = JobScheduler::new().await.map_err(|e| format!("Failed to create scheduler: {e}"))?;
     
-    // Create the job to run at 30th second of minute 0 and 30 (twice per hour)
+    // Create jobs to run at 30s past minute 0,10,20,30,40,50,59 and at 00:05/59:55.
     let job_dir = dir.clone();
     let job_listener = listener.clone();
     let job_tx = snapshot_fetch_task_tx.clone();
     let job_inflight = snapshot_inflight.clone();
-    let job = Job::new("30 0,30 * * * *", move |_uuid, _l| {
+    let job = Job::new("30 0,10,20,30,40,50,59 * * * *", move |_uuid, _l| {
         let listener = job_listener.clone();
         let snapshot_fetch_task_tx = job_tx.clone();
-        trigger_snapshot_fetch(job_dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot, job_inflight.clone());
-    }).map_err(|e| format!("Failed to create cron job: {e}"))?;
+        let dir = job_dir.clone();
+        let inflight = job_inflight.clone();
+        tokio::spawn(async move {
+            let guard = listener.lock().await;
+            if !guard.is_ready() || guard.initializing || guard.validation_active {
+                return;
+            }
+            drop(guard);
+            trigger_snapshot_fetch(dir, listener, snapshot_fetch_task_tx, ignore_spot, inflight);
+        });
+    })
+    .map_err(|e| format!("Failed to create cron job: {e}"))?;
+
+    let boundary_listener = listener.clone();
+    let boundary_tx = snapshot_fetch_task_tx.clone();
+    let boundary_dir = dir.clone();
+    let boundary_inflight = snapshot_inflight.clone();
+    let boundary_job = Job::new("5 0 * * * *", move |_uuid, _l| {
+        let listener = boundary_listener.clone();
+        let snapshot_fetch_task_tx = boundary_tx.clone();
+        let dir = boundary_dir.clone();
+        let inflight = boundary_inflight.clone();
+        tokio::spawn(async move {
+            let guard = listener.lock().await;
+            if !guard.is_ready() || guard.initializing || guard.validation_active {
+                return;
+            }
+            drop(guard);
+            trigger_snapshot_fetch(dir, listener, snapshot_fetch_task_tx, ignore_spot, inflight);
+        });
+    })
+    .map_err(|e| format!("Failed to create cron job: {e}"))?;
+
+    let boundary_listener2 = listener.clone();
+    let boundary_tx2 = snapshot_fetch_task_tx.clone();
+    let boundary_dir2 = dir.clone();
+    let boundary_inflight2 = snapshot_inflight.clone();
+    let boundary_job2 = Job::new("55 59 * * * *", move |_uuid, _l| {
+        let listener = boundary_listener2.clone();
+        let snapshot_fetch_task_tx = boundary_tx2.clone();
+        let dir = boundary_dir2.clone();
+        let inflight = boundary_inflight2.clone();
+        tokio::spawn(async move {
+            let guard = listener.lock().await;
+            if !guard.is_ready() || guard.initializing || guard.validation_active {
+                return;
+            }
+            drop(guard);
+            trigger_snapshot_fetch(dir, listener, snapshot_fetch_task_tx, ignore_spot, inflight);
+        });
+    })
+    .map_err(|e| format!("Failed to create cron job: {e}"))?;
 
     sched.add(job).await.map_err(|e| format!("Failed to add job: {e}"))?;
+    sched.add(boundary_job).await.map_err(|e| format!("Failed to add job: {e}"))?;
+    sched.add(boundary_job2).await.map_err(|e| format!("Failed to add job: {e}"))?;
     sched.start().await.map_err(|e| format!("Failed to start scheduler: {e}"))?;
 
-    info!("Cron scheduler started: snapshot validation set to run at xx:00:30 and xx:30:30.");
+    info!("Cron scheduler started: snapshot validation set to run at xx:x0:30, xx:59:30, xx:00:05, and xx:59:55.");
     
-    // Trigger initial snapshot fetch (prefetch cache 200ms before request)
-    info!("Triggering initial snapshot fetch");
-    {
-        let mut listener = listener.lock().await;
-        listener.start_rebuild();
-        listener.request_snapshot_rebuild();
-    }
+    info!("Waiting for first stream data before requesting initial snapshot");
 
     let mut health_check = interval(Duration::from_secs(60));
     loop {
@@ -229,20 +275,22 @@ fn fetch_snapshot(
 ) {
     let tx = tx.clone();
     tokio::spawn(async move {
+        let mut validation_active = false;
+        let state = {
+            let mut listener = listener.lock().await;
+            if listener.initializing || listener.order_book_state.is_none() {
+                None
+            } else {
+                validation_active = true;
+                listener.begin_validation_cache();
+                listener.clone_state()
+            }
+        };
         let request_start = Instant::now();
         let res = match process_rmp_file(&dir).await {
             Ok(output_fln) => {
                 let request_ms = request_start.elapsed().as_secs_f64() * 1000.0;
                 info!("Snapshot request completed in {:.3} ms", request_ms);
-                let state = {
-                    let mut listener = listener.lock().await;
-                    if listener.initializing || listener.order_book_state.is_none() {
-                        None
-                    } else {
-                        listener.begin_caching();
-                        listener.clone_state()
-                    }
-                };
                 let parse_start = Instant::now();
                 let snapshot =
                     load_snapshots_from_json_filtered::<InnerL4Order, (Address, SnapshotOrder)>(&output_fln, &MAIN_COINS)
@@ -253,18 +301,18 @@ fn fetch_snapshot(
                     let listener = listener.lock().await;
                     listener.initializing || listener.order_book_state.is_none()
                 };
-                let mut cache = VecDeque::new();
+                let mut validation_cache = VecDeque::new();
                 if state.is_some() && !initializing {
                     // sleep to let some updates build up for validation
                     sleep(Duration::from_millis(200)).await;
-                    cache = {
-                        let mut listener = listener.lock().await;
-                        listener.take_cache()
+                    validation_cache = {
+                        let listener = listener.lock().await;
+                        listener.clone_pending_aligned()
                     };
-                    info!("Cache has {} elements", cache.len());
+                    info!("Cache has {} elements", validation_cache.len());
                 } else if state.is_some() {
                     let mut listener = listener.lock().await;
-                    let _unused = listener.take_cache();
+                    let _unused = listener.take_pending_aligned();
                 }
                 match snapshot {
                     Ok((height, expected_snapshot)) => {
@@ -289,15 +337,41 @@ fn fetch_snapshot(
                             }
                             Ok(())
                         } else if let Some(mut state) = state {
-                            let mut validation_cache = cache.clone();
+                            let mut height_cache = validation_cache.clone();
                             while state.height() < height {
-                                if let Some((order_statuses, order_diffs)) = validation_cache.pop_front() {
-                                    state.apply_updates(order_statuses, order_diffs)?;
+                                if let Some((order_statuses, order_diffs, _fills)) = height_cache.pop_front() {
+                                    let mut state_statuses = order_statuses.clone();
+                                    state_statuses.retain(|ev| MAIN_COINS.contains(&ev.order.coin.as_str()));
+
+                                    let mut state_diffs = order_diffs.clone();
+                                    state_diffs.retain(|ev| MAIN_COINS.contains(&ev.coin().value().as_str()));
+
+                                    if let Err(err) = state.apply_updates(state_statuses, state_diffs) {
+                                        let mut listener_guard = listener.lock().await;
+                                        let cache = listener_guard.take_pending_aligned();
+                                        let replay_ok = listener_guard.replay_cached_updates(cache);
+                                        if !replay_ok {
+                                            listener_guard.reset_after_drop();
+                                        }
+                                        return Err(err);
+                                    }
                                 } else {
+                                    let mut listener_guard = listener.lock().await;
+                                    let cache = listener_guard.take_pending_aligned();
+                                    let replay_ok = listener_guard.replay_cached_updates(cache);
+                                    if !replay_ok {
+                                        listener_guard.reset_after_drop();
+                                    }
                                     return Err::<(), Error>("Not enough cached updates".into());
                                 }
                             }
                             if state.height() > height {
+                                let mut listener_guard = listener.lock().await;
+                                let cache = listener_guard.take_pending_aligned();
+                                let replay_ok = listener_guard.replay_cached_updates(cache);
+                                if !replay_ok {
+                                    listener_guard.reset_after_drop();
+                                }
                                 return Err("Fetched snapshot lagging stored state".into());
                             }
                             let stored_snapshot = state.compute_snapshot().snapshot;
@@ -313,186 +387,46 @@ fn fetch_snapshot(
                             match validation {
                                 Ok(Ok(())) => {
                                     info!("L4Book snapshot validated successfully at height {}", height);
-
-                                    struct LiteValidationIssue {
-                                        coin: Coin,
-                                        snapshot: Option<Snapshot<InnerL4Order>>,
-                                        expected_hash: Option<u64>,
-                                        actual_hash: u64,
-                                        initialized: bool,
-                                    }
-
-                                    let (lite_inputs, lite_state) = {
-                                        let listener = listener.lock().await;
-                                        let lite_inputs = listener
-                                            .lite_books
-                                            .iter()
-                                            .map(|(coin, lite_book)| {
-                                                let initialized = lite_book.is_initialized();
-                                                let actual_hash = lite_book.snapshot_hash();
-                                                (coin.clone(), (initialized, actual_hash))
-                                            })
-                                            .collect::<HashMap<_, _>>();
-                                        let lite_state = listener.order_book_state.clone();
-                                        (lite_inputs, lite_state)
-                                    };
-                                    let lite_coin_keys: Vec<Coin> = lite_inputs.keys().cloned().collect();
-
-                                    if !lite_inputs.is_empty() {
-                                        match lite_state {
-                                            Some(lite_state) => {
-                                                info!("Validating L4Lite snapshots against L4Book state");
-                                                let lite_validation = tokio::task::spawn_blocking(move || -> std::result::Result<(u64, Vec<LiteValidationIssue>), Error> {
-                                                    let validation_height = lite_state.height();
-                                                    let l4_snapshot = lite_state.compute_snapshot().snapshot;
-
-                                                    let mut issues = Vec::new();
-                                                    for (coin, (initialized, actual_hash)) in lite_inputs {
-                                                        if let Some(coin_snapshot) = l4_snapshot.as_ref().get(&coin) {
-                                                            let expected_hash = lite::expected_snapshot_hash(coin_snapshot);
-                                                            if !initialized || actual_hash != expected_hash {
-                                                                issues.push(LiteValidationIssue {
-                                                                    coin,
-                                                                    snapshot: Some(coin_snapshot.clone()),
-                                                                    expected_hash: Some(expected_hash),
-                                                                    actual_hash,
-                                                                    initialized,
-                                                                });
-                                                            }
-                                                        } else {
-                                                            issues.push(LiteValidationIssue {
-                                                                coin,
-                                                                snapshot: None,
-                                                                expected_hash: None,
-                                                                actual_hash,
-                                                                initialized,
-                                                            });
-                                                        }
-                                                    }
-                                                    Ok((validation_height, issues))
-                                                })
-                                                .await;
-
-                                                match lite_validation {
-                                                    Ok(Ok((validation_height, issues))) => {
-                                                        if issues.is_empty() {
-                                                            info!("L4Lite snapshots validated successfully at height {}", validation_height);
-                                                            for coin in &lite_coin_keys {
-                                                                info!(
-                                                                    "L4Lite snapshot status for {}: OK",
-                                                                    coin.value()
-                                                                );
-                                                            }
-                                                        } else {
-                                                            let mut issue_coins = HashSet::new();
-                                                            let mut rebuilds = Vec::new();
-                                                            for issue in issues {
-                                                                issue_coins.insert(issue.coin.clone());
-                                                                match issue.snapshot {
-                                                                    Some(snapshot) => {
-                                                                        let expected_hash = issue.expected_hash.unwrap_or_default();
-                                                                        warn!(
-                                                                            "L4Lite snapshot status for {}: FAIL: expected hash {}, actual hash {}, initialized {}. Rebuilding from L4Book state.",
-                                                                            issue.coin.value(),
-                                                                            expected_hash,
-                                                                            issue.actual_hash,
-                                                                            issue.initialized
-                                                                        );
-                                                                        rebuilds.push((issue.coin, snapshot));
-                                                                    }
-                                                                    None => {
-                                                                        warn!(
-                                                                            "L4Lite snapshot status for {}: FAIL: missing L4Book snapshot",
-                                                                            issue.coin.value(),
-                                                                        );
-                                                                    }
-                                                                }
-                                                            }
-                                                            for coin in &lite_coin_keys {
-                                                                if issue_coins.contains(coin) {
-                                                                    continue;
-                                                                }
-                                                                info!(
-                                                                    "L4Lite snapshot status for {}: OK",
-                                                                    coin.value()
-                                                                );
-                                                            }
-
-                                                            if !rebuilds.is_empty() {
-                                                                let mut rebuilt = false;
-                                                                let mut listener_guard = listener.lock().await;
-                                                                for (coin, snapshot) in rebuilds {
-                                                                    let lite_book = listener_guard
-                                                                        .lite_books
-                                                                        .entry(coin.clone())
-                                                                        .or_insert_with(lite::BookState::new);
-                                                                    lite_book.init_from_snapshot(&snapshot, validation_height);
-                                                                    rebuilt = true;
-                                                                }
-                                                                drop(listener_guard);
-                                                                if rebuilt {
-                                                                    let inflight = {
-                                                                        let listener = listener.lock().await;
-                                                                        listener.snapshot_request_inflight()
-                                                                    };
-                                                                    schedule_snapshot_validation(
-                                                                        dir.clone(),
-                                                                        listener.clone(),
-                                                                        tx.clone(),
-                                                                        ignore_spot,
-                                                                        inflight,
-                                                                    );
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    Ok(Err(err)) => {
-                                                        warn!("L4Lite validation failed: {}", err);
-                                                    }
-                                                    Err(err) => {
-                                                        warn!("L4Lite validation task failed: {}", err);
-                                                    }
-                                                }
-                                            }
-                                            None => {
-                                                warn!("Skipping L4Lite validation: L4Book state unavailable");
-                                            }
-                                        }
-                                    }
-
-                                    Ok(())
-                                }
-                                Ok(Err(err)) => {
-                                    warn!("L4Book snapshot hash mismatch at height {}: {}", height, err);
                                     let mut listener_guard = listener.lock().await;
-                                    let schedule_validation = listener_guard.init_from_snapshot(expected_snapshot, height);
-                                    let rebuilt_from_snapshot = listener_guard.order_book_state.is_some();
+                                    let cache = listener_guard.take_pending_aligned();
+                                    let replay_ok = listener_guard.replay_cached_updates(cache);
+                                    if !replay_ok {
+                                        listener_guard.reset_after_drop();
+                                        return Ok(());
+                                    }
 
-                                    let mut replay_failed = false;
-                                    while let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                        let target_height = order_statuses.block_number();
-
-                                        if let Some(book) = listener_guard.order_book_state.as_mut() {
-                                            let mut state_statuses = order_statuses.clone();
-                                            state_statuses.retain(|ev| MAIN_COINS.contains(&ev.order.coin.as_str()));
-
-                                            let mut state_diffs = order_diffs.clone();
-                                            state_diffs.retain(|ev| MAIN_COINS.contains(&ev.coin().value().as_str()));
-
-                                            if let Err(err) = book.apply_updates(state_statuses, state_diffs) {
-                                                warn!(
-                                                    "Failed to replay cached updates at height {} after snapshot rebuild: {}",
-                                                    target_height,
-                                                    err
-                                                );
-                                                replay_failed = true;
+                                    let mut lite_mismatch = false;
+                                    if let Some(book) = listener_guard.order_book_state.as_ref() {
+                                        let l4_snapshot = book.compute_snapshot().snapshot;
+                                        for (coin, lite_book) in &listener_guard.lite_books {
+                                            let Some(coin_snapshot) = l4_snapshot.as_ref().get(coin) else {
+                                                lite_mismatch = true;
+                                                break;
+                                            };
+                                            let expected_hash = lite::expected_snapshot_hash(coin_snapshot);
+                                            if !lite_book.is_initialized() || lite_book.snapshot_hash() != expected_hash {
+                                                lite_mismatch = true;
                                                 break;
                                             }
                                         }
                                     }
 
+                                    if lite_mismatch {
+                                        warn!("L4Lite snapshot mismatch after L4Book validation; rebuilding from L4Book state");
+                                        listener_guard.rebuild_lite_from_state();
+                                    }
+                                    Ok(())
+                                }
+                                Ok(Err(err)) => {
+                                    warn!("L4Book snapshot hash mismatch at height {}: {}", height, err);
+                                    let mut listener_guard = listener.lock().await;
+                                    let cache = listener_guard.take_pending_aligned();
+                                    let schedule_validation = listener_guard.init_from_snapshot(expected_snapshot, height);
+                                    let rebuilt_from_snapshot = listener_guard.order_book_state.is_some();
+                                    let replay_ok = listener_guard.replay_cached_updates(cache);
+
                                     let inflight = listener_guard.snapshot_request_inflight();
-                                    if replay_failed {
+                                    if !replay_ok {
                                         listener_guard.reset_after_drop();
                                     } else if rebuilt_from_snapshot {
                                         listener_guard.rebuild_lite_from_state();
@@ -512,33 +446,13 @@ fn fetch_snapshot(
                                 Err(err) => {
                                     warn!("L4Book snapshot validation task failed at height {}: {}", height, err);
                                     let mut listener_guard = listener.lock().await;
+                                    let cache = listener_guard.take_pending_aligned();
                                     let schedule_validation = listener_guard.init_from_snapshot(expected_snapshot, height);
                                     let rebuilt_from_snapshot = listener_guard.order_book_state.is_some();
-                                    let mut replay_failed = false;
-                                    while let Some((order_statuses, order_diffs)) = cache.pop_front() {
-                                        let target_height = order_statuses.block_number();
-
-                                        if let Some(book) = listener_guard.order_book_state.as_mut() {
-                                            let mut state_statuses = order_statuses.clone();
-                                            state_statuses.retain(|ev| MAIN_COINS.contains(&ev.order.coin.as_str()));
-
-                                            let mut state_diffs = order_diffs.clone();
-                                            state_diffs.retain(|ev| MAIN_COINS.contains(&ev.coin().value().as_str()));
-
-                                            if let Err(err) = book.apply_updates(state_statuses, state_diffs) {
-                                                warn!(
-                                                    "Failed to replay cached updates at height {} after snapshot rebuild: {}",
-                                                    target_height,
-                                                    err
-                                                );
-                                                replay_failed = true;
-                                                break;
-                                            }
-                                        }
-                                    }
+                                    let replay_ok = listener_guard.replay_cached_updates(cache);
 
                                     let inflight = listener_guard.snapshot_request_inflight();
-                                    if replay_failed {
+                                    if !replay_ok {
                                         listener_guard.reset_after_drop();
                                     } else if rebuilt_from_snapshot {
                                         listener_guard.rebuild_lite_from_state();
@@ -565,6 +479,16 @@ fn fetch_snapshot(
                             let mut listener = listener.lock().await;
                             listener.clear_pending_aligned();
                         }
+                        if validation_active {
+                            let mut listener_guard = listener.lock().await;
+                            let cache = listener_guard.take_pending_aligned();
+                            if !initializing {
+                                let replay_ok = listener_guard.replay_cached_updates(cache);
+                                if !replay_ok {
+                                    listener_guard.reset_after_drop();
+                                }
+                            }
+                        }
                         Err(err)
                     }
                 }
@@ -577,6 +501,16 @@ fn fetch_snapshot(
                 if initializing {
                     let mut listener = listener.lock().await;
                     listener.clear_pending_aligned();
+                }
+                if validation_active {
+                    let mut listener_guard = listener.lock().await;
+                    let cache = listener_guard.take_pending_aligned();
+                    if !initializing {
+                        let replay_ok = listener_guard.replay_cached_updates(cache);
+                        if !replay_ok {
+                            listener_guard.reset_after_drop();
+                        }
+                    }
                 }
                 Err(err)
             }
@@ -609,9 +543,7 @@ pub(crate) struct OrderBookListener {
     pending_drop_warned: bool,
     last_stream_height: Option<u64>,
     initializing: bool,
-    // Only Some when we want it to collect updates
-    fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
-    snapshot_cache_dropped: bool,
+    validation_active: bool,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
     active_coins: Option<Arc<Mutex<HashMap<String, usize>>>>,
     pub lite_books: HashMap<Coin, lite::BookState>,
@@ -623,7 +555,6 @@ pub(crate) struct OrderBookListener {
 
 const FIFO_QUEUE_MAX_LEN: usize = 255;
 const PENDING_ALIGNED_MAX_LEN: usize = 512;
-const SNAPSHOT_CACHE_MAX_LEN: usize = 512;
 const UDS_PATH: &str = "/home/aimee/hl_runtime/hl_book/fifo_listener.sock";
 const UDS_SOCKET_BUFFER: i32 = 16 * 1024 * 1024;
 const MAIN_COINS: [&str; 2] = ["BTC", "ETH"];
@@ -655,8 +586,7 @@ impl OrderBookListener {
             ignore_spot,
             order_book_state: None,
             last_event_time: None,
-            fetched_snapshot_cache: None,
-            snapshot_cache_dropped: false,
+            validation_active: false,
             internal_message_tx,
             pending_aligned: VecDeque::new(),
             pending_window_start: None,
@@ -686,8 +616,7 @@ impl OrderBookListener {
         self.initializing = true;
         self.clear_pending_aligned();
         self.last_stream_height = None;
-        self.fetched_snapshot_cache = None;
-        self.snapshot_cache_dropped = false;
+        self.validation_active = false;
         self.bump_warmup_deadline();
         self.request_snapshot_rebuild();
     }
@@ -742,8 +671,7 @@ impl OrderBookListener {
         self.initializing = true;
         self.order_book_state = None;
         self.clear_pending_aligned();
-        self.fetched_snapshot_cache = None;
-        self.snapshot_cache_dropped = false;
+        self.validation_active = false;
         true
     }
 
@@ -771,7 +699,7 @@ impl OrderBookListener {
 
     fn update_pending_window(&mut self, height: u64) {
         self.last_stream_height = Some(height);
-        if self.order_book_state.is_some() {
+        if self.order_book_state.is_some() && !self.validation_active {
             return;
         }
         let window = PENDING_ALIGNED_MAX_LEN.saturating_sub(1) as u64;
@@ -876,7 +804,24 @@ impl OrderBookListener {
             MAIN_COINS.contains(&coin.as_str()) || active_coins.contains_key(coin)
         });
 
-        if self.initializing || self.order_book_state.is_none() {
+        if self.order_book_state.is_none() {
+            if !self.initializing {
+                let started = self.start_rebuild();
+                let requested = if started { self.request_snapshot_rebuild() } else { false };
+                if started && requested {
+                    info!("No snapshot available; requesting rebuild after first stream data");
+                }
+            }
+            self.queue_pending_aligned((order_statuses, order_diffs, fills));
+            return Ok(());
+        }
+
+        if self.initializing {
+            self.queue_pending_aligned((order_statuses, order_diffs, fills));
+            return Ok(());
+        }
+
+        if self.validation_active {
             self.queue_pending_aligned((order_statuses, order_diffs, fills));
             return Ok(());
         }
@@ -891,6 +836,27 @@ impl OrderBookListener {
         fills: Batch<NodeDataFill>,
     ) -> Result<()> {
         let target_height = order_statuses.block_number();
+        let current_height = self.order_book_state.as_ref().map(OrderBookState::height).unwrap_or(0);
+        let expected_height = current_height.saturating_add(1);
+        if target_height != expected_height {
+            let started = self.start_rebuild();
+            let requested = if started { self.request_snapshot_rebuild() } else { false };
+            if started && requested {
+                warn!(
+                    "Order book height discontinuity: expected {}, got {}. Triggering snapshot rebuild.",
+                    expected_height,
+                    target_height
+                );
+            } else {
+                warn!(
+                    "Order book height discontinuity: expected {}, got {}. Snapshot rebuild already queued.",
+                    expected_height,
+                    target_height
+                );
+            }
+            self.queue_pending_aligned((order_statuses, order_diffs, fills));
+            return Ok(());
+        }
 
         // Main coins update state
         let mut state_statuses = order_statuses.clone();
@@ -899,7 +865,28 @@ impl OrderBookListener {
         let mut state_diffs = order_diffs.clone();
         state_diffs.retain(|ev| MAIN_COINS.contains(&ev.coin().value().as_str()));
 
-        // L4Lite Updates
+        if let Err(err) = self
+            .order_book_state
+            .as_mut()
+            .map(|book| book.apply_updates(state_statuses.clone(), state_diffs.clone()))
+            .transpose()
+        {
+            let started = self.start_rebuild();
+            let requested = if started {
+                self.request_snapshot_rebuild()
+            } else {
+                false
+            };
+            if started && requested {
+                warn!("L4Book out of sync: {}. Triggering snapshot rebuild.", err);
+            } else {
+                warn!("L4Book out of sync: {}. Snapshot rebuild already queued.", err);
+            }
+            self.queue_pending_aligned((order_statuses, order_diffs, fills));
+            return Ok(());
+        }
+
+        // L4Lite Updates (after book update)
         let mut all_lite_updates = Vec::new();
         let mut all_analysis_updates_b = Vec::new();
         let mut all_analysis_updates_a = Vec::new();
@@ -909,12 +896,12 @@ impl OrderBookListener {
         let mut all_analysis_rollup_sum_a: Vec<(Coin, [String; 4])> = Vec::new();
 
         let mut coin_statuses: HashMap<Coin, Vec<NodeDataOrderStatus>> = HashMap::new();
-        for status in state_statuses.clone().events() {
+        for status in state_statuses.events() {
             coin_statuses.entry(Coin::new(&status.order.coin)).or_default().push(status);
         }
 
         let mut coin_diffs: HashMap<Coin, Vec<NodeDataOrderDiff>> = HashMap::new();
-        for diff in state_diffs.clone().events() {
+        for diff in state_diffs.events() {
             coin_diffs.entry(diff.coin()).or_default().push(diff);
         }
 
@@ -1000,48 +987,8 @@ impl OrderBookListener {
             }
         }
 
-        if let Err(err) = self
-            .order_book_state
-            .as_mut()
-            .map(|book| book.apply_updates(state_statuses, state_diffs))
-            .transpose()
-        {
-            let started = self.start_rebuild();
-            let requested = if started {
-                self.request_snapshot_rebuild()
-            } else {
-                false
-            };
-            if started && requested {
-                warn!("L4Book out of sync: {}. Triggering snapshot rebuild.", err);
-            } else {
-                warn!("L4Book out of sync: {}. Snapshot rebuild already queued.", err);
-            }
-            self.queue_pending_aligned((order_statuses, order_diffs, fills));
-            return Ok(());
-        }
-
         if lite_needs_rebuild {
             self.rebuild_lite_from_state();
-        }
-
-        if let Some(cache) = &mut self.fetched_snapshot_cache {
-            let mut cache_statuses = order_statuses.clone();
-            cache_statuses.retain(|ev| MAIN_COINS.contains(&ev.order.coin.as_str()));
-
-            let mut cache_diffs = order_diffs.clone();
-            cache_diffs.retain(|ev| MAIN_COINS.contains(&ev.coin().value().as_str()));
-
-            if cache.len() >= SNAPSHOT_CACHE_MAX_LEN {
-                cache.pop_front();
-                if !self.snapshot_cache_dropped {
-                    warn!(
-                        "Snapshot cache exceeded {SNAPSHOT_CACHE_MAX_LEN} entries; dropping oldest updates"
-                    );
-                    self.snapshot_cache_dropped = true;
-                }
-            }
-            cache.push_back((cache_statuses, cache_diffs));
         }
 
         if let Some(tx) = &self.internal_message_tx {
@@ -1058,22 +1005,58 @@ impl OrderBookListener {
         Ok(())
     }
 
-    fn begin_caching(&mut self) {
-        if self.fetched_snapshot_cache.is_some() {
+    fn begin_validation_cache(&mut self) {
+        if self.validation_active {
             return;
         }
-        self.fetched_snapshot_cache = Some(VecDeque::new());
-        self.snapshot_cache_dropped = false;
+        self.validation_active = true;
+        self.clear_pending_aligned();
         if let Some(height) = self.last_stream_height {
             let window = PENDING_ALIGNED_MAX_LEN.saturating_sub(1) as u64;
             self.pending_window_start = Some(height.saturating_sub(window));
         }
     }
 
-    // tkae the cached updates and stop collecting updates
-    fn take_cache(&mut self) -> VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)> {
-        self.snapshot_cache_dropped = false;
-        self.fetched_snapshot_cache.take().unwrap_or_default()
+    fn clone_pending_aligned(&self) -> VecDeque<AlignedTriple> {
+        self.pending_aligned.clone()
+    }
+
+    // take the cached updates and stop collecting updates
+    fn take_pending_aligned(&mut self) -> VecDeque<AlignedTriple> {
+        self.validation_active = false;
+        let cache = std::mem::take(&mut self.pending_aligned);
+        self.pending_window_start = None;
+        self.pending_drop_warned = false;
+        cache
+    }
+
+    fn replay_cached_updates(&mut self, mut cache: VecDeque<AlignedTriple>) -> bool {
+        let mut current_height = self.order_book_state.as_ref().map(OrderBookState::height).unwrap_or(0);
+        while let Some((order_statuses, order_diffs, fills)) = cache.pop_front() {
+            let target_height = order_statuses.block_number();
+            if target_height <= current_height {
+                continue;
+            }
+            if target_height > current_height.saturating_add(1) {
+                warn!(
+                    "Replay gap detected: expected {}, got {}. Triggering snapshot rebuild.",
+                    current_height.saturating_add(1),
+                    target_height
+                );
+                return false;
+            }
+            if let Err(err) = self.apply_aligned_batches(order_statuses, order_diffs, fills) {
+                warn!(
+                    "Failed to replay cached updates at height {} after snapshot validation: {}",
+                    target_height,
+                    err
+                );
+                return false;
+            }
+            current_height = self.order_book_state.as_ref().map(OrderBookState::height).unwrap_or(current_height);
+        }
+        self.clear_pending_aligned();
+        true
     }
 
     fn init_from_snapshot(&mut self, snapshot: Snapshots<InnerL4Order>, height: u64) -> bool {
@@ -1131,20 +1114,28 @@ impl OrderBookListener {
             let mut state_fills = fills.clone();
             state_fills.retain(|ev| MAIN_COINS.contains(&ev.1.coin.as_str()));
 
+            if new_order_book.apply_updates(state_statuses.clone(), state_diffs.clone()).is_err() {
+                info!(
+                    "Failed to apply updates to this book (likely missing older updates). Waiting for next snapshot."
+                );
+                retry = true;
+                break;
+            }
+
             // Update LiteBooks
             // We need to calculate target height here too
             let target_height = order_statuses.block_number();
 
             let mut coin_statuses: HashMap<Coin, Vec<NodeDataOrderStatus>> = HashMap::new();
-            for status in state_statuses.clone().events() {
+            for status in state_statuses.events() {
                 coin_statuses.entry(Coin::new(&status.order.coin)).or_default().push(status);
             }
-            
+
             let mut coin_diffs: HashMap<Coin, Vec<NodeDataOrderDiff>> = HashMap::new();
-            for diff in state_diffs.clone().events() {
+            for diff in state_diffs.events() {
                 coin_diffs.entry(diff.coin()).or_default().push(diff);
             }
-            
+
             let mut coin_fills: HashMap<Coin, Vec<NodeDataFill>> = HashMap::new();
             for fill in state_fills.clone().events() {
                  coin_fills.entry(Coin::new(&fill.1.coin)).or_default().push(fill);
@@ -1175,14 +1166,6 @@ impl OrderBookListener {
                         err
                     );
                 }
-            }
-
-            if new_order_book.apply_updates(state_statuses, state_diffs).is_err() {
-                info!(
-                    "Failed to apply updates to this book (likely missing older updates). Waiting for next snapshot."
-                );
-                retry = true;
-                break;
             }
         }
         let initialized = !retry;
