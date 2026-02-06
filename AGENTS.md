@@ -10,9 +10,17 @@ This repository hosts a Rust workspace for a local WebSocket server that mirrors
 - `Cargo.toml`: workspace config and lint settings.
 - `rustfmt.toml`: formatting rules (120-char width, crate-level import grouping).
 
+## Runtime Data Flow
+
+- Node writes three FIFO streams: `fills`, `order`, `diffs`.
+- `fifo_listener` aligns batches by `block_number`, serves merged stream over UDS, and can optionally archive to Parquet.
+- `server` consumes merged UDS payloads, updates L4 state, validates snapshots, and derives L4Lite/L2 projections.
+- `websocket_server` broadcasts per-subscription updates and snapshot responses.
+
 ## Build, Test, and Development Commands
 
 - `cargo build --workspace`: build all crates.
+- `cargo b`: shorthand rebuild used in this repo workflow.
 - `cargo run --release --bin websocket_server`: run the WebSocket server (defaults to `0.0.0.0:8443`).
 - `RUST_LOG=info cargo run --release --bin websocket_server -- --address 0.0.0.0 --port 8000`: override address/port and enable logging.
 - `cargo run -p fifo_listener`: run the FIFO listener with alignment metrics.
@@ -38,9 +46,25 @@ This repository hosts a Rust workspace for a local WebSocket server that mirrors
 - Recent history uses short, lowercase, imperative messages (e.g., "fix known issues").
 - PRs should describe behavior changes, include repro steps, and note any config changes.
 - If you touch order book logic or listeners, include test updates or explain why tests are unnecessary.
+- Keep commits scoped: avoid mixing protocol/schema changes with refactors in one commit.
+- For dirty worktrees, stage only intended files (`git add <path>`) and confirm with `git status --short`.
 
 ## Security & Configuration Tips
 
 - The node writes FIFOs at `/home/aimee/hl_runtime/hl_book/node_fifo/{fills,order,diffs}`; `fifo_listener` must be running to expose `/home/aimee/hl_runtime/hl_book/fifo_listener.sock`.
 - Snapshot requests are written to `/home/aimee/hl_runtime/hl_book/snapshot.json`.
 - The process exits if inputs stop arriving or snapshots diverge; treat this as a consistency check, not a crash.
+
+## Operational Guardrails
+
+- Do not silently change websocket response field names; treat them as client-facing protocol.
+- Prefer returning recoverable errors over panics in streaming/state-sync paths.
+- Keep snapshot validation and replay paths deterministic; avoid introducing order-dependent hash behavior.
+- When enabling archive writes, monitor disk growth and rotation behavior under restarts.
+
+## Pre-Commit Checklist
+
+- `cargo fmt --all`
+- `cargo b` (or `cargo build --workspace`)
+- `cargo check --workspace`
+- `cargo test --workspace` (or document why it is skipped/failing)
