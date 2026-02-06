@@ -11,18 +11,34 @@ pub(crate) const DEFAULT_LEVELS: usize = 20;
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ClientMessage {
     #[serde(rename = "subscribe")]
-    Subscribe { #[serde(flatten)] payload: SubscribePayload },
+    Subscribe {
+        #[serde(flatten)]
+        payload: SubscribePayload,
+    },
     #[serde(rename = "unsubscribe")]
-    Unsubscribe { #[serde(flatten)] payload: SubscribePayload },
+    Unsubscribe {
+        #[serde(flatten)]
+        payload: SubscribePayload,
+    },
     #[serde(rename = "getSnapshot")]
-    GetSnapshot { snapshot: String, #[serde(rename = "req_id")] req_id: Option<i64> },
+    GetSnapshot {
+        snapshot: String,
+        #[serde(rename = "req_id")]
+        req_id: Option<i64>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum SubscribePayload {
-    Single { subscription: Subscription },
-    Streams { streams: Vec<String>, #[serde(rename = "req_id")] req_id: Option<i64> },
+    Single {
+        subscription: Subscription,
+    },
+    Streams {
+        streams: Vec<String>,
+        #[serde(rename = "req_id")]
+        req_id: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -119,7 +135,11 @@ pub(crate) struct AnalysisData {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum ServerResponse {
     // New response format: return list of streams and echo req_id (or null)
-    SubscriptionResponse { streams: Vec<String>, #[serde(rename = "req_id")] req_id: Option<i64> },
+    SubscriptionResponse {
+        streams: Vec<String>,
+        #[serde(rename = "req_id")]
+        req_id: Option<i64>,
+    },
     L2Book(L2Book),
     L4Book(L4Book),
     L4Lite(crate::listeners::order_book::lite::L2BlockUpdate),
@@ -196,14 +216,15 @@ mod test {
         "#;
         let msg: ClientMessage = serde_json::from_str(message).unwrap();
         match msg {
-            ClientMessage::Subscribe { payload } => {
-                match payload {
-                    SubscribePayload::Single { subscription } => {
-                        assert!(matches!(subscription, Subscription::L2Book { n_sig_figs: None, n_levels: None, mantissa: None, .. }));
-                    }
-                    _ => panic!("unexpected payload"),
+            ClientMessage::Subscribe { payload } => match payload {
+                SubscribePayload::Single { subscription } => {
+                    assert!(matches!(
+                        subscription,
+                        Subscription::L2Book { n_sig_figs: None, n_levels: None, mantissa: None, .. }
+                    ));
                 }
-            }
+                _ => panic!("unexpected payload"),
+            },
             _ => panic!("unexpected message"),
         }
     }
@@ -215,15 +236,13 @@ mod test {
         "#;
         let msg: ClientMessage = serde_json::from_str(message).unwrap();
         match msg {
-            ClientMessage::Subscribe { payload } => {
-                match payload {
-                    SubscribePayload::Streams { streams, req_id } => {
-                        assert_eq!(streams, vec!["BTC@l4Book".to_string(), "BTC@trade".to_string()]);
-                        assert_eq!(req_id, Some(102));
-                    }
-                    _ => panic!("unexpected payload"),
+            ClientMessage::Subscribe { payload } => match payload {
+                SubscribePayload::Streams { streams, req_id } => {
+                    assert_eq!(streams, vec!["BTC@l4Book".to_string(), "BTC@trade".to_string()]);
+                    assert_eq!(req_id, Some(102));
                 }
-            }
+                _ => panic!("unexpected payload"),
+            },
             _ => panic!("unexpected message"),
         }
     }

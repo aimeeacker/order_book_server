@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use simd_json::to_owned_value;
 use std::{
     env,
-    fs::{read, File},
+    fs::{File, read},
     io::Write,
     time::Instant,
 };
@@ -28,9 +28,7 @@ const MINIFY_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() -> Result<(), DynError> {
     let mut args = env::args().skip(1);
-    let path = args
-        .next()
-        .unwrap_or_else(|| "/home/aimee/hl_runtime/hl_book/snapshot.json".to_string());
+    let path = args.next().unwrap_or_else(|| "/home/aimee/hl_runtime/hl_book/snapshot.json".to_string());
     let coins_arg = args.next().unwrap_or_else(|| "BTC,ETH".to_string());
     let coins: Vec<&str> = coins_arg.split(',').filter(|c| !c.is_empty()).collect();
     if coins.is_empty() {
@@ -45,10 +43,8 @@ fn main() -> Result<(), DynError> {
     let (height, snapshots_start) = parse_snapshot_header(&bytes)?;
     let scan_results = scan_for_coins(&bytes, snapshots_start, &coins)?;
     let scan_ms = scan_results.iter().map(|r| r.scan_ms).sum::<f64>();
-    let entry_ranges = scan_results
-        .iter()
-        .map(|scan| build_entry_ranges(&bytes, scan))
-        .collect::<Result<Vec<_>, DynError>>()?;
+    let entry_ranges =
+        scan_results.iter().map(|scan| build_entry_ranges(&bytes, scan)).collect::<Result<Vec<_>, DynError>>()?;
 
     let minify_start = Instant::now();
     let minified = minify_parallel(&bytes);
@@ -62,10 +58,8 @@ fn main() -> Result<(), DynError> {
     let min_scan_results = scan_for_coins(&minified, min_snapshots_start, &coins)?;
     let min_scan_ms = min_scan_results.iter().map(|r| r.scan_ms).sum::<f64>();
 
-    let mmap_out = env::var("SNAPSHOT_BENCH_OUT")
-        .unwrap_or_else(|_| "/dev/shm/snapshot.min.mmap.json".to_string());
-    let (mmap_out, mmap_minify_ms, mmap_write_ms, mmap_total_ms, mmap_size_mb) =
-        minify_mmap_to_file(&path, &mmap_out)?;
+    let mmap_out = env::var("SNAPSHOT_BENCH_OUT").unwrap_or_else(|_| "/dev/shm/snapshot.min.mmap.json".to_string());
+    let (mmap_out, mmap_minify_ms, mmap_write_ms, mmap_total_ms, mmap_size_mb) = minify_mmap_to_file(&path, &mmap_out)?;
 
     println!(
         "snapshot_bench path={} height={} coins={} read_ms={:.3} scan_ms={:.3} minify_ms={:.3} minified_scan_ms={:.3} size_mb={:.3} min_size_mb={:.3}",
@@ -85,8 +79,7 @@ fn main() -> Result<(), DynError> {
     );
 
     let copy_timings = parse_with_copy(&bytes, &entry_ranges)?;
-    let (inplace_copy_ms, inplace_timings, inplace_parse_total_ms) =
-        parse_inplace_with_copy(&bytes, &entry_ranges)?;
+    let (inplace_copy_ms, inplace_timings, inplace_parse_total_ms) = parse_inplace_with_copy(&bytes, &entry_ranges)?;
     println!(
         "parse_bench_inplace copy_ms={:.3} parse_ms_total={:.3} total_ms={:.3}",
         inplace_copy_ms,
@@ -103,11 +96,7 @@ fn main() -> Result<(), DynError> {
     for (orig, min) in scan_results.iter().zip(min_scan_results.iter()) {
         println!(
             "coin={} entry_start={} scan_ms={:.3} min_entry_start={} min_scan_ms={:.3}",
-            orig.coin,
-            orig.entry_start,
-            orig.scan_ms,
-            min.entry_start,
-            min.scan_ms
+            orig.coin, orig.entry_start, orig.scan_ms, min.entry_start, min.scan_ms
         );
     }
 
@@ -193,12 +182,7 @@ fn build_entry_ranges(bytes: &[u8], scan: &ScanResult) -> Result<EntryRanges, Dy
     let range_start = Instant::now();
     let (bids, asks) = extract_entry_ranges(bytes, scan.entry_start)?;
     let range_ms = range_start.elapsed().as_secs_f64() * 1000.0;
-    Ok(EntryRanges {
-        coin: scan.coin.clone(),
-        bids,
-        asks,
-        range_ms,
-    })
+    Ok(EntryRanges { coin: scan.coin.clone(), bids, asks, range_ms })
 }
 
 fn parse_with_copy(bytes: &[u8], ranges: &[EntryRanges]) -> Result<Vec<ParseCopyTiming>, DynError> {
@@ -212,12 +196,7 @@ fn parse_with_copy(bytes: &[u8], ranges: &[EntryRanges]) -> Result<Vec<ParseCopy
         let _bids_value = to_owned_value(&mut bids)?;
         let _asks_value = to_owned_value(&mut asks)?;
         let copy_parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
-        timings.push(ParseCopyTiming {
-            coin: entry.coin.clone(),
-            range_ms: entry.range_ms,
-            copy_ms,
-            copy_parse_ms,
-        });
+        timings.push(ParseCopyTiming { coin: entry.coin.clone(), range_ms: entry.range_ms, copy_ms, copy_parse_ms });
     }
     Ok(timings)
 }
@@ -351,11 +330,7 @@ fn scan_for_coins(bytes: &[u8], snapshots_start: usize, coins: &[&str]) -> Resul
         let entry_start = find_entry_start_in_range(bytes, snapshots_start, bytes.len(), &pattern)
             .ok_or_else(|| format!("coin {} not found", coin))?;
         let scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
-        results.push(ScanResult {
-            coin: coin.to_string(),
-            entry_start,
-            scan_ms,
-        });
+        results.push(ScanResult { coin: coin.to_string(), entry_start, scan_ms });
     }
     Ok(results)
 }

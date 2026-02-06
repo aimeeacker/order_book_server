@@ -110,8 +110,7 @@ where
     let mut file_contents = read(path).await?;
     if allowed_coins.is_empty() {
         #[allow(clippy::type_complexity)]
-        let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) =
-            simd_json::from_slice(&mut file_contents)?;
+        let (height, snapshot): (u64, Vec<(String, [Vec<R>; 2])>) = simd_json::from_slice(&mut file_contents)?;
         return build_snapshots_filtered(height, snapshot, allowed_coins);
     }
 
@@ -127,10 +126,8 @@ where
     };
     let scan_ms = scan_start.elapsed().as_secs_f64() * 1000.0;
     update_snapshot_index(&entries_bytes);
-    let entries: Vec<ParsedEntry<R>> = entries_bytes
-        .into_par_iter()
-        .map(|entry| parse_snapshot_entry(entry))
-        .collect::<Result<Vec<_>>>()?;
+    let entries: Vec<ParsedEntry<R>> =
+        entries_bytes.into_par_iter().map(|entry| parse_snapshot_entry(entry)).collect::<Result<Vec<_>>>()?;
     let mut out = HashMap::new();
     let mut timings = Vec::with_capacity(entries.len());
     for ParsedEntry { coin, orders, slice_ms, parse_ms } in entries {
@@ -140,13 +137,7 @@ where
         let asks: Vec<O> = asks.into_iter().map(O::try_from).collect::<Result<Vec<O>>>()?;
         let build_ms = build_start.elapsed().as_secs_f64() * 1000.0;
         out.insert(Coin::new(&coin), Snapshot([bids, asks]));
-        timings.push(SnapshotTiming {
-            coin,
-            scan_ms,
-            slice_ms,
-            parse_ms,
-            build_ms,
-        });
+        timings.push(SnapshotTiming { coin, scan_ms, slice_ms, parse_ms, build_ms });
     }
     for timing in timings {
         info!(
@@ -163,10 +154,7 @@ where
     O: TryFrom<R, Error = Error> + Clone,
     R: Serialize + for<'a> Deserialize<'a>,
 {
-    Ok((
-        height,
-        Snapshots::new(build_snapshot_map(snapshot, &[])?),
-    ))
+    Ok((height, Snapshots::new(build_snapshot_map(snapshot, &[])?)))
 }
 
 fn build_snapshots_filtered<O, R>(
@@ -261,13 +249,7 @@ fn snapshot_index() -> &'static Mutex<HashMap<String, EntryHint>> {
 fn update_snapshot_index(entries: &[SnapshotEntryParts]) {
     let mut map = snapshot_index().lock().expect("snapshot index poisoned");
     for entry in entries {
-        map.insert(
-            entry.coin.clone(),
-            EntryHint {
-                start: entry.entry_start,
-                len: entry.entry_len,
-            },
-        );
+        map.insert(entry.coin.clone(), EntryHint { start: entry.entry_start, len: entry.entry_len });
     }
 }
 
@@ -289,13 +271,13 @@ fn fast_extract_snapshot_entries(
             if entry_header_matches(bytes, hint.start, coin) {
                 entry_start = Some(hint.start);
             } else {
-            let mut window = hint.len.saturating_add(INDEX_WINDOW_MARGIN);
-            if window < INDEX_WINDOW_MIN {
-                window = INDEX_WINDOW_MIN;
-            }
-            let start = hint.start.saturating_sub(window);
-            let end = (hint.start + hint.len + window).min(bytes.len());
-            entry_start = find_entry_start_in_range(bytes, start, end, &pattern);
+                let mut window = hint.len.saturating_add(INDEX_WINDOW_MARGIN);
+                if window < INDEX_WINDOW_MIN {
+                    window = INDEX_WINDOW_MIN;
+                }
+                let start = hint.start.saturating_sub(window);
+                let end = (hint.start + hint.len + window).min(bytes.len());
+                entry_start = find_entry_start_in_range(bytes, start, end, &pattern);
             }
         }
         if entry_start.is_none() {
@@ -383,12 +365,7 @@ fn entry_start_from_match(bytes: &[u8], quote_pos: usize, pattern_len: usize) ->
     Some(idx - 1)
 }
 
-fn find_entry_start_in_range(
-    bytes: &[u8],
-    start: usize,
-    end: usize,
-    pattern: &[u8],
-) -> Option<usize> {
+fn find_entry_start_in_range(bytes: &[u8], start: usize, end: usize, pattern: &[u8]) -> Option<usize> {
     let mut cursor = start.min(bytes.len());
     let end = end.min(bytes.len());
     while cursor < end {
@@ -469,9 +446,7 @@ fn extract_snapshot_entries(
                 if array_depth == 1 {
                     if let Some(start) = entry_start {
                         if entry_coin_allowed {
-                            let coin = entry_coin
-                                .take()
-                                .ok_or_else(|| "snapshot entry missing coin".to_string())?;
+                            let coin = entry_coin.take().ok_or_else(|| "snapshot entry missing coin".to_string())?;
                             let slice_start = Instant::now();
                             let entry_slice = &bytes[start..=idx];
                             let (bids, asks) = extract_entry_orders(entry_slice)?;
@@ -527,28 +502,14 @@ fn parse_snapshot_entry<R>(entry: SnapshotEntryParts) -> Result<ParsedEntry<R>>
 where
     R: Serialize + for<'a> Deserialize<'a> + Send,
 {
-    let SnapshotEntryParts {
-        coin,
-        mut bids,
-        mut asks,
-        slice_ms,
-        entry_start: _,
-        entry_len: _,
-    } = entry;
+    let SnapshotEntryParts { coin, mut bids, mut asks, slice_ms, entry_start: _, entry_len: _ } = entry;
     let parse_start = Instant::now();
-    let (bids_res, asks_res) = rayon::join(
-        || simd_json::from_slice::<Vec<R>>(&mut bids),
-        || simd_json::from_slice::<Vec<R>>(&mut asks),
-    );
+    let (bids_res, asks_res) =
+        rayon::join(|| simd_json::from_slice::<Vec<R>>(&mut bids), || simd_json::from_slice::<Vec<R>>(&mut asks));
     let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
     let bids = bids_res?;
     let asks = asks_res?;
-    Ok(ParsedEntry {
-        coin,
-        orders: [bids, asks],
-        slice_ms,
-        parse_ms,
-    })
+    Ok(ParsedEntry { coin, orders: [bids, asks], slice_ms, parse_ms })
 }
 
 fn extract_entry_orders(entry: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -729,7 +690,10 @@ mod tests {
     };
     use alloy::primitives::Address;
     use itertools::Itertools;
-    use std::{fs::{create_dir_all, write}, path::PathBuf};
+    use std::{
+        fs::{create_dir_all, write},
+        path::PathBuf,
+    };
 
     #[must_use]
     fn snapshot_to_l2_snapshot<O: InnerOrder>(

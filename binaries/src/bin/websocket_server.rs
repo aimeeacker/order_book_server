@@ -2,8 +2,8 @@
 use std::net::Ipv4Addr;
 
 use clap::Parser;
+use env_logger::{Builder, Env};
 use server::{Result, run_websocket_server};
-use env_logger::{Env, Builder};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -30,9 +30,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    Builder::from_env(Env::default().default_filter_or("info"))
-        .format_timestamp_micros()
-        .init();
+    Builder::from_env(Env::default().default_filter_or("info")).format_timestamp_micros().init();
 
     let args = Args::parse();
 

@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::fmt;
 
 use alloy::primitives::Address;
-use serde::{Deserialize, Serialize};
 use serde::de::{self, Visitor};
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    order_book::types::{Coin, Px, Side, Sz, MULTIPLIER},
+    order_book::types::{Coin, MULTIPLIER, Px, Side, Sz},
     types::node_data::{NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
 };
 

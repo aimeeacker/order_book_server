@@ -5,13 +5,16 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::Duration;
 
 use log::{info, warn};
 use memchr::{memchr, memmem};
+
+pub use crate::archive::set_archive_enabled;
+use crate::archive::{ARCHIVE_QUEUE_BLOCKS, ArchiveBlock, is_archive_enabled, run_archive_writer};
 
 const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book/node_fifo";
 const ORDER_PIPE_CAPACITY: i32 = 16 * 1024 * 1024;
@@ -37,12 +40,7 @@ struct RollbackState {
 
 impl RollbackTracker {
     fn new() -> Self {
-        Self {
-            state: Mutex::new(RollbackState {
-                flags: [false; 3],
-                generation: 0,
-            }),
-        }
+        Self { state: Mutex::new(RollbackState { flags: [false; 3], generation: 0 }) }
     }
 
     fn generation(&self) -> Option<u64> {
@@ -86,10 +84,8 @@ impl ListenerHandle {
 
 pub fn init_cli_logging() {
     LOG_INIT.call_once(|| {
-        let _unused = env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Info)
-            .format_timestamp_micros()
-            .try_init();
+        let _unused =
+            env_logger::Builder::new().filter_level(log::LevelFilter::Info).format_timestamp_micros().try_init();
     });
 }
 
@@ -134,12 +130,7 @@ struct StreamQueues {
 
 impl StreamQueues {
     fn new() -> Self {
-        Self {
-            order: VecDeque::new(),
-            fills: VecDeque::new(),
-            diffs: VecDeque::new(),
-            drops: DropLog::new(),
-        }
+        Self { order: VecDeque::new(), fills: VecDeque::new(), diffs: VecDeque::new(), drops: DropLog::new() }
     }
 
     fn pop_aligned(&mut self) -> Option<(StreamLine, StreamLine, StreamLine)> {
@@ -163,12 +154,7 @@ impl StreamQueues {
             if order_height < max_height {
                 self.drops.record_align_drop(
                     FifoSource::Order,
-                    AlignDropDetail {
-                        order: order_height,
-                        diff: diff_height,
-                        fill: fill_height,
-                        target: max_height,
-                    },
+                    AlignDropDetail { order: order_height, diff: diff_height, fill: fill_height, target: max_height },
                 );
                 self.order.pop_front();
                 continue;
@@ -176,12 +162,7 @@ impl StreamQueues {
             if diff_height < max_height {
                 self.drops.record_align_drop(
                     FifoSource::Diffs,
-                    AlignDropDetail {
-                        order: order_height,
-                        diff: diff_height,
-                        fill: fill_height,
-                        target: max_height,
-                    },
+                    AlignDropDetail { order: order_height, diff: diff_height, fill: fill_height, target: max_height },
                 );
                 self.diffs.pop_front();
                 continue;
@@ -189,12 +170,7 @@ impl StreamQueues {
             if fill_height < max_height {
                 self.drops.record_align_drop(
                     FifoSource::Fills,
-                    AlignDropDetail {
-                        order: order_height,
-                        diff: diff_height,
-                        fill: fill_height,
-                        target: max_height,
-                    },
+                    AlignDropDetail { order: order_height, diff: diff_height, fill: fill_height, target: max_height },
                 );
                 self.fills.pop_front();
                 continue;
@@ -304,10 +280,7 @@ impl DropLog {
 
 fn format_align_detail(detail: Option<AlignDropDetail>) -> String {
     match detail {
-        Some(detail) => format!(
-            "o={} d={} f={} target={}",
-            detail.order, detail.diff, detail.fill, detail.target
-        ),
+        Some(detail) => format!("o={} d={} f={} target={}", detail.order, detail.diff, detail.fill, detail.target),
         None => "n/a".to_string(),
     }
 }
@@ -341,10 +314,7 @@ impl UdsServer {
         let bytes = path.as_os_str().as_bytes();
         if bytes.len() >= addr.sun_path.len() {
             close_fd(fd);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "UDS path too long",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "UDS path too long"));
         }
         for (dst, src) in addr.sun_path.iter_mut().zip(bytes.iter()) {
             *dst = *src as libc::c_char;
@@ -353,13 +323,7 @@ impl UdsServer {
         let addr_len = size_of::<libc::sockaddr_un>() as libc::socklen_t;
         let addr_ptr: *const libc::sockaddr_un = &addr;
         let addr_ptr = addr_ptr.cast::<libc::sockaddr>();
-        let bind_rc = unsafe {
-            libc::bind(
-                fd,
-                addr_ptr,
-                addr_len,
-            )
-        };
+        let bind_rc = unsafe { libc::bind(fd, addr_ptr, addr_len) };
         if bind_rc < 0 {
             close_fd(fd);
             return Err(std::io::Error::last_os_error());
@@ -373,12 +337,7 @@ impl UdsServer {
         set_fd_nonblocking(fd)?;
         set_socket_buffers(fd)?;
 
-        Ok(Self {
-            listener_fd: fd,
-            client_fd: None,
-            path,
-            pending_payload: None,
-        })
+        Ok(Self { listener_fd: fd, client_fd: None, path, pending_payload: None })
     }
 
     fn try_accept(&mut self) {
@@ -386,9 +345,7 @@ impl UdsServer {
             return;
         }
         #[allow(unsafe_code)]
-        let fd = unsafe {
-            libc::accept(self.listener_fd, std::ptr::null_mut(), std::ptr::null_mut())
-        };
+        let fd = unsafe { libc::accept(self.listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
         if fd < 0 {
             return;
         }
@@ -432,14 +389,7 @@ impl UdsServer {
             return false;
         };
         #[allow(unsafe_code)]
-        let rc = unsafe {
-            libc::send(
-                fd,
-                payload.as_ptr() as *const libc::c_void,
-                payload.len(),
-                libc::MSG_DONTWAIT,
-            )
-        };
+        let rc = unsafe { libc::send(fd, payload.as_ptr() as *const libc::c_void, payload.len(), libc::MSG_DONTWAIT) };
         if rc < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::BrokenPipe {
@@ -452,7 +402,9 @@ impl UdsServer {
             let mut queued: i32 = 0;
             // TIOCOUTQ gets the amount of data in the output buffer
             #[allow(unsafe_code)]
-            unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut queued) };
+            unsafe {
+                libc::ioctl(fd, libc::TIOCOUTQ, &mut queued)
+            };
 
             let mut sndbuf: i32 = 0;
             let mut len = size_of::<i32>() as libc::socklen_t;
@@ -516,13 +468,7 @@ fn create_eventfd() -> std::io::Result<RawFd> {
 fn signal_eventfd(fd: RawFd) {
     let value: u64 = 1;
     #[allow(unsafe_code)]
-    let rc = unsafe {
-        libc::write(
-            fd,
-            std::ptr::addr_of!(value).cast::<libc::c_void>(),
-            size_of::<u64>(),
-        )
-    };
+    let rc = unsafe { libc::write(fd, std::ptr::addr_of!(value).cast::<libc::c_void>(), size_of::<u64>()) };
     if rc < 0 {
         let err = std::io::Error::last_os_error();
         if err.kind() != std::io::ErrorKind::WouldBlock {
@@ -535,11 +481,7 @@ fn drain_eventfd(fd: RawFd) {
     let mut value: u64 = 0;
     #[allow(unsafe_code)]
     unsafe {
-        libc::read(
-            fd,
-            std::ptr::addr_of_mut!(value).cast::<libc::c_void>(),
-            size_of::<u64>(),
-        )
+        libc::read(fd, std::ptr::addr_of_mut!(value).cast::<libc::c_void>(), size_of::<u64>())
     };
 }
 
@@ -561,23 +503,19 @@ fn set_socket_buffers(fd: i32) -> std::io::Result<()> {
     let size_ptr: *const i32 = &size;
     let size_ptr = size_ptr.cast::<libc::c_void>();
     let size_len = size_of::<i32>() as libc::socklen_t;
-    
+
     // Set Send Buffer
-    let snd_rc = unsafe {
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, size_ptr, size_len)
-    };
+    let snd_rc = unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, size_ptr, size_len) };
     if snd_rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
 
     // Set Receive Buffer
-    let rcv_rc = unsafe {
-        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size_ptr, size_len)
-    };
+    let rcv_rc = unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size_ptr, size_len) };
     if rcv_rc < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    
+
     Ok(())
 }
 
@@ -656,11 +594,7 @@ fn listen_fifo(
                 path.display(),
                 size as f64 / 1024.0 / 1024.0
             ),
-            Err(err) => warn!(
-                "Listening FIFO {:?} at {} (pipe_capacity=failed: {err})",
-                source,
-                path.display()
-            ),
+            Err(err) => warn!("Listening FIFO {:?} at {} (pipe_capacity=failed: {err})", source, path.display()),
         }
 
         let warmup_deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -679,16 +613,8 @@ fn listen_fifo(
             }
 
             let mut fds = [
-                libc::pollfd {
-                    fd: file.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: stop_eventfd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
+                libc::pollfd { fd: file.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: stop_eventfd, events: libc::POLLIN, revents: 0 },
             ];
             #[allow(unsafe_code)]
             let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
@@ -713,13 +639,8 @@ fn listen_fifo(
             let mut reopen = false;
             loop {
                 #[allow(unsafe_code)]
-                let n = unsafe {
-                    libc::read(
-                        file.as_raw_fd(),
-                        scratch.as_mut_ptr().cast::<libc::c_void>(),
-                        scratch.len(),
-                    )
-                };
+                let n =
+                    unsafe { libc::read(file.as_raw_fd(), scratch.as_mut_ptr().cast::<libc::c_void>(), scratch.len()) };
                 if n > 0 {
                     pending.extend_from_slice(&scratch[..n as usize]);
                     while let Some(pos) = memchr(b'\n', &pending) {
@@ -765,11 +686,7 @@ fn listen_fifo(
                         }
                         last_height = Some(height);
                         rollback.clear_rollback(source);
-                        let msg = StreamLine {
-                            source,
-                            block_number: height,
-                            line,
-                        };
+                        let msg = StreamLine { source, block_number: height, line };
                         if tx.send(msg).is_err() {
                             warn!("Aggregator dropped; exiting {source:?} listener");
                             return;
@@ -803,7 +720,12 @@ fn listen_fifo(
     }
 }
 
-fn run_aggregator(rx: Receiver<StreamLine>, stop: Arc<AtomicBool>, callback: Option<HeightCallback>) {
+fn run_aggregator(
+    rx: Receiver<StreamLine>,
+    stop: Arc<AtomicBool>,
+    callback: Option<HeightCallback>,
+    archive_tx: Option<SyncSender<ArchiveBlock>>,
+) {
     let mut queues = StreamQueues::new();
     let uds_path = PathBuf::from(UDS_PATH);
     let mut uds = match bind_uds_with_retry(uds_path) {
@@ -847,22 +769,45 @@ fn run_aggregator(rx: Receiver<StreamLine>, stop: Arc<AtomicBool>, callback: Opt
 
         while let Some((order, diffs, fills)) = queues.pop_aligned() {
             let height = order.block_number;
-            
-            let mut merged = Vec::with_capacity(
-                fills.line.len() + diffs.line.len() + order.line.len() + 3,
-            );
+            let fills_line = fills.line;
+            let diffs_line = diffs.line;
+            let order_line = order.line;
+
+            let mut merged = Vec::with_capacity(fills_line.len() + diffs_line.len() + order_line.len() + 3);
             merged.push(b'[');
-            merged.extend_from_slice(&fills.line);
+            merged.extend_from_slice(&fills_line);
             merged.push(b',');
-            merged.extend_from_slice(&diffs.line);
+            merged.extend_from_slice(&diffs_line);
             merged.push(b',');
-            merged.extend_from_slice(&order.line);
+            merged.extend_from_slice(&order_line);
             merged.push(b']');
             merged.push(b'\n'); // Newline delimiter for stream mode
 
             if let Some(server) = uds.as_mut() {
                 server.try_accept();
                 server.send(&merged);
+            }
+
+            if let Some(tx) = archive_tx.as_ref() {
+                if !is_archive_enabled() {
+                    continue;
+                }
+                let mut msg = Some(ArchiveBlock::new(height, fills_line, diffs_line, order_line));
+                while let Some(block) = msg.take() {
+                    match tx.try_send(block) {
+                        Ok(()) => break,
+                        Err(TrySendError::Full(block)) => {
+                            if stop.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            msg = Some(block);
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(TrySendError::Disconnected(_block)) => {
+                            break;
+                        }
+                    }
+                }
             }
 
             if height % 100 == 0 {
@@ -883,11 +828,7 @@ fn bind_uds_with_retry(path: PathBuf) -> Option<UdsServer> {
         match UdsServer::bind(path.clone()) {
             Ok(server) => return Some(server),
             Err(err) => {
-                warn!(
-                    "Failed to bind UDS {} (attempt {}/3): {err}",
-                    path.display(),
-                    attempt
-                );
+                warn!("Failed to bind UDS {} (attempt {}/3): {err}", path.display(), attempt);
                 if attempt < 3 {
                     thread::sleep(Duration::from_secs(1));
                 }
@@ -902,6 +843,7 @@ pub fn run_forever() {
     info!("fifo_listener starting");
 
     let (tx, rx) = sync_channel(512);
+    let (archive_tx, archive_rx) = sync_channel(ARCHIVE_QUEUE_BLOCKS);
     let stop = Arc::new(AtomicBool::new(false));
     let rollback = Arc::new(RollbackTracker::new());
     let stop_eventfd = match create_eventfd() {
@@ -924,7 +866,10 @@ pub fn run_forever() {
         }));
     }
 
-    run_aggregator(rx, stop.clone(), None);
+    let archive_stop = stop.clone();
+    threads.push(thread::spawn(move || run_archive_writer(archive_rx, archive_stop)));
+
+    run_aggregator(rx, stop.clone(), None, Some(archive_tx));
 
     stop.store(true, Ordering::SeqCst);
     signal_eventfd(stop_eventfd);
@@ -939,6 +884,7 @@ pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<Liste
     info!("fifo_listener starting");
 
     let (tx, rx) = sync_channel(512);
+    let (archive_tx, archive_rx) = sync_channel(ARCHIVE_QUEUE_BLOCKS);
     let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     let rollback = Arc::new(RollbackTracker::new());
@@ -956,11 +902,9 @@ pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<Liste
     }
 
     let agg_stop = stop.clone();
-    threads.push(thread::spawn(move || run_aggregator(rx, agg_stop, callback)));
+    let archive_stop = stop.clone();
+    threads.push(thread::spawn(move || run_archive_writer(archive_rx, archive_stop)));
+    threads.push(thread::spawn(move || run_aggregator(rx, agg_stop, callback, Some(archive_tx))));
 
-    Ok(ListenerHandle {
-        stop,
-        stop_eventfd,
-        threads,
-    })
+    Ok(ListenerHandle { stop, stop_eventfd, threads })
 }

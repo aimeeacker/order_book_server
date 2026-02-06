@@ -192,7 +192,7 @@ async fn handle_socket(
                                 for u in updates {
                                     updates_by_coin.insert(u.coin.clone(), u.clone());
                                 }
-                                
+
                                 let mut analysis_by_coin_b: HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>> = HashMap::new();
                                 for a in analysis_b {
                                     analysis_by_coin_b.entry(a.coin.value()).or_default().push(a.clone());
@@ -545,17 +545,11 @@ async fn handle_snapshot_request(
         SnapshotKind::L4Book => {
             let snapshot = listener.lock().await.compute_snapshot();
             if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
-                let snapshot =
-                    snapshot.value().into_iter().find(|(c, _)| *c == Coin::new(&coin));
+                let snapshot = snapshot.value().into_iter().find(|(c, _)| *c == Coin::new(&coin));
                 if let Some((coin, snapshot)) = snapshot {
                     let levels =
                         snapshot.as_ref().clone().map(|orders| orders.into_iter().map(L4Order::from).collect());
-                    let payload = L4Book::Snapshot {
-                        coin: coin.value(),
-                        time,
-                        height,
-                        levels,
-                    };
+                    let payload = L4Book::Snapshot { coin: coin.value(), time, height, levels };
                     if let Ok(data) = serde_json::to_value(payload) {
                         send_snapshot_response(socket, &channel, req_id, data).await;
                         return;
@@ -585,12 +579,7 @@ async fn handle_snapshot_request(
     }
 }
 
-async fn send_snapshot_response(
-    socket: &mut WebSocket,
-    channel: &str,
-    req_id: Option<i64>,
-    data: serde_json::Value,
-) {
+async fn send_snapshot_response(socket: &mut WebSocket, channel: &str, req_id: Option<i64>, data: serde_json::Value) {
     let obj = serde_json::json!({
         "channel": channel,
         "req_id": req_id,
@@ -606,11 +595,7 @@ async fn send_snapshot_response(
     }
 }
 
-async fn send_stream_snapshot_message(
-    socket: &mut WebSocket,
-    channel: &str,
-    data: serde_json::Value,
-) {
+async fn send_stream_snapshot_message(socket: &mut WebSocket, channel: &str, data: serde_json::Value) {
     let obj = serde_json::json!({
         "channel": channel,
         "data": data,
@@ -626,19 +611,26 @@ async fn send_stream_snapshot_message(
 }
 
 #[derive(serde::Serialize)]
-struct AnalysisRollupFrame<'a> {
-    #[serde(rename = "sum_a")]
+struct AnalysisBucketFrame {
+    #[serde(rename = "px")]
+    px: String,
+    #[serde(rename = "vals")]
+    vals: [String; 4],
+}
+
+#[derive(serde::Serialize)]
+struct AnalysisRollupFrame {
+    #[serde(rename = "window_sum_ask")]
     sum_a: [String; 4],
-    #[serde(rename = "sum_b")]
+    #[serde(rename = "window_sum_bid")]
     sum_b: [String; 4],
-    #[serde(rename = "a")]
-    asks: &'a Vec<crate::listeners::order_book::lite::AnalysisUpdate>,
-    #[serde(rename = "b")]
-    bids: &'a Vec<crate::listeners::order_book::lite::AnalysisUpdate>,
+    #[serde(rename = "window_asks")]
+    asks: Vec<AnalysisBucketFrame>,
+    #[serde(rename = "window_bids")]
+    bids: Vec<AnalysisBucketFrame>,
     #[serde(rename = "block_height")]
     block_height: u64,
 }
-
 
 async fn send_socket_message(socket: &mut WebSocket, msg: ServerResponse) {
     // Special-case subscription response so `req_id` is placed at top-level
@@ -766,61 +758,51 @@ async fn send_ws_data_from_lite_updates(
     match subscription {
         Subscription::L4Lite { coin } => {
             use crate::types::subscription::AnalysisData;
-            
-            let lite = updates.get(coin).cloned().unwrap_or_else(|| {
-                 crate::listeners::order_book::lite::L2BlockUpdate {
-                     coin: coin.clone(),
-                     b: Vec::new(),
-                     a: Vec::new(),
-                     block_height
-                 }
-            });
-            
-            // Send analysis frame 
+
+            let lite =
+                updates.get(coin).cloned().unwrap_or_else(|| crate::listeners::order_book::lite::L2BlockUpdate {
+                    coin: coin.clone(),
+                    b: Vec::new(),
+                    a: Vec::new(),
+                    block_height,
+                });
+
+            // Send analysis frame
             let a_b = analysis_b.remove(coin).unwrap_or_default();
             let a_a = analysis_a.remove(coin).unwrap_or_default();
 
-            let analysis = AnalysisData {
-                 bids: a_b,
-                 asks: a_a,
-                 block_height,
-            };
-            
+            let analysis = AnalysisData { bids: a_b, asks: a_a, block_height };
+
             // Combined Update
-            let msg = ServerResponse::L4LiteUpdate {
-                 lite,
-                 analysis
-            };
-            
+            let msg = ServerResponse::L4LiteUpdate { lite, analysis };
+
             send_socket_message(socket, msg).await;
         }
         Subscription::L4Anal { coin } => {
             if let Some(rollup_height) = rollup_height {
                 let r_b = rollup_b.remove(coin).unwrap_or_default();
                 let r_a = rollup_a.remove(coin).unwrap_or_default();
-                let sum_b = rollup_sum_b.remove(coin).unwrap_or_else(|| {
-                    [
-                        "0".to_string(),
-                        "0".to_string(),
-                        "0".to_string(),
-                        "0".to_string(),
-                    ]
-                });
-                let sum_a = rollup_sum_a.remove(coin).unwrap_or_else(|| {
-                    [
-                        "0".to_string(),
-                        "0".to_string(),
-                        "0".to_string(),
-                        "0".to_string(),
-                    ]
-                });
-                let frame = AnalysisRollupFrame {
-                    sum_a,
-                    sum_b,
-                    asks: &r_a,
-                    bids: &r_b,
-                    block_height: rollup_height,
-                };
+                let sum_b = rollup_sum_b
+                    .remove(coin)
+                    .unwrap_or_else(|| ["0".to_string(), "0".to_string(), "0".to_string(), "0".to_string()]);
+                let sum_a = rollup_sum_a
+                    .remove(coin)
+                    .unwrap_or_else(|| ["0".to_string(), "0".to_string(), "0".to_string(), "0".to_string()]);
+                let bids = r_b
+                    .into_iter()
+                    .map(|u| AnalysisBucketFrame {
+                        px: u.px,
+                        vals: [u.fill, u.fill_notional, u.change, u.change_notional],
+                    })
+                    .collect::<Vec<_>>();
+                let asks = r_a
+                    .into_iter()
+                    .map(|u| AnalysisBucketFrame {
+                        px: u.px,
+                        vals: [u.fill, u.fill_notional, u.change, u.change_notional],
+                    })
+                    .collect::<Vec<_>>();
+                let frame = AnalysisRollupFrame { sum_a, sum_b, asks, bids, block_height: rollup_height };
                 if let Ok(val) = serde_json::to_value(frame) {
                     let channel = format!("{}@l4Anal", coin.to_lowercase());
                     send_stream_snapshot_message(socket, &channel, val).await;
@@ -886,14 +868,14 @@ impl Subscription {
                 // Fetch L2 Snapshot from LiteBook
                 let listener = listener.lock().await;
                 if let Some(lb) = listener.lite_books.get(&Coin::new(coin)) {
-                     let snap = lb.get_snapshot();
-                     return Ok(Some(ServerResponse::L2Snapshot(snap)));
+                    let snap = lb.get_snapshot();
+                    return Ok(Some(ServerResponse::L2Snapshot(snap)));
                 } else {
-                     return Err("LiteBook not ready".into());
+                    return Err("LiteBook not ready".into());
                 }
             }
             Self::L4Anal { .. } => Ok(None),
-            _ => Ok(None)
+            _ => Ok(None),
         }
     }
 }

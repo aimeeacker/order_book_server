@@ -2,11 +2,11 @@ use crate::order_book::types::{Coin, Oid, Px, Side, Sz};
 use crate::order_book::{InnerOrder, Snapshot};
 use crate::prelude::Result;
 use crate::types::inner::{InnerL4Order, InnerOrderDiff};
-use crate::types::node_data::{NodeDataOrderDiff, NodeDataOrderStatus, NodeDataFill};
-use serde::ser::{Serializer, SerializeTuple};
+use crate::types::node_data::{NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus};
+use serde::ser::{SerializeTuple, Serializer};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
 const PRICE_SCALE: u64 = 100_000_000;
@@ -61,11 +61,7 @@ fn fmt_px(v: u64) -> String {
 }
 
 fn fmt_sz(v: u64) -> String {
-    if v == 0 {
-        "0".to_string()
-    } else {
-        format!("{:.5}", v as f64 / 1e8)
-    }
+    if v == 0 { "0".to_string() } else { format!("{:.5}", v as f64 / 1e8) }
 }
 
 fn fmt_sz_signed(v: i64) -> String {
@@ -97,11 +93,7 @@ fn fmt_notional_signed(v: i128) -> String {
     let rounded = (abs + 500_000) / 1_000_000;
     let int_part = rounded / 100;
     let frac = rounded % 100;
-    if neg {
-        format!("-{}.{:02}", int_part, frac)
-    } else {
-        format!("+{}.{:02}", int_part, frac)
-    }
+    if neg { format!("-{}.{:02}", int_part, frac) } else { format!("+{}.{:02}", int_part, frac) }
 }
 
 fn bucket_size_for_coin(coin: &Coin) -> u64 {
@@ -146,12 +138,7 @@ fn sum_bucket_map(buckets: &HashMap<u64, BucketAgg>) -> (u64, u128, i64, i128) {
 }
 
 fn format_sum_values(fill: u64, fill_notional: u128, change: i64, change_notional: i128) -> [String; 4] {
-    [
-        fmt_sz(fill),
-        fmt_notional(fill_notional),
-        fmt_sz_signed(change),
-        fmt_notional_signed(change_notional),
-    ]
+    [fmt_sz(fill), fmt_notional(fill_notional), fmt_sz_signed(change), fmt_notional_signed(change_notional)]
 }
 
 fn bucket_map_to_updates(coin: &Coin, side: Side, buckets: &HashMap<u64, BucketAgg>) -> Vec<AnalysisUpdate> {
@@ -211,20 +198,15 @@ pub(crate) struct OrderInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LevelState {
-    pub sum_sz: Sz,        // Current aggregated quantity (real-time update)
-    pub shadow_sum: Sz,    // Last sum sent to client
+    pub sum_sz: Sz,               // Current aggregated quantity (real-time update)
+    pub shadow_sum: Sz,           // Last sum sent to client
     pub orders: HashMap<Oid, Sz>, // Optional: for debugging/auditing
     pub dirty: bool,
 }
 
 impl LevelState {
     pub(crate) fn new() -> Self {
-        Self {
-            sum_sz: Sz::new(0),
-            shadow_sum: Sz::new(0),
-            orders: HashMap::new(),
-            dirty: false,
-        }
+        Self { sum_sz: Sz::new(0), shadow_sum: Sz::new(0), orders: HashMap::new(), dirty: false }
     }
 }
 
@@ -236,6 +218,14 @@ pub(crate) struct BookState {
     pub last_block_height: u64,
     analysis_window_b: HashMap<u64, BucketAgg>,
     analysis_window_a: HashMap<u64, BucketAgg>,
+    analysis_sum_fill_b: u64,
+    analysis_sum_fill_notional_b: u128,
+    analysis_sum_change_b: i64,
+    analysis_sum_change_notional_b: i128,
+    analysis_sum_fill_a: u64,
+    analysis_sum_fill_notional_a: u128,
+    analysis_sum_change_a: i64,
+    analysis_sum_change_notional_a: i128,
     analysis_rollups: VecDeque<BucketWindow>,
     initialized: bool,
 }
@@ -262,6 +252,14 @@ impl BookState {
             last_block_height: 0,
             analysis_window_b: HashMap::new(),
             analysis_window_a: HashMap::new(),
+            analysis_sum_fill_b: 0,
+            analysis_sum_fill_notional_b: 0,
+            analysis_sum_change_b: 0,
+            analysis_sum_change_notional_b: 0,
+            analysis_sum_fill_a: 0,
+            analysis_sum_fill_notional_a: 0,
+            analysis_sum_change_a: 0,
+            analysis_sum_change_notional_a: 0,
             analysis_rollups: VecDeque::new(),
             initialized: false,
         }
@@ -283,6 +281,14 @@ impl BookState {
         self.last_block_height = 0;
         self.analysis_window_b.clear();
         self.analysis_window_a.clear();
+        self.analysis_sum_fill_b = 0;
+        self.analysis_sum_fill_notional_b = 0;
+        self.analysis_sum_change_b = 0;
+        self.analysis_sum_change_notional_b = 0;
+        self.analysis_sum_fill_a = 0;
+        self.analysis_sum_fill_notional_a = 0;
+        self.analysis_sum_change_a = 0;
+        self.analysis_sum_change_notional_a = 0;
         self.initialized = false;
     }
 
@@ -290,7 +296,7 @@ impl BookState {
         fn fmt_level(px: &Px, level: &LevelState) -> (String, String) {
             (fmt_px(px.value()), fmt_sz(level.sum_sz.value()))
         }
-        
+
         // Collect bids (Reverse order for bids usually in display, High to Low)
         let bids = self.bids.iter().rev().map(|(px, lvl)| fmt_level(px, lvl)).collect();
         // Collect asks (Low to High)
@@ -302,8 +308,8 @@ impl BookState {
     pub(crate) fn process_block(
         &mut self,
         coin: Coin,
-        statuses: &Vec<NodeDataOrderStatus>, 
-        diffs: &Vec<NodeDataOrderDiff>, 
+        statuses: &Vec<NodeDataOrderStatus>,
+        diffs: &Vec<NodeDataOrderDiff>,
         fills: &Vec<NodeDataFill>,
         block_height: u64,
     ) -> Result<L4LiteBlockEvent> {
@@ -322,16 +328,12 @@ impl BookState {
             });
         }
         if block_height != self.last_block_height + 1 {
-            return Err(format!(
-                "Expecting block {}, got {}",
-                self.last_block_height + 1,
-                block_height
-            ).into());
+            return Err(format!("Expecting block {}, got {}", self.last_block_height + 1, block_height).into());
         }
 
         // 1. Identify all affected levels (sides/px)
         let mut affected_levels: HashSet<(Side, Px)> = HashSet::new();
-        
+
         // Aggregate fills for this block: (Side, Px) -> Sz
         let mut filled_amts: HashMap<(Side, Px), u64> = HashMap::new();
         for fill in fills {
@@ -342,7 +344,7 @@ impl BookState {
             if raw_fill.crossed {
                 continue;
             }
-            
+
             // Note: Fill side is "Maker" side usually? Or "Taker"?
             // We checked: Trade logic implies Fill side is side of the order (Maker if not crossed).
             let side = raw_fill.side;
@@ -372,7 +374,7 @@ impl BookState {
                     continue;
                 }
             };
-            
+
             *filled_amts.entry((side, px)).or_default() += sz.value();
             affected_levels.insert((side, px));
         }
@@ -388,28 +390,31 @@ impl BookState {
                 order_map.insert(oid, status.clone());
             }
         }
-        
-        log::debug!("[{:?}] Block {}: {} statuses -> {} in order_map, {} diffs to process",
-            coin, block_height, statuses.len(), order_map.len(), diffs.len());
-        
+
+        log::debug!(
+            "[{:?}] Block {}: {} statuses -> {} in order_map, {} diffs to process",
+            coin,
+            block_height,
+            statuses.len(),
+            order_map.len(),
+            diffs.len()
+        );
+
         // Process Diffs & Calculate Deltas
         let mut level_deltas: HashMap<(Side, Px), i64> = HashMap::new();
         let mut removed_levels: HashSet<(Side, Px)> = HashSet::new();
         for diff in diffs {
             let oid = diff.oid();
-            
+
             // Process diffs matching L4Book logic exactly:
             // - New: must have matching status in this block
             // - Update/Remove: must already exist in oid_index
-            let inner_diff: InnerOrderDiff = diff
-                .diff()
-                .try_into()
-                .map_err(|e| format!("Unable to parse diff {diff:?}: {e}"))?;
+            let inner_diff: InnerOrderDiff =
+                diff.diff().try_into().map_err(|e| format!("Unable to parse diff {diff:?}: {e}"))?;
             match inner_diff {
                 InnerOrderDiff::New { sz } => {
-                    let status = order_map
-                        .remove(&oid)
-                        .ok_or_else(|| format!("Missing status for New diff {diff:?}"))?;
+                    let status =
+                        order_map.remove(&oid).ok_or_else(|| format!("Missing status for New diff {diff:?}"))?;
                     let mut inner: InnerL4Order = status
                         .clone()
                         .try_into()
@@ -423,10 +428,8 @@ impl BookState {
                     *level_deltas.entry((inner.side(), inner.limit_px())).or_default() += sz.value() as i64;
                 }
                 InnerOrderDiff::Update { new_sz, .. } => {
-                    let info = self
-                        .oid_index
-                        .get(&oid)
-                        .ok_or_else(|| format!("Missing order for Update diff {diff:?}"))?;
+                    let info =
+                        self.oid_index.get(&oid).ok_or_else(|| format!("Missing order for Update diff {diff:?}"))?;
                     if info.coin != coin {
                         return Err(format!("Coin mismatch for Update diff {diff:?}").into());
                     }
@@ -442,10 +445,8 @@ impl BookState {
                     self.update_order_sz(oid, new_sz);
                 }
                 InnerOrderDiff::Remove => {
-                    let info = self
-                        .oid_index
-                        .get(&oid)
-                        .ok_or_else(|| format!("Missing order for Remove diff {diff:?}"))?;
+                    let info =
+                        self.oid_index.get(&oid).ok_or_else(|| format!("Missing order for Remove diff {diff:?}"))?;
                     if info.coin != coin {
                         return Err(format!("Coin mismatch for Remove diff {diff:?}").into());
                     }
@@ -469,57 +470,87 @@ impl BookState {
         let mut a_updates = Vec::new();
         let mut block_buckets_b: HashMap<u64, BucketAgg> = HashMap::new();
         let mut block_buckets_a: HashMap<u64, BucketAgg> = HashMap::new();
+        let mut block_fill_b: u64 = 0;
+        let mut block_fill_notional_b: u128 = 0;
+        let mut block_change_b: i64 = 0;
+        let mut block_change_notional_b: i128 = 0;
+        let mut block_fill_a: u64 = 0;
+        let mut block_fill_notional_a: u128 = 0;
+        let mut block_change_a: i64 = 0;
+        let mut block_change_notional_a: i128 = 0;
 
         for (side, px) in affected_levels {
-             let filled_val = *filled_amts.get(&(side, px)).unwrap_or(&0);
-             let delta_total = *level_deltas.get(&(side, px)).unwrap_or(&0);
-             
-             // Book change comes from diffs; fills reduce book size on the maker side.
-             // change = add/cancel component after accounting for fills.
-             let change = delta_total + (filled_val as i64);
-             
-             if filled_val > 0 || change != 0 {
-                 let bucket_px = bucket_lower_px(&coin, px.value());
-                 let target = match side {
-                     Side::Bid => &mut block_buckets_b,
-                     Side::Ask => &mut block_buckets_a,
-                 };
-                 let entry = target.entry(bucket_px).or_default();
-                 entry.fill += filled_val;
-                 entry.change += change;
-             }
-             
-             let state = match side {
-                 Side::Bid => self.bids.get_mut(&px),
-                 Side::Ask => self.asks.get_mut(&px),
-             };
-             
-             if let Some(lvl) = state {
-                 if lvl.dirty {
-                     match side {
-                         Side::Bid => b_updates.push((fmt_px(px.value()), fmt_sz(lvl.sum_sz.value()))),
-                         Side::Ask => a_updates.push((fmt_px(px.value()), fmt_sz(lvl.sum_sz.value()))),
-                     }
-                     lvl.shadow_sum = lvl.sum_sz;
-                     lvl.dirty = false;
-                 }
-             } else if removed_levels.contains(&(side, px)) {
-                 match side {
-                     Side::Bid => b_updates.push((fmt_px(px.value()), "0".to_string())),
-                     Side::Ask => a_updates.push((fmt_px(px.value()), "0".to_string())),
-                 }
-             }
+            let filled_val = *filled_amts.get(&(side, px)).unwrap_or(&0);
+            let delta_total = *level_deltas.get(&(side, px)).unwrap_or(&0);
+
+            // Book change comes from diffs directly; downstream handles fill effects.
+            // change = net order book delta (no fill adjustment).
+            let change = delta_total;
+
+            if filled_val > 0 || change != 0 {
+                let px_u128 = u128::from(px.value());
+                let change_notional = (i128::from(px.value()) * i128::from(change)) / i128::from(PRICE_SCALE);
+                let fill_notional = (px_u128 * u128::from(filled_val)) / u128::from(PRICE_SCALE);
+                match side {
+                    Side::Bid => {
+                        block_fill_b = block_fill_b.saturating_add(filled_val);
+                        block_fill_notional_b = block_fill_notional_b.saturating_add(fill_notional);
+                        block_change_b = block_change_b.saturating_add(change);
+                        block_change_notional_b = block_change_notional_b.saturating_add(change_notional);
+                    }
+                    Side::Ask => {
+                        block_fill_a = block_fill_a.saturating_add(filled_val);
+                        block_fill_notional_a = block_fill_notional_a.saturating_add(fill_notional);
+                        block_change_a = block_change_a.saturating_add(change);
+                        block_change_notional_a = block_change_notional_a.saturating_add(change_notional);
+                    }
+                }
+                let bucket_px = bucket_lower_px(&coin, px.value());
+                let target = match side {
+                    Side::Bid => &mut block_buckets_b,
+                    Side::Ask => &mut block_buckets_a,
+                };
+                let entry = target.entry(bucket_px).or_default();
+                entry.fill += filled_val;
+                entry.change += change;
+            }
+
+            let state = match side {
+                Side::Bid => self.bids.get_mut(&px),
+                Side::Ask => self.asks.get_mut(&px),
+            };
+
+            if let Some(lvl) = state {
+                if lvl.dirty {
+                    match side {
+                        Side::Bid => b_updates.push((fmt_px(px.value()), fmt_sz(lvl.sum_sz.value()))),
+                        Side::Ask => a_updates.push((fmt_px(px.value()), fmt_sz(lvl.sum_sz.value()))),
+                    }
+                    lvl.shadow_sum = lvl.sum_sz;
+                    lvl.dirty = false;
+                }
+            } else if removed_levels.contains(&(side, px)) {
+                match side {
+                    Side::Bid => b_updates.push((fmt_px(px.value()), "0".to_string())),
+                    Side::Ask => a_updates.push((fmt_px(px.value()), "0".to_string())),
+                }
+            }
         }
-        
-        let depth_updates = Some(L2BlockUpdate {
-             coin: coin.value(),
-             b: b_updates,
-             a: a_updates,
-             block_height,
-        });
+
+        let depth_updates = Some(L2BlockUpdate { coin: coin.value(), b: b_updates, a: a_updates, block_height });
 
         merge_bucket_maps(&mut self.analysis_window_b, &block_buckets_b);
         merge_bucket_maps(&mut self.analysis_window_a, &block_buckets_a);
+        self.analysis_sum_fill_b = self.analysis_sum_fill_b.saturating_add(block_fill_b);
+        self.analysis_sum_fill_notional_b = self.analysis_sum_fill_notional_b.saturating_add(block_fill_notional_b);
+        self.analysis_sum_change_b = self.analysis_sum_change_b.saturating_add(block_change_b);
+        self.analysis_sum_change_notional_b =
+            self.analysis_sum_change_notional_b.saturating_add(block_change_notional_b);
+        self.analysis_sum_fill_a = self.analysis_sum_fill_a.saturating_add(block_fill_a);
+        self.analysis_sum_fill_notional_a = self.analysis_sum_fill_notional_a.saturating_add(block_fill_notional_a);
+        self.analysis_sum_change_a = self.analysis_sum_change_a.saturating_add(block_change_a);
+        self.analysis_sum_change_notional_a =
+            self.analysis_sum_change_notional_a.saturating_add(block_change_notional_a);
 
         let analysis_b = bucket_map_to_updates(&coin, Side::Bid, &block_buckets_b);
         let analysis_a = bucket_map_to_updates(&coin, Side::Ask, &block_buckets_a);
@@ -533,6 +564,8 @@ impl BookState {
                 bids: std::mem::take(&mut self.analysis_window_b),
                 asks: std::mem::take(&mut self.analysis_window_a),
             };
+            // Original rolling-window logic (kept for reference):
+            /*
             self.analysis_rollups.push_back(window);
             if self.analysis_rollups.len() > ANALYSIS_ROLLUP_WINDOWS {
                 self.analysis_rollups.pop_front();
@@ -550,6 +583,31 @@ impl BookState {
             let (fill_a, fill_notional_a, change_a, change_notional_a) = sum_bucket_map(&agg_a);
             analysis_rollup_sum_b = Some(format_sum_values(fill_b, fill_notional_b, change_b, change_notional_b));
             analysis_rollup_sum_a = Some(format_sum_values(fill_a, fill_notional_a, change_a, change_notional_a));
+            */
+
+            // New behavior: only aggregate the latest 10-block window (no rolling accumulation).
+            analysis_rollup_b = bucket_map_to_updates(&coin, Side::Bid, &window.bids);
+            analysis_rollup_a = bucket_map_to_updates(&coin, Side::Ask, &window.asks);
+            analysis_rollup_sum_b = Some(format_sum_values(
+                self.analysis_sum_fill_b,
+                self.analysis_sum_fill_notional_b,
+                self.analysis_sum_change_b,
+                self.analysis_sum_change_notional_b,
+            ));
+            analysis_rollup_sum_a = Some(format_sum_values(
+                self.analysis_sum_fill_a,
+                self.analysis_sum_fill_notional_a,
+                self.analysis_sum_change_a,
+                self.analysis_sum_change_notional_a,
+            ));
+            self.analysis_sum_fill_b = 0;
+            self.analysis_sum_fill_notional_b = 0;
+            self.analysis_sum_change_b = 0;
+            self.analysis_sum_change_notional_b = 0;
+            self.analysis_sum_fill_a = 0;
+            self.analysis_sum_fill_notional_a = 0;
+            self.analysis_sum_change_a = 0;
+            self.analysis_sum_change_notional_a = 0;
         }
 
         let event = L4LiteBlockEvent {
@@ -574,6 +632,14 @@ impl BookState {
         self.last_block_height = block_height;
         self.analysis_window_b.clear();
         self.analysis_window_a.clear();
+        self.analysis_sum_fill_b = 0;
+        self.analysis_sum_fill_notional_b = 0;
+        self.analysis_sum_change_b = 0;
+        self.analysis_sum_change_notional_b = 0;
+        self.analysis_sum_fill_a = 0;
+        self.analysis_sum_fill_notional_a = 0;
+        self.analysis_sum_change_a = 0;
+        self.analysis_sum_change_notional_a = 0;
         self.initialized = true;
 
         for orders in snapshot.as_ref() {
@@ -590,12 +656,7 @@ impl BookState {
             return;
         }
 
-        let info = OrderInfo {
-            coin,
-            side,
-            px,
-            sz,
-        };
+        let info = OrderInfo { coin, side, px, sz };
         self.oid_index.insert(oid.clone(), info);
 
         let levels = match side {
@@ -612,15 +673,15 @@ impl BookState {
 
     fn update_order_sz(&mut self, oid: Oid, new_sz: Sz) {
         if let Some(info) = self.oid_index.get_mut(&oid) {
-             let old_sz = info.sz;
-             if old_sz.value() == new_sz.value() {
-                 return;
-             }
-             info.sz = new_sz;
-             let side = info.side;
-             let px = info.px;
+            let old_sz = info.sz;
+            if old_sz.value() == new_sz.value() {
+                return;
+            }
+            info.sz = new_sz;
+            let side = info.side;
+            let px = info.px;
 
-             let levels = match side {
+            let levels = match side {
                 Side::Bid => &mut self.bids,
                 Side::Ask => &mut self.asks,
             };
@@ -679,7 +740,7 @@ impl BookState {
     #[allow(dead_code)]
     fn compute_snapshot_hash(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
-        
+
         // Hash bids in descending order (BTreeMap::rev) and asks in ascending order
         for (px, level) in self.bids.iter().rev() {
             px.value().hash(&mut hasher);
@@ -689,7 +750,7 @@ impl BookState {
             px.value().hash(&mut hasher);
             level.sum_sz.value().hash(&mut hasher);
         }
-        
+
         hasher.finish()
     }
 
@@ -697,9 +758,14 @@ impl BookState {
     /// Validate L2 snapshot against L4 order snapshot by comparing hashes
     /// Returns false on mismatch (warns with details).
     /// Aggregates all L4 orders by (side, price) and compares hash with current L2 state
-    pub(crate) fn validate_snapshot(&self, l4_snapshot: &Snapshot<InnerL4Order>, coin: &Coin, block_height: u64) -> bool {
+    pub(crate) fn validate_snapshot(
+        &self,
+        l4_snapshot: &Snapshot<InnerL4Order>,
+        coin: &Coin,
+        block_height: u64,
+    ) -> bool {
         use log::warn;
-        
+
         // Only validate main coins
         const MAIN_COINS: [&str; 2] = ["BTC", "ETH"];
         if !MAIN_COINS.contains(&coin.value().as_str()) {
@@ -745,10 +811,10 @@ impl BookState {
             sz.value().hash(&mut expected_hasher);
         }
         let expected_hash = expected_hasher.finish();
-        
+
         // Compare hashes
         let actual_hash = self.compute_snapshot_hash();
-        
+
         if actual_hash != expected_hash {
             // Log totals for easier debugging
             let expected_bids_total: u64 = expected_bids.values().map(|s| s.value()).sum();

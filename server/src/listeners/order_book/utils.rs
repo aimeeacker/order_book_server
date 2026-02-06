@@ -1,8 +1,7 @@
 use crate::{
     listeners::order_book::{L2SnapshotParams, L2Snapshots},
     order_book::{
-        Coin,
-        Snapshot,
+        Coin, Snapshot,
         multi_book::{OrderBooks, Snapshots},
         types::InnerOrder,
     },
@@ -13,8 +12,8 @@ use log::{info, warn};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use reqwest::Client;
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::{
     collections::HashMap,
@@ -231,11 +230,7 @@ fn collect_mismatches(
     all_mismatches
 }
 
-fn log_mismatch_diagnostics(
-    snapshot: &Snapshots<InnerL4Order>,
-    expected: &Snapshots<InnerL4Order>,
-    ignore_spot: bool,
-) {
+fn log_mismatch_diagnostics(snapshot: &Snapshots<InnerL4Order>, expected: &Snapshots<InnerL4Order>, ignore_spot: bool) {
     let mismatches = collect_mismatches(snapshot, expected, ignore_spot);
     let mut coins: BTreeSet<Coin> = BTreeSet::new();
     coins.extend(snapshot.as_ref().keys().cloned());
@@ -255,16 +250,9 @@ fn log_mismatch_diagnostics(
         }
         let key = coin.value();
         if let Some(items) = mismatches.get(&key) {
-            warn!(
-                "L4Book snapshot status for {}: FAIL: {}",
-                key,
-                items.join("; ")
-            );
+            warn!("L4Book snapshot status for {}: FAIL: {}", key, items.join("; "));
         } else if mismatches.is_empty() {
-            warn!(
-                "L4Book snapshot status for {}: FAIL: unable to locate differing order",
-                key
-            );
+            warn!("L4Book snapshot status for {}: FAIL: unable to locate differing order", key);
         } else {
             info!("L4Book snapshot status for {}: OK", key);
         }
@@ -318,7 +306,8 @@ pub(super) fn validate_snapshot_hash(
                         coin.value(),
                         orders1.len(),
                         orders2.len()
-                    ).into());
+                    )
+                    .into());
                 }
                 let count1 = hash_orders_btree(orders1, &mut hasher_snapshot)?;
                 let count2 = hash_orders_btree(orders2, &mut hasher_expected)?;
@@ -329,7 +318,8 @@ pub(super) fn validate_snapshot_hash(
                         coin.value(),
                         count1,
                         count2
-                    ).into());
+                    )
+                    .into());
                 }
             }
         } else if !book1[0].is_empty() || !book1[1].is_empty() {
@@ -342,10 +332,7 @@ pub(super) fn validate_snapshot_hash(
     let hash_expected = hasher_expected.finish();
     if hash_snapshot != hash_expected {
         log_mismatch_diagnostics(snapshot, expected, ignore_spot);
-        return Err(format!(
-            "Snapshot hash mismatch: expected={}, actual={}",
-            hash_expected, hash_snapshot
-        ).into());
+        return Err(format!("Snapshot hash mismatch: expected={}, actual={}", hash_expected, hash_snapshot).into());
     }
     log_snapshot_success(snapshot, expected, ignore_spot);
     Ok(())

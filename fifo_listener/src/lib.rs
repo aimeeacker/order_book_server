@@ -1,14 +1,17 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(non_local_definitions, unused_qualifications)]
 
+mod archive;
 mod listener;
 
-pub use listener::{HeightCallback, ListenerHandle, init_cli_logging, run_forever, start_listener};
+pub use listener::{
+    HeightCallback, ListenerHandle, init_cli_logging, run_forever, set_archive_enabled, start_listener,
+};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
+use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3_asyncio::TaskLocals;
-use pyo3::prelude::*;
 use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,9 +84,7 @@ impl PyFifoListener {
     #[pyo3(signature = (callback=None, event_loop=None))]
     fn start(&mut self, callback: Option<PyObject>, event_loop: Option<PyObject>) -> PyResult<()> {
         if self.handle.is_some() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "fifo_listener already started",
-            ));
+            return Err(pyo3::exceptions::PyRuntimeError::new_err("fifo_listener already started"));
         }
         PY_BRIDGE_ENABLED.store(true, Ordering::SeqCst);
         init_python_logging();
@@ -92,22 +93,19 @@ impl PyFifoListener {
             Some(callback) => {
                 let callback: Py<PyAny> = callback.into();
                 let (is_async, locals) = Python::with_gil(|py| -> PyResult<(bool, Option<TaskLocals>)> {
-                        let inspect = py.import("inspect")?;
-                        let is_async = inspect
-                            .call_method1("iscoroutinefunction", (callback.as_ref(py),))?
-                            .extract::<bool>()?;
-                        let locals = if is_async {
-                            let loop_handle = event_loop.ok_or_else(|| {
-                                pyo3::exceptions::PyRuntimeError::new_err(
-                                    "async callback requires event_loop",
-                                )
-                            })?;
-                            Some(TaskLocals::new(loop_handle.as_ref(py)).copy_context(py)?)
-                        } else {
-                            None
-                        };
-                        Ok((is_async, locals))
-                    })?;
+                    let inspect = py.import("inspect")?;
+                    let is_async =
+                        inspect.call_method1("iscoroutinefunction", (callback.as_ref(py),))?.extract::<bool>()?;
+                    let locals = if is_async {
+                        let loop_handle = event_loop.ok_or_else(|| {
+                            pyo3::exceptions::PyRuntimeError::new_err("async callback requires event_loop")
+                        })?;
+                        Some(TaskLocals::new(loop_handle.as_ref(py)).copy_context(py)?)
+                    } else {
+                        None
+                    };
+                    Ok((is_async, locals))
+                })?;
                 (Some(callback), is_async, locals)
             }
             None => (None, false, None),
@@ -159,6 +157,16 @@ impl PyFifoListener {
             PY_BRIDGE_ENABLED.store(false, Ordering::SeqCst);
             handle.stop();
         }
+        Ok(())
+    }
+
+    fn start_write_dataset(&self) -> PyResult<()> {
+        set_archive_enabled(true);
+        Ok(())
+    }
+
+    fn stop_write_dataset(&self) -> PyResult<()> {
+        set_archive_enabled(false);
         Ok(())
     }
 }

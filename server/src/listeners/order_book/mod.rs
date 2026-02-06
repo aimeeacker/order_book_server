@@ -18,10 +18,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader},
     mem::size_of,
-    os::unix::{net::UnixStream, io::AsRawFd},
+    os::unix::{io::AsRawFd, net::UnixStream},
     path::PathBuf,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     sync::Arc,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -36,9 +36,9 @@ use tokio::{
 use tokio_cron_scheduler::{Job, JobScheduler};
 use utils::{process_rmp_file, validate_snapshot_hash};
 
+pub(crate) mod lite;
 mod state;
 mod utils;
-pub(crate) mod lite;
 
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
@@ -51,11 +51,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     info!("Listening for merged stream at {}", UDS_PATH);
 
     let (stream_tx, mut stream_rx) = channel::<AlignedMessage>(FIFO_QUEUE_MAX_LEN);
-    spawn_uds_reader(
-        stream_tx.clone(),
-        dropped_updates.clone(),
-        warmup_deadline.clone(),
-    );
+    spawn_uds_reader(stream_tx.clone(), dropped_updates.clone(), warmup_deadline.clone());
     let parser_listener = listener.clone();
     let parser_dropped_updates = dropped_updates.clone();
     tokio::spawn(async move {
@@ -92,33 +88,13 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
 
     // Initialize Scheduler
     let sched = JobScheduler::new().await.map_err(|e| format!("Failed to create scheduler: {e}"))?;
-    
-    // Create jobs to run at 30s past minute 0,10,20,30,40,50,59 and at 00:05/59:55.
-    let job_dir = dir.clone();
-    let job_listener = listener.clone();
-    let job_tx = snapshot_fetch_task_tx.clone();
-    let job_inflight = snapshot_inflight.clone();
-    let job = Job::new("30 0,10,20,30,40,50,59 * * * *", move |_uuid, _l| {
-        let listener = job_listener.clone();
-        let snapshot_fetch_task_tx = job_tx.clone();
-        let dir = job_dir.clone();
-        let inflight = job_inflight.clone();
-        tokio::spawn(async move {
-            let guard = listener.lock().await;
-            if !guard.is_ready() || guard.initializing || guard.validation_active {
-                return;
-            }
-            drop(guard);
-            trigger_snapshot_fetch(dir, listener, snapshot_fetch_task_tx, ignore_spot, inflight);
-        });
-    })
-    .map_err(|e| format!("Failed to create cron job: {e}"))?;
 
+    // Create job to run at xx:01:00 only.
     let boundary_listener = listener.clone();
     let boundary_tx = snapshot_fetch_task_tx.clone();
     let boundary_dir = dir.clone();
     let boundary_inflight = snapshot_inflight.clone();
-    let boundary_job = Job::new("5 0 * * * *", move |_uuid, _l| {
+    let boundary_job = Job::new("0 1 * * * *", move |_uuid, _l| {
         let listener = boundary_listener.clone();
         let snapshot_fetch_task_tx = boundary_tx.clone();
         let dir = boundary_dir.clone();
@@ -134,33 +110,11 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     })
     .map_err(|e| format!("Failed to create cron job: {e}"))?;
 
-    let boundary_listener2 = listener.clone();
-    let boundary_tx2 = snapshot_fetch_task_tx.clone();
-    let boundary_dir2 = dir.clone();
-    let boundary_inflight2 = snapshot_inflight.clone();
-    let boundary_job2 = Job::new("55 59 * * * *", move |_uuid, _l| {
-        let listener = boundary_listener2.clone();
-        let snapshot_fetch_task_tx = boundary_tx2.clone();
-        let dir = boundary_dir2.clone();
-        let inflight = boundary_inflight2.clone();
-        tokio::spawn(async move {
-            let guard = listener.lock().await;
-            if !guard.is_ready() || guard.initializing || guard.validation_active {
-                return;
-            }
-            drop(guard);
-            trigger_snapshot_fetch(dir, listener, snapshot_fetch_task_tx, ignore_spot, inflight);
-        });
-    })
-    .map_err(|e| format!("Failed to create cron job: {e}"))?;
-
-    sched.add(job).await.map_err(|e| format!("Failed to add job: {e}"))?;
     sched.add(boundary_job).await.map_err(|e| format!("Failed to add job: {e}"))?;
-    sched.add(boundary_job2).await.map_err(|e| format!("Failed to add job: {e}"))?;
     sched.start().await.map_err(|e| format!("Failed to start scheduler: {e}"))?;
 
-    info!("Cron scheduler started: snapshot validation set to run at xx:x0:30, xx:59:30, xx:00:05, and xx:59:55.");
-    
+    info!("Cron scheduler started: snapshot validation set to run at xx:01:00.");
+
     info!("Waiting for first stream data before requesting initial snapshot");
 
     let mut health_check = interval(Duration::from_secs(60));
@@ -292,9 +246,11 @@ fn fetch_snapshot(
                 let request_ms = request_start.elapsed().as_secs_f64() * 1000.0;
                 info!("Snapshot request completed in {:.3} ms", request_ms);
                 let parse_start = Instant::now();
-                let snapshot =
-                    load_snapshots_from_json_filtered::<InnerL4Order, (Address, SnapshotOrder)>(&output_fln, &MAIN_COINS)
-                        .await;
+                let snapshot = load_snapshots_from_json_filtered::<InnerL4Order, (Address, SnapshotOrder)>(
+                    &output_fln,
+                    &MAIN_COINS,
+                )
+                .await;
                 let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
                 info!("Snapshot parse completed in {:.3} ms", parse_ms);
                 let initializing = {
@@ -380,7 +336,11 @@ fn fetch_snapshot(
                             let stored_snapshot_for_validation = stored_snapshot.clone();
                             let expected_snapshot_for_validation = expected_snapshot.clone();
                             let validation = tokio::task::spawn_blocking(move || {
-                                validate_snapshot_hash(&stored_snapshot_for_validation, &expected_snapshot_for_validation, ignore_spot)
+                                validate_snapshot_hash(
+                                    &stored_snapshot_for_validation,
+                                    &expected_snapshot_for_validation,
+                                    ignore_spot,
+                                )
                             })
                             .await;
 
@@ -404,7 +364,8 @@ fn fetch_snapshot(
                                                 break;
                                             };
                                             let expected_hash = lite::expected_snapshot_hash(coin_snapshot);
-                                            if !lite_book.is_initialized() || lite_book.snapshot_hash() != expected_hash {
+                                            if !lite_book.is_initialized() || lite_book.snapshot_hash() != expected_hash
+                                            {
                                                 lite_mismatch = true;
                                                 break;
                                             }
@@ -412,7 +373,9 @@ fn fetch_snapshot(
                                     }
 
                                     if lite_mismatch {
-                                        warn!("L4Lite snapshot mismatch after L4Book validation; rebuilding from L4Book state");
+                                        warn!(
+                                            "L4Lite snapshot mismatch after L4Book validation; rebuilding from L4Book state"
+                                        );
                                         listener_guard.rebuild_lite_from_state();
                                     }
                                     Ok(())
@@ -421,7 +384,8 @@ fn fetch_snapshot(
                                     warn!("L4Book snapshot hash mismatch at height {}: {}", height, err);
                                     let mut listener_guard = listener.lock().await;
                                     let cache = listener_guard.take_pending_aligned();
-                                    let schedule_validation = listener_guard.init_from_snapshot(expected_snapshot, height);
+                                    let schedule_validation =
+                                        listener_guard.init_from_snapshot(expected_snapshot, height);
                                     let rebuilt_from_snapshot = listener_guard.order_book_state.is_some();
                                     let replay_ok = listener_guard.replay_cached_updates(cache);
 
@@ -447,7 +411,8 @@ fn fetch_snapshot(
                                     warn!("L4Book snapshot validation task failed at height {}: {}", height, err);
                                     let mut listener_guard = listener.lock().await;
                                     let cache = listener_guard.take_pending_aligned();
-                                    let schedule_validation = listener_guard.init_from_snapshot(expected_snapshot, height);
+                                    let schedule_validation =
+                                        listener_guard.init_from_snapshot(expected_snapshot, height);
                                     let rebuilt_from_snapshot = listener_guard.order_book_state.is_some();
                                     let replay_ok = listener_guard.replay_cached_updates(cache);
 
@@ -561,11 +526,7 @@ const MAIN_COINS: [&str; 2] = ["BTC", "ETH"];
 const WARMUP_MS: u64 = 250;
 const INITIAL_SNAPSHOT_PREFETCH_MS: u64 = 200;
 
-type AlignedTriple = (
-    Batch<NodeDataOrderStatus>,
-    Batch<NodeDataOrderDiff>,
-    Batch<NodeDataFill>,
-);
+type AlignedTriple = (Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>, Batch<NodeDataFill>);
 
 struct AlignedMessage {
     fills_line: String,
@@ -575,9 +536,9 @@ struct AlignedMessage {
 
 impl OrderBookListener {
     pub(crate) fn new(
-        internal_message_tx: Option<Sender<Arc<InternalMessage>>>, 
+        internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
         active_coins: Option<Arc<Mutex<HashMap<String, usize>>>>,
-        ignore_spot: bool
+        ignore_spot: bool,
     ) -> Self {
         let warmup_deadline = Arc::new(AtomicU64::new(now_millis() + WARMUP_MS));
         let snapshot_request_inflight = Arc::new(AtomicBool::new(false));
@@ -681,14 +642,11 @@ impl OrderBookListener {
         self.pending_drop_warned = false;
     }
 
-
     fn queue_pending_aligned(&mut self, aligned: AlignedTriple) {
         if let Some(window_start) = self.pending_window_start {
             if aligned.0.block_number() < window_start {
                 if !self.pending_drop_warned {
-                    warn!(
-                        "Pending aligned window advanced; dropping batches below height {window_start}"
-                    );
+                    warn!("Pending aligned window advanced; dropping batches below height {window_start}");
                     self.pending_drop_warned = true;
                 }
                 return;
@@ -714,9 +672,7 @@ impl OrderBookListener {
             dropped = true;
         }
         if dropped && !self.pending_drop_warned {
-            warn!(
-                "Pending aligned window advanced; dropping batches below height {window_start}"
-            );
+            warn!("Pending aligned window advanced; dropping batches below height {window_start}");
             self.pending_drop_warned = true;
         }
     }
@@ -844,14 +800,12 @@ impl OrderBookListener {
             if started && requested {
                 warn!(
                     "Order book height discontinuity: expected {}, got {}. Triggering snapshot rebuild.",
-                    expected_height,
-                    target_height
+                    expected_height, target_height
                 );
             } else {
                 warn!(
                     "Order book height discontinuity: expected {}, got {}. Snapshot rebuild already queued.",
-                    expected_height,
-                    target_height
+                    expected_height, target_height
                 );
             }
             self.queue_pending_aligned((order_statuses, order_diffs, fills));
@@ -872,11 +826,7 @@ impl OrderBookListener {
             .transpose()
         {
             let started = self.start_rebuild();
-            let requested = if started {
-                self.request_snapshot_rebuild()
-            } else {
-                false
-            };
+            let requested = if started { self.request_snapshot_rebuild() } else { false };
             if started && requested {
                 warn!("L4Book out of sync: {}. Triggering snapshot rebuild.", err);
             } else {
@@ -967,11 +917,7 @@ impl OrderBookListener {
         // Always send L4Lite message to propagate block height, even if empty
         if lite_errors.is_empty() {
             if let Some(tx) = &self.internal_message_tx {
-                let analysis_rollup_height = if target_height % 10 == 0 {
-                    Some(target_height)
-                } else {
-                    None
-                };
+                let analysis_rollup_height = if target_height % 10 == 0 { Some(target_height) } else { None };
                 let msg = Arc::new(InternalMessage::L4Lite {
                     updates: all_lite_updates,
                     analysis_b: all_analysis_updates_b,
@@ -992,10 +938,8 @@ impl OrderBookListener {
         }
 
         if let Some(tx) = &self.internal_message_tx {
-            let updates = Arc::new(InternalMessage::L4BookUpdates {
-                diff_batch: order_diffs,
-                status_batch: order_statuses,
-            });
+            let updates =
+                Arc::new(InternalMessage::L4BookUpdates { diff_batch: order_diffs, status_batch: order_statuses });
             let _unused = tx.send(updates);
 
             let fills_msg = Arc::new(InternalMessage::Fills { batch: fills });
@@ -1046,11 +990,7 @@ impl OrderBookListener {
                 return false;
             }
             if let Err(err) = self.apply_aligned_batches(order_statuses, order_diffs, fills) {
-                warn!(
-                    "Failed to replay cached updates at height {} after snapshot validation: {}",
-                    target_height,
-                    err
-                );
+                warn!("Failed to replay cached updates at height {} after snapshot validation: {}", target_height, err);
                 return false;
             }
             current_height = self.order_book_state.as_ref().map(OrderBookState::height).unwrap_or(current_height);
@@ -1097,17 +1037,16 @@ impl OrderBookListener {
 
         let snapshot = Snapshots::new(books);
 
-        let mut new_order_book =
-            OrderBookState::from_snapshot(snapshot, init_height, 0, true, self.ignore_spot);
+        let mut new_order_book = OrderBookState::from_snapshot(snapshot, init_height, 0, true, self.ignore_spot);
         let mut retry = false;
         let mut lite_needs_rebuild = false;
         while let Some((order_statuses, order_diffs, fills)) = self.pending_aligned.pop_front() {
             // Filter cached updates for MAIN_COINS before applying to initial state.
             // pending_aligned already stores Active | Main batches.
-            
+
             let mut state_statuses = order_statuses.clone();
             state_statuses.retain(|ev| MAIN_COINS.contains(&ev.order.coin.as_str()));
-            
+
             let mut state_diffs = order_diffs.clone();
             state_diffs.retain(|ev| MAIN_COINS.contains(&ev.coin().value().as_str()));
 
@@ -1138,22 +1077,22 @@ impl OrderBookListener {
 
             let mut coin_fills: HashMap<Coin, Vec<NodeDataFill>> = HashMap::new();
             for fill in state_fills.clone().events() {
-                 coin_fills.entry(Coin::new(&fill.1.coin)).or_default().push(fill);
+                coin_fills.entry(Coin::new(&fill.1.coin)).or_default().push(fill);
             }
 
             let mut lite_errors: Vec<(Coin, u64, String)> = Vec::new();
             for (coin, lb) in &mut self.lite_books {
-                 if !lb.is_initialized() {
-                     continue;
-                 }
-                 let statuses = coin_statuses.remove(coin).unwrap_or_default();
-                 let diffs = coin_diffs.remove(coin).unwrap_or_default();
-                 let fills = coin_fills.remove(coin).unwrap_or_default();
-                 
-                 if let Err(err) = lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height) {
-                     lite_errors.push((coin.clone(), target_height, err.to_string()));
-                     lb.reset();
-                 }
+                if !lb.is_initialized() {
+                    continue;
+                }
+                let statuses = coin_statuses.remove(coin).unwrap_or_default();
+                let diffs = coin_diffs.remove(coin).unwrap_or_default();
+                let fills = coin_fills.remove(coin).unwrap_or_default();
+
+                if let Err(err) = lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height) {
+                    lite_errors.push((coin.clone(), target_height, err.to_string()));
+                    lb.reset();
+                }
             }
 
             if !lite_errors.is_empty() {
@@ -1243,12 +1182,7 @@ impl OrderBookListener {
             }
         }
 
-        let msg = InternalMessage::SnapshotRebuilt {
-            time,
-            height,
-            l4_snapshot,
-            lite_snapshots,
-        };
+        let msg = InternalMessage::SnapshotRebuilt { time, height, l4_snapshot, lite_snapshots };
         let _unused = tx.send(Arc::new(msg));
     }
 
@@ -1281,15 +1215,23 @@ pub(crate) struct TimedSnapshots {
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
     #[allow(dead_code)]
-    Snapshot { l2_snapshots: L2Snapshots, time: u64 },
+    Snapshot {
+        l2_snapshots: L2Snapshots,
+        time: u64,
+    },
     SnapshotRebuilt {
         time: u64,
         height: u64,
         l4_snapshot: Snapshots<InnerL4Order>,
         lite_snapshots: HashMap<Coin, lite::L2Snapshot>,
     },
-    Fills { batch: Batch<NodeDataFill> },
-    L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
+    Fills {
+        batch: Batch<NodeDataFill>,
+    },
+    L4BookUpdates {
+        diff_batch: Batch<NodeDataOrderDiff>,
+        status_batch: Batch<NodeDataOrderStatus>,
+    },
     L4Lite {
         updates: Vec<lite::L2BlockUpdate>,
         analysis_b: Vec<lite::AnalysisUpdate>,
@@ -1310,10 +1252,7 @@ pub(crate) struct L2SnapshotParams {
 }
 
 fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_millis() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_secs(0)).as_millis() as u64
 }
 
 fn split_merged_array(payload: &[u8]) -> Option<[&[u8]; 3]> {
@@ -1327,9 +1266,7 @@ fn split_merged_array(payload: &[u8]) -> Option<[&[u8]; 3]> {
     idx += 1;
     let mut parts: Vec<&[u8]> = Vec::with_capacity(3);
     while parts.len() < 3 {
-        while idx < payload.len()
-            && (payload[idx].is_ascii_whitespace() || payload[idx] == b',')
-        {
+        while idx < payload.len() && (payload[idx].is_ascii_whitespace() || payload[idx] == b',') {
             idx += 1;
         }
         if idx >= payload.len() || payload[idx] != b'{' {
@@ -1376,89 +1313,76 @@ fn split_merged_array(payload: &[u8]) -> Option<[&[u8]; 3]> {
             return None;
         }
     }
-    if parts.len() == 3 {
-        Some([parts[0], parts[1], parts[2]])
-    } else {
-        None
-    }
+    if parts.len() == 3 { Some([parts[0], parts[1], parts[2]]) } else { None }
 }
 
 #[allow(unsafe_code)]
-fn spawn_uds_reader(
-    tx: MpscSender<AlignedMessage>,
-    dropped_updates: Arc<AtomicBool>,
-    warmup_deadline: Arc<AtomicU64>,
-) {
-    thread::spawn(move || loop {
-        // 1. Connect using UnixStream (Stream mode)
-        let stream = match UnixStream::connect(UDS_PATH) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to connect to UDS {UDS_PATH}: {e}");
-                thread::sleep(Duration::from_secs(1));
-                continue;
-            }
-        };
-
-        if let Err(e) = stream.set_nonblocking(false) {
-            error!("Failed to set UDS blocking mode: {e}");
-        }
-
-        let fd = stream.as_raw_fd();
-        let buf_size = UDS_SOCKET_BUFFER;
-        let buf_ptr: *const i32 = &buf_size;
-        let buf_ptr = buf_ptr.cast::<libc::c_void>();
-        let buf_len = size_of::<i32>() as libc::socklen_t;
-
-        // 2. Set Receive Buffer
-        unsafe {
-            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, buf_ptr, buf_len);
-        }
-        
-        info!("Connected to merged stream at {UDS_PATH}");
-        
-        let mut reader = BufReader::new(stream);
-        let mut line_buffer = Vec::new();
-
-        // 3. Reader Loop
+fn spawn_uds_reader(tx: MpscSender<AlignedMessage>, dropped_updates: Arc<AtomicBool>, warmup_deadline: Arc<AtomicU64>) {
+    thread::spawn(move || {
         loop {
-            // Check warmup deadline
-            let is_warmup = now_millis() < warmup_deadline.load(AtomicOrdering::SeqCst);
-
-            line_buffer.clear();
-            match reader.read_until(b'\n', &mut line_buffer) {
-                Ok(0) => {
-                    warn!("UDS connection closed (EOF); reconnecting");
-                    break;
-                }
-                Ok(_) => {
-                    process_message(&line_buffer, &tx, &dropped_updates, is_warmup);
-                }
+            // 1. Connect using UnixStream (Stream mode)
+            let stream = match UnixStream::connect(UDS_PATH) {
+                Ok(s) => s,
                 Err(e) => {
-                    error!("UDS read error: {e}");
-                    break;
+                    error!("Failed to connect to UDS {UDS_PATH}: {e}");
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+            };
+
+            if let Err(e) = stream.set_nonblocking(false) {
+                error!("Failed to set UDS blocking mode: {e}");
+            }
+
+            let fd = stream.as_raw_fd();
+            let buf_size = UDS_SOCKET_BUFFER;
+            let buf_ptr: *const i32 = &buf_size;
+            let buf_ptr = buf_ptr.cast::<libc::c_void>();
+            let buf_len = size_of::<i32>() as libc::socklen_t;
+
+            // 2. Set Receive Buffer
+            unsafe {
+                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, buf_ptr, buf_len);
+            }
+
+            info!("Connected to merged stream at {UDS_PATH}");
+
+            let mut reader = BufReader::new(stream);
+            let mut line_buffer = Vec::new();
+
+            // 3. Reader Loop
+            loop {
+                // Check warmup deadline
+                let is_warmup = now_millis() < warmup_deadline.load(AtomicOrdering::SeqCst);
+
+                line_buffer.clear();
+                match reader.read_until(b'\n', &mut line_buffer) {
+                    Ok(0) => {
+                        warn!("UDS connection closed (EOF); reconnecting");
+                        break;
+                    }
+                    Ok(_) => {
+                        process_message(&line_buffer, &tx, &dropped_updates, is_warmup);
+                    }
+                    Err(e) => {
+                        error!("UDS read error: {e}");
+                        break;
+                    }
                 }
             }
-        }
 
-        thread::sleep(Duration::from_secs(1));
+            thread::sleep(Duration::from_secs(1));
+        }
     });
 }
 
-fn process_message(
-    buffer: &[u8], 
-    tx: &MpscSender<AlignedMessage>, 
-    dropped_updates: &Arc<AtomicBool>,
-    is_warmup: bool,
-) {
+fn process_message(buffer: &[u8], tx: &MpscSender<AlignedMessage>, dropped_updates: &Arc<AtomicBool>, is_warmup: bool) {
     // Remove trailing newline if present for parsing
-    let payload = if buffer.ends_with(&[b'\n']) {
-        &buffer[..buffer.len()-1]
-    } else {
-        buffer
-    };
+    let payload = if buffer.ends_with(&[b'\n']) { &buffer[..buffer.len() - 1] } else { buffer };
 
-    if payload.is_empty() { return; }
+    if payload.is_empty() {
+        return;
+    }
 
     let Some(parts) = split_merged_array(payload) else {
         // Log only if it's not a trivial empty line or something, acts as filter
@@ -1475,17 +1399,17 @@ fn process_message(
     };
 
     if !is_warmup {
-         // Optimization: check drop flag loosely before trying (already present in original logic)
-         if dropped_updates.load(AtomicOrdering::SeqCst) {
-             // In original logic, once dropped, it seemed to persist? 
-             // Or maybe it was just a transient aligned batch drop.
-             // We'll mimic sending attempt which can update the flag.
-         }
-         
-         if let Err(err) = tx.try_send(message) {
+        // Optimization: check drop flag loosely before trying (already present in original logic)
+        if dropped_updates.load(AtomicOrdering::SeqCst) {
+            // In original logic, once dropped, it seemed to persist?
+            // Or maybe it was just a transient aligned batch drop.
+            // We'll mimic sending attempt which can update the flag.
+        }
+
+        if let Err(err) = tx.try_send(message) {
             if !dropped_updates.swap(true, AtomicOrdering::SeqCst) {
-                 warn!("UDS queue full; dropping aligned batch: {err}");
+                warn!("UDS queue full; dropping aligned batch: {err}");
             }
-         }
+        }
     }
 }
