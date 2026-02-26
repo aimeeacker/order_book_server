@@ -11,6 +11,9 @@ This server provides the `l2book` and `trades` endpoints from [Hyperliquid’s o
 - The `l2book` subscription now includes an optional field:
   `n_levels`, which can be up to `100` and defaults to `20`.
 - This server also introduces a new endpoint: `l4book`.
+- Additional local endpoints:
+  - `l4Lite`: per-block level-2 style updates derived from L4 state.
+  - `l4Anal`: analysis rollups emitted every 10 blocks.
 
 The `l4book` subscription first sends a snapshot of the entire book and then forwards order diffs by block. The subscription format is:
 
@@ -23,6 +26,25 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
   }
 }
 ```
+
+`l4Lite`/`l4Anal` use stream-style subscriptions (example):
+
+```json
+{
+  "method": "subscribe",
+  "streams": ["BTC@l4Lite", "BTC@l4Anal"],
+  "req_id": 1
+}
+```
+
+### `l4Anal` payload notes
+
+- `l4Anal` frames are emitted when `block_height % 10 == 0`.
+- The rollup represents the latest 10-block window only (not long-horizon rolling accumulation).
+- `window_bids/window_asks[].vals` keep 4 values:
+  `[fill_sz, fill_notional, change_sz, change_notional]`.
+- `window_sum_bid/window_sum_ask` contain 8 positional values:
+  `[fill_sz, fill_notional, change_sz, change_notional, add_sz, add_notional, remove_sz, remove_notional]`.
 
 ## Setup
 

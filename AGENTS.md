@@ -61,6 +61,12 @@ This repository hosts a Rust workspace for a local WebSocket server that mirrors
 - Prefer returning recoverable errors over panics in streaming/state-sync paths.
 - Keep snapshot validation and replay paths deterministic; avoid introducing order-dependent hash behavior.
 - When enabling archive writes, monitor disk growth and rotation behavior under restarts.
+- Treat `l4Anal` payload shape as protocol: `window_sum_bid/window_sum_ask` are positional arrays with 8 values in order:
+  `[fill_sz, fill_notional, change_sz, change_notional, add_sz, add_notional, remove_sz, remove_notional]`.
+- `l4Anal` rollup cadence/semantics: emitted on heights divisible by 10, representing only the most recent 10-block
+  window (not a long rolling accumulation).
+- If you need to change `l4Anal` array length/order/semantics, coordinate downstream consumers first and document the
+  migration in `README.md`.
 
 ## Pre-Commit Checklist
 
