@@ -842,8 +842,8 @@ impl OrderBookListener {
         let mut all_analysis_updates_a = Vec::new();
         let mut all_analysis_rollup_b = Vec::new();
         let mut all_analysis_rollup_a = Vec::new();
-        let mut all_analysis_rollup_sum_b: Vec<(Coin, [String; 4])> = Vec::new();
-        let mut all_analysis_rollup_sum_a: Vec<(Coin, [String; 4])> = Vec::new();
+        let mut all_analysis_rollup_sum_b: Vec<(Coin, [String; 8])> = Vec::new();
+        let mut all_analysis_rollup_sum_a: Vec<(Coin, [String; 8])> = Vec::new();
 
         let mut coin_statuses: HashMap<Coin, Vec<NodeDataOrderStatus>> = HashMap::new();
         for status in state_statuses.events() {
@@ -1238,8 +1238,8 @@ pub(crate) enum InternalMessage {
         analysis_a: Vec<lite::AnalysisUpdate>,
         analysis_rollup_b: Vec<lite::AnalysisUpdate>,
         analysis_rollup_a: Vec<lite::AnalysisUpdate>,
-        analysis_rollup_sum_b: Vec<(Coin, [String; 4])>,
-        analysis_rollup_sum_a: Vec<(Coin, [String; 4])>,
+        analysis_rollup_sum_b: Vec<(Coin, [String; 8])>,
+        analysis_rollup_sum_a: Vec<(Coin, [String; 8])>,
         analysis_rollup_height: Option<u64>,
         height: u64,
     },

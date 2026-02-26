@@ -6,14 +6,13 @@ use crate::types::node_data::{NodeDataFill, NodeDataOrderDiff, NodeDataOrderStat
 use serde::ser::{SerializeTuple, Serializer};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 const PRICE_SCALE: u64 = 100_000_000;
 const BTC_BUCKET_SIZE: u64 = 50 * PRICE_SCALE;
 const ETH_BUCKET_SIZE: u64 = 5 * PRICE_SCALE;
 const ANALYSIS_ROLLUP_BLOCKS: u64 = 10;
-const ANALYSIS_ROLLUP_WINDOWS: usize = 180;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,28 +116,36 @@ fn merge_bucket_maps(target: &mut HashMap<u64, BucketAgg>, source: &HashMap<u64,
     for (px, agg) in source {
         let entry = target.entry(*px).or_default();
         entry.fill += agg.fill;
+        entry.fill_notional += agg.fill_notional;
         entry.change += agg.change;
+        entry.change_notional += agg.change_notional;
+        entry.add_sz += agg.add_sz;
+        entry.add_notional += agg.add_notional;
+        entry.remove_sz += agg.remove_sz;
+        entry.remove_notional += agg.remove_notional;
     }
 }
 
-fn sum_bucket_map(buckets: &HashMap<u64, BucketAgg>) -> (u64, u128, i64, i128) {
-    let mut fill = 0u64;
-    let mut fill_notional = 0u128;
-    let mut change = 0i64;
-    let mut change_notional = 0i128;
-    for (px, agg) in buckets {
-        fill = fill.saturating_add(agg.fill);
-        change = change.saturating_add(agg.change);
-        let px_u128 = u128::from(*px);
-        fill_notional = fill_notional.saturating_add((px_u128 * u128::from(agg.fill)) / u128::from(PRICE_SCALE));
-        let change_part = (i128::from(*px) * i128::from(agg.change)) / i128::from(PRICE_SCALE);
-        change_notional = change_notional.saturating_add(change_part);
-    }
-    (fill, fill_notional, change, change_notional)
-}
-
-fn format_sum_values(fill: u64, fill_notional: u128, change: i64, change_notional: i128) -> [String; 4] {
-    [fmt_sz(fill), fmt_notional(fill_notional), fmt_sz_signed(change), fmt_notional_signed(change_notional)]
+fn format_sum_values(
+    fill: u64,
+    fill_notional: u128,
+    change: i64,
+    change_notional: i128,
+    add_sz: u64,
+    add_notional: u128,
+    remove_sz: u64,
+    remove_notional: u128,
+) -> [String; 8] {
+    [
+        fmt_sz(fill),
+        fmt_notional(fill_notional),
+        fmt_sz_signed(change),
+        fmt_notional_signed(change_notional),
+        fmt_sz(add_sz),
+        fmt_notional(add_notional),
+        fmt_sz(remove_sz),
+        fmt_notional(remove_notional),
+    ]
 }
 
 fn bucket_map_to_updates(coin: &Coin, side: Side, buckets: &HashMap<u64, BucketAgg>) -> Vec<AnalysisUpdate> {
@@ -149,20 +156,18 @@ fn bucket_map_to_updates(coin: &Coin, side: Side, buckets: &HashMap<u64, BucketA
     }
 
     let mut updates = Vec::new();
-    for (px, agg) in levels {
+    for (_bucket_px, agg) in levels {
         if agg.fill == 0 && agg.change == 0 {
             continue;
         }
-        let fill_notional = (u128::from(*px) * u128::from(agg.fill)) / u128::from(PRICE_SCALE);
-        let change_notional = (i128::from(*px) * i128::from(agg.change)) / i128::from(PRICE_SCALE);
         updates.push(AnalysisUpdate {
             coin: coin.clone(),
             side,
-            px: fmt_px(*px),
+            px: fmt_px(*_bucket_px),
             fill: fmt_sz(agg.fill),
-            fill_notional: fmt_notional(fill_notional),
+            fill_notional: fmt_notional(agg.fill_notional),
             change: fmt_sz_signed(agg.change),
-            change_notional: fmt_notional_signed(change_notional),
+            change_notional: fmt_notional_signed(agg.change_notional),
         });
     }
     updates
@@ -175,8 +180,8 @@ pub(crate) struct L4LiteBlockEvent {
     pub analysis_updates_a: Vec<AnalysisUpdate>,
     pub analysis_rollup_b: Vec<AnalysisUpdate>,
     pub analysis_rollup_a: Vec<AnalysisUpdate>,
-    pub analysis_rollup_sum_b: Option<[String; 4]>,
-    pub analysis_rollup_sum_a: Option<[String; 4]>,
+    pub analysis_rollup_sum_b: Option<[String; 8]>,
+    pub analysis_rollup_sum_a: Option<[String; 8]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,14 +231,27 @@ pub(crate) struct BookState {
     analysis_sum_fill_notional_a: u128,
     analysis_sum_change_a: i64,
     analysis_sum_change_notional_a: i128,
-    analysis_rollups: VecDeque<BucketWindow>,
+    analysis_sum_add_b: u64,
+    analysis_sum_add_notional_b: u128,
+    analysis_sum_remove_b: u64,
+    analysis_sum_remove_notional_b: u128,
+    analysis_sum_add_a: u64,
+    analysis_sum_add_notional_a: u128,
+    analysis_sum_remove_a: u64,
+    analysis_sum_remove_notional_a: u128,
     initialized: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 struct BucketAgg {
     fill: u64,
+    fill_notional: u128,
     change: i64,
+    change_notional: i128,
+    add_sz: u64,
+    add_notional: u128,
+    remove_sz: u64,
+    remove_notional: u128,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -260,7 +278,14 @@ impl BookState {
             analysis_sum_fill_notional_a: 0,
             analysis_sum_change_a: 0,
             analysis_sum_change_notional_a: 0,
-            analysis_rollups: VecDeque::new(),
+            analysis_sum_add_b: 0,
+            analysis_sum_add_notional_b: 0,
+            analysis_sum_remove_b: 0,
+            analysis_sum_remove_notional_b: 0,
+            analysis_sum_add_a: 0,
+            analysis_sum_add_notional_a: 0,
+            analysis_sum_remove_a: 0,
+            analysis_sum_remove_notional_a: 0,
             initialized: false,
         }
     }
@@ -289,6 +314,14 @@ impl BookState {
         self.analysis_sum_fill_notional_a = 0;
         self.analysis_sum_change_a = 0;
         self.analysis_sum_change_notional_a = 0;
+        self.analysis_sum_add_b = 0;
+        self.analysis_sum_add_notional_b = 0;
+        self.analysis_sum_remove_b = 0;
+        self.analysis_sum_remove_notional_b = 0;
+        self.analysis_sum_add_a = 0;
+        self.analysis_sum_add_notional_a = 0;
+        self.analysis_sum_remove_a = 0;
+        self.analysis_sum_remove_notional_a = 0;
         self.initialized = false;
     }
 
@@ -474,18 +507,27 @@ impl BookState {
         let mut block_fill_notional_b: u128 = 0;
         let mut block_change_b: i64 = 0;
         let mut block_change_notional_b: i128 = 0;
+        let mut block_add_b: u64 = 0;
+        let mut block_add_notional_b: u128 = 0;
+        let mut block_remove_b: u64 = 0;
+        let mut block_remove_notional_b: u128 = 0;
         let mut block_fill_a: u64 = 0;
         let mut block_fill_notional_a: u128 = 0;
         let mut block_change_a: i64 = 0;
         let mut block_change_notional_a: i128 = 0;
+        let mut block_add_a: u64 = 0;
+        let mut block_add_notional_a: u128 = 0;
+        let mut block_remove_a: u64 = 0;
+        let mut block_remove_notional_a: u128 = 0;
 
         for (side, px) in affected_levels {
             let filled_val = *filled_amts.get(&(side, px)).unwrap_or(&0);
             let delta_total = *level_deltas.get(&(side, px)).unwrap_or(&0);
 
-            // Book change comes from diffs directly; downstream handles fill effects.
-            // change = net order book delta (no fill adjustment).
-            let change = delta_total;
+            // Isolate pure order placement/cancellation from fill-induced sz decrease.
+            // delta_total includes fill effect (fills reduce sz → negative delta);
+            // adding filled_val back yields the non-fill book change.
+            let change = delta_total.saturating_add(filled_val as i64);
 
             if filled_val > 0 || change != 0 {
                 let px_u128 = u128::from(px.value());
@@ -497,12 +539,30 @@ impl BookState {
                         block_fill_notional_b = block_fill_notional_b.saturating_add(fill_notional);
                         block_change_b = block_change_b.saturating_add(change);
                         block_change_notional_b = block_change_notional_b.saturating_add(change_notional);
+                        if change > 0 {
+                            let add_val = change as u64;
+                            block_add_b = block_add_b.saturating_add(add_val);
+                            block_add_notional_b = block_add_notional_b.saturating_add((px_u128 * u128::from(add_val)) / u128::from(PRICE_SCALE));
+                        } else {
+                            let rm_val = (-change) as u64;
+                            block_remove_b = block_remove_b.saturating_add(rm_val);
+                            block_remove_notional_b = block_remove_notional_b.saturating_add((px_u128 * u128::from(rm_val)) / u128::from(PRICE_SCALE));
+                        }
                     }
                     Side::Ask => {
                         block_fill_a = block_fill_a.saturating_add(filled_val);
                         block_fill_notional_a = block_fill_notional_a.saturating_add(fill_notional);
                         block_change_a = block_change_a.saturating_add(change);
                         block_change_notional_a = block_change_notional_a.saturating_add(change_notional);
+                        if change > 0 {
+                            let add_val = change as u64;
+                            block_add_a = block_add_a.saturating_add(add_val);
+                            block_add_notional_a = block_add_notional_a.saturating_add((px_u128 * u128::from(add_val)) / u128::from(PRICE_SCALE));
+                        } else {
+                            let rm_val = (-change) as u64;
+                            block_remove_a = block_remove_a.saturating_add(rm_val);
+                            block_remove_notional_a = block_remove_notional_a.saturating_add((px_u128 * u128::from(rm_val)) / u128::from(PRICE_SCALE));
+                        }
                     }
                 }
                 let bucket_px = bucket_lower_px(&coin, px.value());
@@ -512,7 +572,16 @@ impl BookState {
                 };
                 let entry = target.entry(bucket_px).or_default();
                 entry.fill += filled_val;
+                entry.fill_notional += fill_notional;
                 entry.change += change;
+                entry.change_notional += change_notional;
+                if change > 0 {
+                    entry.add_sz += change as u64;
+                    entry.add_notional += (px_u128 * u128::from(change as u64)) / u128::from(PRICE_SCALE);
+                } else {
+                    entry.remove_sz += (-change) as u64;
+                    entry.remove_notional += (px_u128 * u128::from((-change) as u64)) / u128::from(PRICE_SCALE);
+                }
             }
 
             let state = match side {
@@ -551,6 +620,14 @@ impl BookState {
         self.analysis_sum_change_a = self.analysis_sum_change_a.saturating_add(block_change_a);
         self.analysis_sum_change_notional_a =
             self.analysis_sum_change_notional_a.saturating_add(block_change_notional_a);
+        self.analysis_sum_add_b = self.analysis_sum_add_b.saturating_add(block_add_b);
+        self.analysis_sum_add_notional_b = self.analysis_sum_add_notional_b.saturating_add(block_add_notional_b);
+        self.analysis_sum_remove_b = self.analysis_sum_remove_b.saturating_add(block_remove_b);
+        self.analysis_sum_remove_notional_b = self.analysis_sum_remove_notional_b.saturating_add(block_remove_notional_b);
+        self.analysis_sum_add_a = self.analysis_sum_add_a.saturating_add(block_add_a);
+        self.analysis_sum_add_notional_a = self.analysis_sum_add_notional_a.saturating_add(block_add_notional_a);
+        self.analysis_sum_remove_a = self.analysis_sum_remove_a.saturating_add(block_remove_a);
+        self.analysis_sum_remove_notional_a = self.analysis_sum_remove_notional_a.saturating_add(block_remove_notional_a);
 
         let analysis_b = bucket_map_to_updates(&coin, Side::Bid, &block_buckets_b);
         let analysis_a = bucket_map_to_updates(&coin, Side::Ask, &block_buckets_a);
@@ -593,21 +670,37 @@ impl BookState {
                 self.analysis_sum_fill_notional_b,
                 self.analysis_sum_change_b,
                 self.analysis_sum_change_notional_b,
+                self.analysis_sum_add_b,
+                self.analysis_sum_add_notional_b,
+                self.analysis_sum_remove_b,
+                self.analysis_sum_remove_notional_b,
             ));
             analysis_rollup_sum_a = Some(format_sum_values(
                 self.analysis_sum_fill_a,
                 self.analysis_sum_fill_notional_a,
                 self.analysis_sum_change_a,
                 self.analysis_sum_change_notional_a,
+                self.analysis_sum_add_a,
+                self.analysis_sum_add_notional_a,
+                self.analysis_sum_remove_a,
+                self.analysis_sum_remove_notional_a,
             ));
             self.analysis_sum_fill_b = 0;
             self.analysis_sum_fill_notional_b = 0;
             self.analysis_sum_change_b = 0;
             self.analysis_sum_change_notional_b = 0;
+            self.analysis_sum_add_b = 0;
+            self.analysis_sum_add_notional_b = 0;
+            self.analysis_sum_remove_b = 0;
+            self.analysis_sum_remove_notional_b = 0;
             self.analysis_sum_fill_a = 0;
             self.analysis_sum_fill_notional_a = 0;
             self.analysis_sum_change_a = 0;
             self.analysis_sum_change_notional_a = 0;
+            self.analysis_sum_add_a = 0;
+            self.analysis_sum_add_notional_a = 0;
+            self.analysis_sum_remove_a = 0;
+            self.analysis_sum_remove_notional_a = 0;
         }
 
         let event = L4LiteBlockEvent {
@@ -640,6 +733,14 @@ impl BookState {
         self.analysis_sum_fill_notional_a = 0;
         self.analysis_sum_change_a = 0;
         self.analysis_sum_change_notional_a = 0;
+        self.analysis_sum_add_b = 0;
+        self.analysis_sum_add_notional_b = 0;
+        self.analysis_sum_remove_b = 0;
+        self.analysis_sum_remove_notional_b = 0;
+        self.analysis_sum_add_a = 0;
+        self.analysis_sum_add_notional_a = 0;
+        self.analysis_sum_remove_a = 0;
+        self.analysis_sum_remove_notional_a = 0;
         self.initialized = true;
 
         for orders in snapshot.as_ref() {
@@ -665,7 +766,7 @@ impl BookState {
         };
 
         let level = levels.entry(px).or_insert_with(LevelState::new);
-        level.sum_sz = Sz::new(level.sum_sz.value() + sz.value());
+        level.sum_sz = Sz::new(level.sum_sz.value().saturating_add(sz.value()));
         level.orders.insert(oid, sz);
         level.dirty = true;
         self.dirty_levels.push((side, px));
@@ -785,13 +886,13 @@ impl BookState {
                     Side::Bid => {
                         expected_bids.entry(px).or_insert_with(|| Sz::new(0));
                         if let Some(acc) = expected_bids.get_mut(&px) {
-                            *acc = Sz::new(acc.value() + sz.value());
+                            *acc = Sz::new(acc.value().saturating_add(sz.value()));
                         }
                     }
                     Side::Ask => {
                         expected_asks.entry(px).or_insert_with(|| Sz::new(0));
                         if let Some(acc) = expected_asks.get_mut(&px) {
-                            *acc = Sz::new(acc.value() + sz.value());
+                            *acc = Sz::new(acc.value().saturating_add(sz.value()));
                         }
                     }
                 }
@@ -851,13 +952,13 @@ pub(crate) fn expected_snapshot_hash(l4_snapshot: &Snapshot<InnerL4Order>) -> u6
                 Side::Bid => {
                     expected_bids.entry(px).or_insert_with(|| Sz::new(0));
                     if let Some(acc) = expected_bids.get_mut(&px) {
-                        *acc = Sz::new(acc.value() + sz.value());
+                        *acc = Sz::new(acc.value().saturating_add(sz.value()));
                     }
                 }
                 Side::Ask => {
                     expected_asks.entry(px).or_insert_with(|| Sz::new(0));
                     if let Some(acc) = expected_asks.get_mut(&px) {
-                        *acc = Sz::new(acc.value() + sz.value());
+                        *acc = Sz::new(acc.value().saturating_add(sz.value()));
                     }
                 }
             }

@@ -210,11 +210,11 @@ async fn handle_socket(
                                 for a in analysis_rollup_a {
                                     rollup_by_coin_a.entry(a.coin.value()).or_default().push(a.clone());
                                 }
-                                let mut rollup_sum_by_coin_b: HashMap<String, [String; 4]> = HashMap::new();
+                                let mut rollup_sum_by_coin_b: HashMap<String, [String; 8]> = HashMap::new();
                                 for (coin, sum) in analysis_rollup_sum_b {
                                     rollup_sum_by_coin_b.insert(coin.value(), sum.clone());
                                 }
-                                let mut rollup_sum_by_coin_a: HashMap<String, [String; 4]> = HashMap::new();
+                                let mut rollup_sum_by_coin_a: HashMap<String, [String; 8]> = HashMap::new();
                                 for (coin, sum) in analysis_rollup_sum_a {
                                     rollup_sum_by_coin_a.insert(coin.value(), sum.clone());
                                 }
@@ -621,9 +621,9 @@ struct AnalysisBucketFrame {
 #[derive(serde::Serialize)]
 struct AnalysisRollupFrame {
     #[serde(rename = "window_sum_ask")]
-    sum_a: [String; 4],
+    sum_a: [String; 8],
     #[serde(rename = "window_sum_bid")]
-    sum_b: [String; 4],
+    sum_b: [String; 8],
     #[serde(rename = "window_asks")]
     asks: Vec<AnalysisBucketFrame>,
     #[serde(rename = "window_bids")]
@@ -750,8 +750,8 @@ async fn send_ws_data_from_lite_updates(
     analysis_a: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
     rollup_b: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
     rollup_a: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
-    rollup_sum_b: &mut HashMap<String, [String; 4]>,
-    rollup_sum_a: &mut HashMap<String, [String; 4]>,
+    rollup_sum_b: &mut HashMap<String, [String; 8]>,
+    rollup_sum_a: &mut HashMap<String, [String; 8]>,
     rollup_height: Option<u64>,
     block_height: u64,
 ) {
@@ -784,10 +784,10 @@ async fn send_ws_data_from_lite_updates(
                 let r_a = rollup_a.remove(coin).unwrap_or_default();
                 let sum_b = rollup_sum_b
                     .remove(coin)
-                    .unwrap_or_else(|| ["0".to_string(), "0".to_string(), "0".to_string(), "0".to_string()]);
+                    .unwrap_or_else(|| ["0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string()]);
                 let sum_a = rollup_sum_a
                     .remove(coin)
-                    .unwrap_or_else(|| ["0".to_string(), "0".to_string(), "0".to_string(), "0".to_string()]);
+                    .unwrap_or_else(|| ["0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string()]);
                 let bids = r_b
                     .into_iter()
                     .map(|u| AnalysisBucketFrame {
