@@ -89,12 +89,12 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     // Initialize Scheduler
     let sched = JobScheduler::new().await.map_err(|e| format!("Failed to create scheduler: {e}"))?;
 
-    // Create job to run at xx:01:00 only.
+    // Create job to run at xx:00:10 only.
     let boundary_listener = listener.clone();
     let boundary_tx = snapshot_fetch_task_tx.clone();
     let boundary_dir = dir.clone();
     let boundary_inflight = snapshot_inflight.clone();
-    let boundary_job = Job::new("0 1 * * * *", move |_uuid, _l| {
+    let boundary_job = Job::new("10 0 * * * *", move |_uuid, _l| {
         let listener = boundary_listener.clone();
         let snapshot_fetch_task_tx = boundary_tx.clone();
         let dir = boundary_dir.clone();
@@ -113,7 +113,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     sched.add(boundary_job).await.map_err(|e| format!("Failed to add job: {e}"))?;
     sched.start().await.map_err(|e| format!("Failed to start scheduler: {e}"))?;
 
-    info!("Cron scheduler started: snapshot validation set to run at xx:01:00.");
+    info!("Cron scheduler started: snapshot validation set to run at xx:00:10.");
 
     info!("Waiting for first stream data before requesting initial snapshot");
 
@@ -842,8 +842,11 @@ impl OrderBookListener {
         let mut all_analysis_updates_a = Vec::new();
         let mut all_analysis_rollup_b = Vec::new();
         let mut all_analysis_rollup_a = Vec::new();
-        let mut all_analysis_rollup_sum_b: Vec<(Coin, [String; 8])> = Vec::new();
-        let mut all_analysis_rollup_sum_a: Vec<(Coin, [String; 8])> = Vec::new();
+        let mut all_analysis_rollup_sum_b: Vec<(Coin, [String; 9])> = Vec::new();
+        let mut all_analysis_rollup_sum_a: Vec<(Coin, [String; 9])> = Vec::new();
+        let mut all_minute_aggs: Vec<(Coin, lite::MinuteAgg)> = Vec::new();
+
+        let block_time_ms = order_statuses.block_time();
 
         let mut coin_statuses: HashMap<Coin, Vec<NodeDataOrderStatus>> = HashMap::new();
         for status in state_statuses.events() {
@@ -870,7 +873,7 @@ impl OrderBookListener {
             let diffs = coin_diffs.remove(coin).unwrap_or_default();
             let fills = coin_fills.remove(coin).unwrap_or_default();
 
-            match lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height) {
+            match lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height, block_time_ms) {
                 Ok(block_event) => {
                     if let Some(du) = block_event.depth_updates {
                         all_lite_updates.push(du);
@@ -892,6 +895,9 @@ impl OrderBookListener {
                     }
                     if let Some(sum_a) = block_event.analysis_rollup_sum_a {
                         all_analysis_rollup_sum_a.push((coin.clone(), sum_a));
+                    }
+                    for magg in block_event.minute_aggs {
+                        all_minute_aggs.push((coin.clone(), magg));
                     }
                 }
                 Err(err) => {
@@ -928,6 +934,7 @@ impl OrderBookListener {
                     analysis_rollup_sum_a: all_analysis_rollup_sum_a,
                     analysis_rollup_height,
                     height: target_height,
+                    minute_aggs: all_minute_aggs,
                 });
                 let _unused = tx.send(msg);
             }
@@ -1089,7 +1096,7 @@ impl OrderBookListener {
                 let diffs = coin_diffs.remove(coin).unwrap_or_default();
                 let fills = coin_fills.remove(coin).unwrap_or_default();
 
-                if let Err(err) = lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height) {
+                if let Err(err) = lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height, order_statuses.block_time()) {
                     lite_errors.push((coin.clone(), target_height, err.to_string()));
                     lb.reset();
                 }
@@ -1238,10 +1245,11 @@ pub(crate) enum InternalMessage {
         analysis_a: Vec<lite::AnalysisUpdate>,
         analysis_rollup_b: Vec<lite::AnalysisUpdate>,
         analysis_rollup_a: Vec<lite::AnalysisUpdate>,
-        analysis_rollup_sum_b: Vec<(Coin, [String; 8])>,
-        analysis_rollup_sum_a: Vec<(Coin, [String; 8])>,
+        analysis_rollup_sum_b: Vec<(Coin, [String; 9])>,
+        analysis_rollup_sum_a: Vec<(Coin, [String; 9])>,
         analysis_rollup_height: Option<u64>,
         height: u64,
+        minute_aggs: Vec<(Coin, lite::MinuteAgg)>,
     },
 }
 

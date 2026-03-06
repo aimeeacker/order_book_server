@@ -55,6 +55,8 @@ pub(crate) enum Subscription {
     L4Lite { coin: String },
     #[serde(rename_all = "camelCase")]
     L4Anal { coin: String },
+    #[serde(rename_all = "camelCase")]
+    L4Min1 { coin: String },
 }
 
 impl Subscription {
@@ -109,6 +111,14 @@ impl Subscription {
                 true
             }
             Self::L4Anal { coin } => {
+                if !universe.contains(coin) || coin.starts_with('@') {
+                    info!("Invalid subscription: coin not found");
+                    return false;
+                }
+                info!("Valid subscription");
+                true
+            }
+            Self::L4Min1 { coin } => {
                 if !universe.contains(coin) || coin.starts_with('@') {
                     info!("Invalid subscription: coin not found");
                     return false;

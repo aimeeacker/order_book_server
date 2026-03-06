@@ -187,7 +187,7 @@ async fn handle_socket(
                                     send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
                                 }
                             },
-                            InternalMessage::L4Lite{ updates, analysis_b, analysis_a, analysis_rollup_b, analysis_rollup_a, analysis_rollup_sum_b, analysis_rollup_sum_a, analysis_rollup_height, height } => {
+                            InternalMessage::L4Lite{ updates, analysis_b, analysis_a, analysis_rollup_b, analysis_rollup_a, analysis_rollup_sum_b, analysis_rollup_sum_a, analysis_rollup_height, height, minute_aggs } => {
                                 let mut updates_by_coin: HashMap<String, crate::listeners::order_book::lite::L2BlockUpdate> = HashMap::new();
                                 for u in updates {
                                     updates_by_coin.insert(u.coin.clone(), u.clone());
@@ -210,11 +210,11 @@ async fn handle_socket(
                                 for a in analysis_rollup_a {
                                     rollup_by_coin_a.entry(a.coin.value()).or_default().push(a.clone());
                                 }
-                                let mut rollup_sum_by_coin_b: HashMap<String, [String; 8]> = HashMap::new();
+                                let mut rollup_sum_by_coin_b: HashMap<String, [String; 9]> = HashMap::new();
                                 for (coin, sum) in analysis_rollup_sum_b {
                                     rollup_sum_by_coin_b.insert(coin.value(), sum.clone());
                                 }
-                                let mut rollup_sum_by_coin_a: HashMap<String, [String; 8]> = HashMap::new();
+                                let mut rollup_sum_by_coin_a: HashMap<String, [String; 9]> = HashMap::new();
                                 for (coin, sum) in analysis_rollup_sum_a {
                                     rollup_sum_by_coin_a.insert(coin.value(), sum.clone());
                                 }
@@ -233,6 +233,22 @@ async fn handle_socket(
                                         *analysis_rollup_height,
                                         *height,
                                     ).await;
+                                }
+
+                                // Dispatch l4Min1 messages (minute boundary and/or 57s preview)
+                                if !minute_aggs.is_empty() {
+                                    for sub in manager.subscriptions() {
+                                        if let Subscription::L4Min1 { coin } = sub {
+                                            for (c, magg) in minute_aggs {
+                                                if c.value() == coin.as_str() {
+                                                    if let Ok(val) = serde_json::to_value(magg) {
+                                                        let channel = format!("{}@l4Min1", coin.to_lowercase());
+                                                        send_stream_snapshot_message(&mut socket, &channel, val).await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             },
                         }
@@ -307,6 +323,7 @@ async fn handle_socket(
             Subscription::L4Book { coin } => coin,
             Subscription::L4Lite { coin } => coin,
             Subscription::L4Anal { coin } => coin,
+            Subscription::L4Min1 { coin } => coin,
         };
         if let Some(count) = guard.get_mut(coin) {
             *count = count.saturating_sub(1);
@@ -333,6 +350,7 @@ async fn receive_client_message(
             Subscription::L4Book { coin } => format!("{}@l4Book", coin.to_lowercase()),
             Subscription::L4Lite { coin } => format!("{}@l4Lite", coin.to_lowercase()),
             Subscription::L4Anal { coin } => format!("{}@l4Anal", coin.to_lowercase()),
+            Subscription::L4Min1 { coin } => format!("{}@l4Min1", coin.to_lowercase()),
         }
     }
 
@@ -345,6 +363,7 @@ async fn receive_client_message(
             "l4book" => Some(Subscription::L4Book { coin }),
             "l4lite" => Some(Subscription::L4Lite { coin }),
             "l4anal" => Some(Subscription::L4Anal { coin }),
+            "l4min1" => Some(Subscription::L4Min1 { coin }),
             "l2book" => Some(Subscription::L2Book { coin, n_sig_figs: None, n_levels: None, mantissa: None }),
             "trade" | "trades" => Some(Subscription::Trades { coin }),
             _ => None,
@@ -415,6 +434,7 @@ async fn receive_client_message(
                 Subscription::L4Book { coin } => coin,
                 Subscription::L4Lite { coin } => coin,
                 Subscription::L4Anal { coin } => coin,
+                Subscription::L4Min1 { coin } => coin,
             };
             if is_subscribe {
                 *guard.entry(coin.clone()).or_insert(0) += 1;
@@ -500,6 +520,27 @@ async fn receive_client_message(
     // send any immediate snapshot messages
     for sm in snapshot_msgs {
         send_socket_message(socket, sm).await;
+    }
+
+    // Send l4Min1 warmup snapshot: last 5 closed minute aggs per subscribed coin.
+    if is_subscribe {
+        for sub in &subscriptions {
+            if let Subscription::L4Min1 { coin } = sub {
+                let listener_guard = listener.lock().await;
+                let recent = listener_guard
+                    .lite_books
+                    .get(&Coin::new(coin))
+                    .map(|lb| lb.get_recent_minute_aggs())
+                    .unwrap_or_default();
+                drop(listener_guard);
+                for magg in recent {
+                    if let Ok(val) = serde_json::to_value(&magg) {
+                        let channel = format!("{}@l4Min1", coin.to_lowercase());
+                        send_stream_snapshot_message(socket, &channel, val).await;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -621,9 +662,9 @@ struct AnalysisBucketFrame {
 #[derive(serde::Serialize)]
 struct AnalysisRollupFrame {
     #[serde(rename = "window_sum_ask")]
-    sum_a: [String; 8],
+    sum_a: [String; 9],
     #[serde(rename = "window_sum_bid")]
-    sum_b: [String; 8],
+    sum_b: [String; 9],
     #[serde(rename = "window_asks")]
     asks: Vec<AnalysisBucketFrame>,
     #[serde(rename = "window_bids")]
@@ -750,8 +791,8 @@ async fn send_ws_data_from_lite_updates(
     analysis_a: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
     rollup_b: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
     rollup_a: &mut HashMap<String, Vec<crate::listeners::order_book::lite::AnalysisUpdate>>,
-    rollup_sum_b: &mut HashMap<String, [String; 8]>,
-    rollup_sum_a: &mut HashMap<String, [String; 8]>,
+    rollup_sum_b: &mut HashMap<String, [String; 9]>,
+    rollup_sum_a: &mut HashMap<String, [String; 9]>,
     rollup_height: Option<u64>,
     block_height: u64,
 ) {
@@ -784,10 +825,10 @@ async fn send_ws_data_from_lite_updates(
                 let r_a = rollup_a.remove(coin).unwrap_or_default();
                 let sum_b = rollup_sum_b
                     .remove(coin)
-                    .unwrap_or_else(|| ["0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string()]);
+                    .unwrap_or_else(|| core::array::from_fn(|_| "0".to_string()));
                 let sum_a = rollup_sum_a
                     .remove(coin)
-                    .unwrap_or_else(|| ["0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string(), "0".to_string()]);
+                    .unwrap_or_else(|| core::array::from_fn(|_| "0".to_string()));
                 let bids = r_b
                     .into_iter()
                     .map(|u| AnalysisBucketFrame {
@@ -875,6 +916,7 @@ impl Subscription {
                 }
             }
             Self::L4Anal { .. } => Ok(None),
+            Self::L4Min1 { .. } => Ok(None),
             _ => Ok(None),
         }
     }
