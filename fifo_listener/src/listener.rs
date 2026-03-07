@@ -789,22 +789,21 @@ fn run_aggregator(
             }
 
             if let Some(tx) = archive_tx.as_ref() {
-                if !is_archive_enabled() {
-                    continue;
-                }
-                let mut msg = Some(ArchiveBlock::new(height, fills_line, diffs_line, order_line));
-                while let Some(block) = msg.take() {
-                    match tx.try_send(block) {
-                        Ok(()) => break,
-                        Err(TrySendError::Full(block)) => {
-                            if stop.load(Ordering::SeqCst) {
+                if is_archive_enabled() {
+                    let mut msg = Some(ArchiveBlock::new(height, fills_line, diffs_line, order_line));
+                    while let Some(block) = msg.take() {
+                        match tx.try_send(block) {
+                            Ok(()) => break,
+                            Err(TrySendError::Full(block)) => {
+                                if stop.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                msg = Some(block);
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(TrySendError::Disconnected(_block)) => {
                                 break;
                             }
-                            msg = Some(block);
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(TrySendError::Disconnected(_block)) => {
-                            break;
                         }
                     }
                 }
