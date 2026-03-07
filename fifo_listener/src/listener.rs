@@ -788,6 +788,14 @@ fn run_aggregator(
                 server.send(&merged);
             }
 
+            // Preserve pre-archive callback timing: notify Python immediately after the merged block
+            // is emitted, before any optional archival backpressure handling.
+            if height % 100 == 0 {
+                if let Some(cb) = callback.as_ref() {
+                    cb(height);
+                }
+            }
+
             if let Some(tx) = archive_tx.as_ref() {
                 if is_archive_enabled() {
                     let mut msg = Some(ArchiveBlock::new(height, fills_line, diffs_line, order_line));
@@ -806,12 +814,6 @@ fn run_aggregator(
                             }
                         }
                     }
-                }
-            }
-
-            if height % 100 == 0 {
-                if let Some(cb) = callback.as_ref() {
-                    cb(height);
                 }
             }
 
