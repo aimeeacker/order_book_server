@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "binaries", "fifo_listener", "snapshot_bench", "compute_l4", "hl_py"]
+members = ["server", "binaries", "fifo_listener", "snapshot_bench", "compute_l4", "hl_book"]
 
 resolver = "3"
 

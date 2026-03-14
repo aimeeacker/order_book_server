@@ -62,7 +62,7 @@ fn init_python_logging() {
     PY_LOG_INIT.call_once(|| {
         let logger = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
             let logging = py.import("logging")?;
-            let logger = logging.getattr("getLogger")?.call1(("HL_module",))?;
+            let logger = logging.getattr("getLogger")?.call1(("hl_book",))?;
             Ok(logger.into())
         });
         let logger = match logger {
@@ -319,7 +319,7 @@ fn py_set_dataset_dir(output_dir: Option<PathBuf>) -> String {
 }
 
 #[pymodule]
-fn _hl_py_native(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn _hl_book_native(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyFifoListener>()?;
     m.add_function(wrap_pyfunction!(py_compute_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_compute_to_file, m)?)?;

@@ -2151,7 +2151,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "hl_py"
+name = "hl_book"
 version = "0.1.0"
 dependencies = [
  "compute_l4",
