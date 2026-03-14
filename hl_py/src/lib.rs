@@ -1,22 +1,29 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(non_local_definitions, unused_qualifications)]
 
-mod archive;
-mod listener;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-pub use listener::{
-    ArchiveMode, HeightCallback, ListenerHandle, current_archive_base_dir, current_archive_symbols, init_cli_logging,
-    run_forever, set_archive_base_dir, set_archive_enabled, set_archive_mode, set_archive_symbols, set_rotation_blocks,
-    start_listener,
+use compute_l4::{
+    ComputeOptions, append_l4_checkpoint, compute_l4_json, compute_l4_to_file, current_dataset_dir,
+    set_current_dataset_dir,
 };
-
+use fifo_listener::{
+    ArchiveMode, HeightCallback, ListenerHandle, current_archive_base_dir, current_archive_symbols,
+    set_archive_base_dir, set_archive_mode, set_archive_symbols, set_rotation_blocks, start_listener,
+};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3_asyncio::TaskLocals;
-use std::sync::Arc;
-use std::sync::Once;
-use std::sync::atomic::{AtomicBool, Ordering};
+
+use compute_l4 as _;
+use fifo_listener as _;
+use log as _;
+use pyo3 as _;
+use pyo3_asyncio as _;
 
 static PY_LOG_INIT: Once = Once::new();
 static PY_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -55,7 +62,7 @@ fn init_python_logging() {
     PY_LOG_INIT.call_once(|| {
         let logger = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
             let logging = py.import("logging")?;
-            let logger = logging.getattr("getLogger")?.call1(("FIFO_module",))?;
+            let logger = logging.getattr("getLogger")?.call1(("HL_module",))?;
             Ok(logger.into())
         });
         let logger = match logger {
@@ -75,7 +82,6 @@ struct PyFifoListener {
     handle: Option<ListenerHandle>,
 }
 
-#[allow(non_local_definitions, unused_qualifications)]
 #[pymethods]
 impl PyFifoListener {
     #[new]
@@ -88,9 +94,11 @@ impl PyFifoListener {
         if self.handle.is_some() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err("fifo_listener already started"));
         }
+
         PY_BRIDGE_ENABLED.store(true, Ordering::SeqCst);
         init_python_logging();
-        let event_loop: Option<Py<PyAny>> = event_loop.map(|event_loop| event_loop.into());
+
+        let event_loop: Option<Py<PyAny>> = event_loop.map(Into::into);
         let (callback, is_async, locals) = match callback {
             Some(callback) => {
                 let callback: Py<PyAny> = callback.into();
@@ -99,7 +107,7 @@ impl PyFifoListener {
                     let is_async =
                         inspect.call_method1("iscoroutinefunction", (callback.as_ref(py),))?.extract::<bool>()?;
                     let locals = if is_async {
-                        let loop_handle = event_loop.ok_or_else(|| {
+                        let loop_handle = event_loop.as_ref().ok_or_else(|| {
                             pyo3::exceptions::PyRuntimeError::new_err("async callback requires event_loop")
                         })?;
                         Some(TaskLocals::new(loop_handle.as_ref(py)).copy_context(py)?)
@@ -150,6 +158,7 @@ impl PyFifoListener {
             });
             handler
         });
+
         self.handle = Some(start_listener(callback)?);
         Ok(())
     }
@@ -167,7 +176,7 @@ impl PyFifoListener {
         &self,
         mode: Option<&str>,
         rotation_blocks: Option<u64>,
-        output_dir: Option<std::path::PathBuf>,
+        output_dir: Option<PathBuf>,
         symbols: Option<Vec<String>>,
     ) -> PyResult<()> {
         let mode = match mode {
@@ -200,7 +209,7 @@ impl PyFifoListener {
     }
 
     #[pyo3(signature = (output_dir=None))]
-    fn set_write_dataset_dir(&self, output_dir: Option<std::path::PathBuf>) -> String {
+    fn set_write_dataset_dir(&self, output_dir: Option<PathBuf>) -> String {
         set_archive_base_dir(output_dir).to_string_lossy().into_owned()
     }
 
@@ -219,8 +228,103 @@ impl Drop for PyFifoListener {
     }
 }
 
+fn into_py_err<E: std::fmt::Display>(err: E) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
+}
+
+fn checkpoint_result_to_py(py: Python<'_>, result: compute_l4::CheckpointWriteResult) -> PyResult<PyObject> {
+    let out = PyDict::new(py);
+    out.set_item("block_height", result.block_height)?;
+    out.set_item("block_time", result.block_time)?;
+    out.set_item("segment_path", result.segment_path.to_string_lossy().into_owned())?;
+    out.set_item("segment_start", result.segment_start)?;
+    out.set_item("segment_end", result.segment_end)?;
+    out.set_item("snapshot_index_path", result.snapshot_index_path.to_string_lossy().into_owned())?;
+    out.set_item("checkpoint_count", result.checkpoint_count)?;
+    out.set_item("asset_count", result.asset_count)?;
+    out.set_item("codec", result.codec)?;
+    out.set_item("compression_level", result.compression_level)?;
+    out.set_item("raw_len", result.raw_len)?;
+    out.set_item("stored_len", result.stored_len)?;
+    Ok(out.into())
+}
+
+#[pyfunction(name = "compute_json")]
+#[pyo3(signature = (input, include_users=false, include_trigger_orders=false, assets=None))]
+fn py_compute_json(
+    input: PathBuf,
+    include_users: bool,
+    include_trigger_orders: bool,
+    assets: Option<Vec<String>>,
+) -> PyResult<String> {
+    let options = ComputeOptions { include_users, include_trigger_orders, assets };
+    compute_l4_json(input, &options).map_err(into_py_err)
+}
+
+#[pyfunction(name = "compute_to_file")]
+#[pyo3(signature = (input, output, include_users=false, include_trigger_orders=false, assets=None))]
+fn py_compute_to_file(
+    input: PathBuf,
+    output: PathBuf,
+    include_users: bool,
+    include_trigger_orders: bool,
+    assets: Option<Vec<String>>,
+) -> PyResult<()> {
+    let options = ComputeOptions { include_users, include_trigger_orders, assets };
+    compute_l4_to_file(input, output, &options).map_err(into_py_err)
+}
+
+#[pyfunction(name = "append_checkpoint")]
+#[pyo3(signature = (input, output_dir=None, include_users=false, include_trigger_orders=false, assets=None))]
+fn py_append_checkpoint(
+    py: Python<'_>,
+    input: PathBuf,
+    output_dir: Option<PathBuf>,
+    include_users: bool,
+    include_trigger_orders: bool,
+    assets: Option<Vec<String>>,
+) -> PyResult<PyObject> {
+    let options = ComputeOptions { include_users, include_trigger_orders, assets };
+    let result = append_l4_checkpoint(input, output_dir, &options).map_err(into_py_err)?;
+    checkpoint_result_to_py(py, result)
+}
+
+#[pyfunction(name = "get_dataset_dir")]
+fn py_get_dataset_dir() -> String {
+    let snapshot_dir = current_dataset_dir();
+    let archive_dir = current_archive_base_dir();
+    if snapshot_dir != archive_dir {
+        log::warn!(
+            "snapshot dataset dir ({}) differs from archive dataset dir ({})",
+            snapshot_dir.display(),
+            archive_dir.display()
+        );
+    }
+    snapshot_dir.to_string_lossy().into_owned()
+}
+
+#[pyfunction(name = "set_dataset_dir")]
+#[pyo3(signature = (output_dir=None))]
+fn py_set_dataset_dir(output_dir: Option<PathBuf>) -> String {
+    let snapshot_dir = set_current_dataset_dir(output_dir.clone());
+    let archive_dir = set_archive_base_dir(output_dir);
+    if snapshot_dir != archive_dir {
+        log::warn!(
+            "snapshot dataset dir ({}) differs from archive dataset dir ({}) after set_dataset_dir",
+            snapshot_dir.display(),
+            archive_dir.display()
+        );
+    }
+    snapshot_dir.to_string_lossy().into_owned()
+}
+
 #[pymodule]
-fn fifo_listener(_py: Python, m: &PyModule) -> PyResult<()> {
+fn _hl_py_native(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyFifoListener>()?;
+    m.add_function(wrap_pyfunction!(py_compute_json, m)?)?;
+    m.add_function(wrap_pyfunction!(py_compute_to_file, m)?)?;
+    m.add_function(wrap_pyfunction!(py_append_checkpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(py_get_dataset_dir, m)?)?;
+    m.add_function(wrap_pyfunction!(py_set_dataset_dir, m)?)?;
     Ok(())
 }

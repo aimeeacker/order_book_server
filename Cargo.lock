@@ -1331,6 +1331,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b05b61dc5112cbb17e4b6cd61790d9845d13888356391624cbe7e41efeac1e75"
 
 [[package]]
+name = "compute_l4"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "pyo3",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "zstd",
+]
+
+[[package]]
 name = "const-hex"
 version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2136,6 +2148,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5313b072ce3c597065a808dbf612c4c8e8590bdbf8b579508bf7a762c5eae6cd"
 dependencies = [
  "arrayvec",
+]
+
+[[package]]
+name = "hl_py"
+version = "0.1.0"
+dependencies = [
+ "compute_l4",
+ "fifo_listener",
+ "log",
+ "pyo3",
+ "pyo3-asyncio",
 ]
 
 [[package]]
@@ -3607,6 +3630,26 @@ checksum = "bb919243f34364b6bd2fc10ef797edbfa75f33c252e7998527479c6d6b47e1ec"
 dependencies = [
  "bytes",
  "rustc-hex",
+]
+
+[[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52e599a477cf9840e92f2cde9a7189e67b42c57532749bf90aea6ec10facd4db"
+dependencies = [
+ "byteorder",
+ "rmp",
+ "serde",
 ]
 
 [[package]]

@@ -311,7 +311,7 @@ pub(crate) struct BookState {
     analysis_sum_remove_notional_a: u128,
     initialized: bool,
     // ── Minute-level accumulator (independent of analysis rollup) ──
-    min_current_minute: u64,          // floored minute ts in ms (0 = not set)
+    min_current_minute: u64, // floored minute ts in ms (0 = not set)
     min_fill_b: u64,
     min_fill_notional_b: u128,
     min_fill_a: u64,
@@ -383,15 +383,24 @@ impl BookState {
             analysis_sum_remove_notional_a: 0,
             initialized: false,
             min_current_minute: 0,
-            min_fill_b: 0, min_fill_notional_b: 0,
-            min_fill_a: 0, min_fill_notional_a: 0,
-            min_add_b: 0, min_add_notional_b: 0,
-            min_add_a: 0, min_add_notional_a: 0,
-            min_remove_b: 0, min_remove_notional_b: 0,
-            min_remove_a: 0, min_remove_notional_a: 0,
-            min_fill_life_sum_ms: 0, min_fill_life_count: 0,
-            min_cancel_life_sum_ms: 0, min_cancel_life_count: 0,
-            min_near_fill_notional: 0, min_near_add_notional: 0,
+            min_fill_b: 0,
+            min_fill_notional_b: 0,
+            min_fill_a: 0,
+            min_fill_notional_a: 0,
+            min_add_b: 0,
+            min_add_notional_b: 0,
+            min_add_a: 0,
+            min_add_notional_a: 0,
+            min_remove_b: 0,
+            min_remove_notional_b: 0,
+            min_remove_a: 0,
+            min_remove_notional_a: 0,
+            min_fill_life_sum_ms: 0,
+            min_fill_life_count: 0,
+            min_cancel_life_sum_ms: 0,
+            min_cancel_life_count: 0,
+            min_near_fill_notional: 0,
+            min_near_add_notional: 0,
             min_preview_sent: false,
             recent_minute_aggs: VecDeque::with_capacity(5),
         }
@@ -444,16 +453,8 @@ impl BookState {
                     ask_notional += u128::from(pv) * sz;
                 }
 
-                let bid_wap = if bid_sz > 0 {
-                    fmt_px((bid_notional / bid_sz) as u64)
-                } else {
-                    "0".to_string()
-                };
-                let ask_wap = if ask_sz > 0 {
-                    fmt_px((ask_notional / ask_sz) as u64)
-                } else {
-                    "0".to_string()
-                };
+                let bid_wap = if bid_sz > 0 { fmt_px((bid_notional / bid_sz) as u64) } else { "0".to_string() };
+                let ask_wap = if ask_sz > 0 { fmt_px((ask_notional / ask_sz) as u64) } else { "0".to_string() };
                 (bid_wap, ask_wap)
             }
             _ => ("0".to_string(), "0".to_string()),
@@ -505,15 +506,24 @@ impl BookState {
     }
 
     fn reset_min_accumulators(&mut self) {
-        self.min_fill_b = 0; self.min_fill_notional_b = 0;
-        self.min_fill_a = 0; self.min_fill_notional_a = 0;
-        self.min_add_b = 0; self.min_add_notional_b = 0;
-        self.min_add_a = 0; self.min_add_notional_a = 0;
-        self.min_remove_b = 0; self.min_remove_notional_b = 0;
-        self.min_remove_a = 0; self.min_remove_notional_a = 0;
-        self.min_fill_life_sum_ms = 0; self.min_fill_life_count = 0;
-        self.min_cancel_life_sum_ms = 0; self.min_cancel_life_count = 0;
-        self.min_near_fill_notional = 0; self.min_near_add_notional = 0;
+        self.min_fill_b = 0;
+        self.min_fill_notional_b = 0;
+        self.min_fill_a = 0;
+        self.min_fill_notional_a = 0;
+        self.min_add_b = 0;
+        self.min_add_notional_b = 0;
+        self.min_add_a = 0;
+        self.min_add_notional_a = 0;
+        self.min_remove_b = 0;
+        self.min_remove_notional_b = 0;
+        self.min_remove_a = 0;
+        self.min_remove_notional_a = 0;
+        self.min_fill_life_sum_ms = 0;
+        self.min_fill_life_count = 0;
+        self.min_cancel_life_sum_ms = 0;
+        self.min_cancel_life_count = 0;
+        self.min_near_fill_notional = 0;
+        self.min_near_add_notional = 0;
     }
 
     fn take_minute_agg(&mut self) -> MinuteAgg {
@@ -522,14 +532,20 @@ impl BookState {
         let agg = MinuteAgg {
             ts_ms: self.min_current_minute + MILLIS_PER_MINUTE - 1,
             bid: [
-                fmt_sz(self.min_fill_b), fmt_notional(self.min_fill_notional_b),
-                fmt_sz(self.min_add_b), fmt_notional(self.min_add_notional_b),
-                fmt_sz(self.min_remove_b), fmt_notional(self.min_remove_notional_b),
+                fmt_sz(self.min_fill_b),
+                fmt_notional(self.min_fill_notional_b),
+                fmt_sz(self.min_add_b),
+                fmt_notional(self.min_add_notional_b),
+                fmt_sz(self.min_remove_b),
+                fmt_notional(self.min_remove_notional_b),
             ],
             ask: [
-                fmt_sz(self.min_fill_a), fmt_notional(self.min_fill_notional_a),
-                fmt_sz(self.min_add_a), fmt_notional(self.min_add_notional_a),
-                fmt_sz(self.min_remove_a), fmt_notional(self.min_remove_notional_a),
+                fmt_sz(self.min_fill_a),
+                fmt_notional(self.min_fill_notional_a),
+                fmt_sz(self.min_add_a),
+                fmt_notional(self.min_add_notional_a),
+                fmt_sz(self.min_remove_a),
+                fmt_notional(self.min_remove_notional_a),
             ],
             bid_near_wap: bid_wap,
             ask_near_wap: ask_wap,
@@ -560,14 +576,20 @@ impl BookState {
         MinuteAgg {
             ts_ms: self.min_current_minute + MILLIS_PER_MINUTE - 1,
             bid: [
-                fmt_sz(self.min_fill_b), fmt_notional(self.min_fill_notional_b),
-                fmt_sz(self.min_add_b), fmt_notional(self.min_add_notional_b),
-                fmt_sz(self.min_remove_b), fmt_notional(self.min_remove_notional_b),
+                fmt_sz(self.min_fill_b),
+                fmt_notional(self.min_fill_notional_b),
+                fmt_sz(self.min_add_b),
+                fmt_notional(self.min_add_notional_b),
+                fmt_sz(self.min_remove_b),
+                fmt_notional(self.min_remove_notional_b),
             ],
             ask: [
-                fmt_sz(self.min_fill_a), fmt_notional(self.min_fill_notional_a),
-                fmt_sz(self.min_add_a), fmt_notional(self.min_add_notional_a),
-                fmt_sz(self.min_remove_a), fmt_notional(self.min_remove_notional_a),
+                fmt_sz(self.min_fill_a),
+                fmt_notional(self.min_fill_notional_a),
+                fmt_sz(self.min_add_a),
+                fmt_notional(self.min_add_notional_a),
+                fmt_sz(self.min_remove_a),
+                fmt_notional(self.min_remove_notional_a),
             ],
             bid_near_wap: bid_wap,
             ask_near_wap: ask_wap,
@@ -593,15 +615,14 @@ impl BookState {
     fn side_slope(&self, levels: &BTreeMap<Px, LevelState>, mid: u64, threshold: u64, is_bid: bool) -> (f64, f64) {
         let scale_sq = (PRICE_SCALE as f64) * (PRICE_SCALE as f64);
         let mut total_notional: f64 = 0.0;
-        let iter: Box<dyn Iterator<Item = (&Px, &LevelState)>> = if is_bid {
-            Box::new(levels.iter().rev())
-        } else {
-            Box::new(levels.iter())
-        };
+        let iter: Box<dyn Iterator<Item = (&Px, &LevelState)>> =
+            if is_bid { Box::new(levels.iter().rev()) } else { Box::new(levels.iter()) };
         for (px, level) in iter {
             let pv = px.value();
             let dist = if pv > mid { pv - mid } else { mid - pv };
-            if dist > threshold { break; }
+            if dist > threshold {
+                break;
+            }
             let sz_usd = (level.sum_sz.value() as f64 * pv as f64) / scale_sq;
             total_notional += sz_usd;
         }
@@ -612,25 +633,32 @@ impl BookState {
 
     /// Compute Herfindahl concentration index for one side within ±`threshold` of `mid`.
     fn side_concentration(&self, levels: &BTreeMap<Px, LevelState>, mid: u64, threshold: u64, is_bid: bool) -> f64 {
-        let iter: Box<dyn Iterator<Item = (&Px, &LevelState)>> = if is_bid {
-            Box::new(levels.iter().rev())
-        } else {
-            Box::new(levels.iter())
-        };
+        let iter: Box<dyn Iterator<Item = (&Px, &LevelState)>> =
+            if is_bid { Box::new(levels.iter().rev()) } else { Box::new(levels.iter()) };
         let mut depths: Vec<f64> = Vec::new();
         let mut total: f64 = 0.0;
         for (px, level) in iter {
             let pv = px.value();
             let dist = if pv > mid { pv - mid } else { mid - pv };
-            if dist > threshold { break; }
+            if dist > threshold {
+                break;
+            }
             let d = level.sum_sz.value() as f64;
             if d > 0.0 {
                 depths.push(d);
                 total += d;
             }
         }
-        if total <= 0.0 { return 0.0; }
-        depths.iter().map(|d| { let s = d / total; s * s }).sum()
+        if total <= 0.0 {
+            return 0.0;
+        }
+        depths
+            .iter()
+            .map(|d| {
+                let s = d / total;
+                s * s
+            })
+            .sum()
     }
 
     /// Compute book-health metrics from current snapshot + minute accumulators.
@@ -659,10 +687,14 @@ impl BookState {
         // Average lifetimes
         let avg_fill = if self.min_fill_life_count > 0 {
             self.min_fill_life_sum_ms as f64 / self.min_fill_life_count as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         let avg_cancel = if self.min_cancel_life_count > 0 {
             self.min_cancel_life_sum_ms as f64 / self.min_cancel_life_count as f64
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         // Resilience: add_near_usd / (fill_near_usd + 1) — values store USD * 1e8
         let fill_near_usd = self.min_near_fill_notional as f64 / PRICE_SCALE as f64;
@@ -678,8 +710,8 @@ impl BookState {
         let conc_score = (1.0 - concentration_f).clamp(0.0, 1.0);
         // Resilience: ratio capped at 1.5 for scoring, normalized to [0,1]
         let resil_score = (resilience_f / 1.5).min(1.0);
-        let health = (spread_score * 25.0 + slope_score * 25.0 + conc_score * 25.0 + resil_score * 25.0)
-            .clamp(0.0, 100.0);
+        let health =
+            (spread_score * 25.0 + slope_score * 25.0 + conc_score * 25.0 + resil_score * 25.0).clamp(0.0, 100.0);
 
         BookHealthSnapshot {
             slope_bid: format!("{:.2}", slope_bid_f),
@@ -840,7 +872,14 @@ impl BookState {
                     #[allow(clippy::unwrap_used)]
                     inner.convert_trigger(time.try_into().unwrap());
                     let created_ms = inner.timestamp;
-                    self.add_order(inner.oid(), inner.coin.clone(), inner.side(), inner.limit_px(), inner.sz(), created_ms);
+                    self.add_order(
+                        inner.oid(),
+                        inner.coin.clone(),
+                        inner.side(),
+                        inner.limit_px(),
+                        inner.sz(),
+                        created_ms,
+                    );
                     affected_levels.insert((inner.side(), inner.limit_px()));
                     *level_deltas.entry((inner.side(), inner.limit_px())).or_default() += sz.value() as i64;
                 }
@@ -941,9 +980,9 @@ impl BookState {
                             self.min_near_fill_notional = self.min_near_fill_notional.saturating_add(fill_notional);
                         }
                         if change > 0 {
-                            self.min_near_add_notional = self.min_near_add_notional.saturating_add(
-                                (px_u128 * u128::from(change as u64)) / u128::from(PRICE_SCALE)
-                            );
+                            self.min_near_add_notional = self
+                                .min_near_add_notional
+                                .saturating_add((px_u128 * u128::from(change as u64)) / u128::from(PRICE_SCALE));
                         }
                     }
                 }
@@ -956,11 +995,13 @@ impl BookState {
                         if change > 0 {
                             let add_val = change as u64;
                             block_add_b = block_add_b.saturating_add(add_val);
-                            block_add_notional_b = block_add_notional_b.saturating_add((px_u128 * u128::from(add_val)) / u128::from(PRICE_SCALE));
+                            block_add_notional_b = block_add_notional_b
+                                .saturating_add((px_u128 * u128::from(add_val)) / u128::from(PRICE_SCALE));
                         } else {
                             let rm_val = (-change) as u64;
                             block_remove_b = block_remove_b.saturating_add(rm_val);
-                            block_remove_notional_b = block_remove_notional_b.saturating_add((px_u128 * u128::from(rm_val)) / u128::from(PRICE_SCALE));
+                            block_remove_notional_b = block_remove_notional_b
+                                .saturating_add((px_u128 * u128::from(rm_val)) / u128::from(PRICE_SCALE));
                         }
                     }
                     Side::Ask => {
@@ -971,11 +1012,13 @@ impl BookState {
                         if change > 0 {
                             let add_val = change as u64;
                             block_add_a = block_add_a.saturating_add(add_val);
-                            block_add_notional_a = block_add_notional_a.saturating_add((px_u128 * u128::from(add_val)) / u128::from(PRICE_SCALE));
+                            block_add_notional_a = block_add_notional_a
+                                .saturating_add((px_u128 * u128::from(add_val)) / u128::from(PRICE_SCALE));
                         } else {
                             let rm_val = (-change) as u64;
                             block_remove_a = block_remove_a.saturating_add(rm_val);
-                            block_remove_notional_a = block_remove_notional_a.saturating_add((px_u128 * u128::from(rm_val)) / u128::from(PRICE_SCALE));
+                            block_remove_notional_a = block_remove_notional_a
+                                .saturating_add((px_u128 * u128::from(rm_val)) / u128::from(PRICE_SCALE));
                         }
                     }
                 }
@@ -1051,11 +1094,13 @@ impl BookState {
         self.analysis_sum_add_b = self.analysis_sum_add_b.saturating_add(block_add_b);
         self.analysis_sum_add_notional_b = self.analysis_sum_add_notional_b.saturating_add(block_add_notional_b);
         self.analysis_sum_remove_b = self.analysis_sum_remove_b.saturating_add(block_remove_b);
-        self.analysis_sum_remove_notional_b = self.analysis_sum_remove_notional_b.saturating_add(block_remove_notional_b);
+        self.analysis_sum_remove_notional_b =
+            self.analysis_sum_remove_notional_b.saturating_add(block_remove_notional_b);
         self.analysis_sum_add_a = self.analysis_sum_add_a.saturating_add(block_add_a);
         self.analysis_sum_add_notional_a = self.analysis_sum_add_notional_a.saturating_add(block_add_notional_a);
         self.analysis_sum_remove_a = self.analysis_sum_remove_a.saturating_add(block_remove_a);
-        self.analysis_sum_remove_notional_a = self.analysis_sum_remove_notional_a.saturating_add(block_remove_notional_a);
+        self.analysis_sum_remove_notional_a =
+            self.analysis_sum_remove_notional_a.saturating_add(block_remove_notional_a);
 
         let analysis_b = bucket_map_to_updates(&coin, Side::Bid, &block_buckets_b);
         let analysis_a = bucket_map_to_updates(&coin, Side::Ask, &block_buckets_a);
@@ -1188,7 +1233,14 @@ impl BookState {
 
         for orders in snapshot.as_ref() {
             for order in orders {
-                self.add_order(order.oid(), order.coin.clone(), order.side(), order.limit_px(), order.sz(), order.timestamp);
+                self.add_order(
+                    order.oid(),
+                    order.coin.clone(),
+                    order.side(),
+                    order.limit_px(),
+                    order.sz(),
+                    order.timestamp,
+                );
             }
         }
     }

@@ -24,7 +24,8 @@ async def main():
     loop = asyncio.get_running_loop()
     listener.start(on_height, event_loop=loop)
 
-    print("fifo_listener running for 5 seconds...")
+    print("fifo_listener running for 5 seconds with FULL archive...")
+    listener.start_write_dataset("FULL")
     await asyncio.sleep(5)
 
     listener.stop()

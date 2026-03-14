@@ -823,12 +823,8 @@ async fn send_ws_data_from_lite_updates(
             if let Some(rollup_height) = rollup_height {
                 let r_b = rollup_b.remove(coin).unwrap_or_default();
                 let r_a = rollup_a.remove(coin).unwrap_or_default();
-                let sum_b = rollup_sum_b
-                    .remove(coin)
-                    .unwrap_or_else(|| core::array::from_fn(|_| "0".to_string()));
-                let sum_a = rollup_sum_a
-                    .remove(coin)
-                    .unwrap_or_else(|| core::array::from_fn(|_| "0".to_string()));
+                let sum_b = rollup_sum_b.remove(coin).unwrap_or_else(|| core::array::from_fn(|_| "0".to_string()));
+                let sum_a = rollup_sum_a.remove(coin).unwrap_or_else(|| core::array::from_fn(|_| "0".to_string()));
                 let bids = r_b
                     .into_iter()
                     .map(|u| AnalysisBucketFrame {

@@ -1096,7 +1096,14 @@ impl OrderBookListener {
                 let diffs = coin_diffs.remove(coin).unwrap_or_default();
                 let fills = coin_fills.remove(coin).unwrap_or_default();
 
-                if let Err(err) = lb.process_block(coin.clone(), &statuses, &diffs, &fills, target_height, order_statuses.block_time()) {
+                if let Err(err) = lb.process_block(
+                    coin.clone(),
+                    &statuses,
+                    &diffs,
+                    &fills,
+                    target_height,
+                    order_statuses.block_time(),
+                ) {
                     lite_errors.push((coin.clone(), target_height, err.to_string()));
                     lb.reset();
                 }

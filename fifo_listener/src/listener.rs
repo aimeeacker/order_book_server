@@ -13,8 +13,11 @@ use std::time::Duration;
 use log::{info, warn};
 use memchr::{memchr, memmem};
 
-pub use crate::archive::set_archive_enabled;
 use crate::archive::{ARCHIVE_QUEUE_BLOCKS, ArchiveBlock, is_archive_enabled, run_archive_writer};
+pub use crate::archive::{
+    ArchiveMode, current_archive_base_dir, current_archive_symbols, set_archive_base_dir, set_archive_enabled,
+    set_archive_mode, set_archive_symbols, set_rotation_blocks,
+};
 
 const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book/node_fifo";
 const ORDER_PIPE_CAPACITY: i32 = 16 * 1024 * 1024;
@@ -477,14 +480,6 @@ fn signal_eventfd(fd: RawFd) {
     }
 }
 
-fn drain_eventfd(fd: RawFd) {
-    let mut value: u64 = 0;
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::read(fd, std::ptr::addr_of_mut!(value).cast::<libc::c_void>(), size_of::<u64>())
-    };
-}
-
 #[allow(unsafe_code)]
 fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -628,7 +623,6 @@ fn listen_fifo(
             }
 
             if (fds[1].revents & libc::POLLIN) != 0 {
-                drain_eventfd(stop_eventfd);
                 return;
             }
 
@@ -798,7 +792,8 @@ fn run_aggregator(
 
             if let Some(tx) = archive_tx.as_ref() {
                 if is_archive_enabled() {
-                    let mut msg = Some(ArchiveBlock::new(height, fills_line, diffs_line, order_line));
+                    let mut msg: Option<ArchiveBlock> =
+                        Some(ArchiveBlock::new(height, fills_line, diffs_line, order_line));
                     while let Some(block) = msg.take() {
                         match tx.try_send(block) {
                             Ok(()) => break,

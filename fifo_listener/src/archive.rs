@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -16,25 +18,119 @@ use parquet::schema::types::Type;
 use serde::Deserialize;
 
 const ARCHIVE_BASE_DIR: &str = "/home/aimee/hl_runtime/dataset";
-const ROTATION_BLOCKS: u64 = 100_000;
+const DEFAULT_ARCHIVE_SYMBOLS: &[&str] = &["BTC", "ETH"];
+const LITE_PRICE_SCALE: u32 = 8;
+const LITE_SIZE_SCALE: u32 = 8;
+static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
+static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
 pub(crate) const ARCHIVE_QUEUE_BLOCKS: usize = 127;
 
-static ARCHIVE_ENABLED: AtomicBool = AtomicBool::new(false);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveMode {
+    Lite = 1,
+    Full = 2,
+}
+
+static ARCHIVE_MODE: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_rotation_blocks(n: u64) {
+    if n > 0 {
+        ROTATION_BLOCKS.store(n, Ordering::SeqCst);
+    }
+}
+
+fn archive_base_dir_override() -> &'static Mutex<Option<PathBuf>> {
+    ARCHIVE_BASE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+fn archive_symbols_override() -> &'static Mutex<Option<Vec<String>>> {
+    ARCHIVE_SYMBOLS_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+fn normalize_archive_symbols(symbols: Option<Vec<String>>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let normalized: Vec<String> = symbols
+        .unwrap_or_else(|| DEFAULT_ARCHIVE_SYMBOLS.iter().map(|symbol| (*symbol).to_string()).collect())
+        .into_iter()
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| !symbol.is_empty())
+        .filter(|symbol| seen.insert(symbol.clone()))
+        .collect();
+    if normalized.is_empty() {
+        DEFAULT_ARCHIVE_SYMBOLS.iter().map(|symbol| (*symbol).to_string()).collect()
+    } else {
+        normalized
+    }
+}
+
+pub fn current_archive_base_dir() -> PathBuf {
+    archive_base_dir_override()
+        .lock()
+        .expect("archive base dir mutex")
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(ARCHIVE_BASE_DIR))
+}
+
+pub fn set_archive_base_dir(path: Option<PathBuf>) -> PathBuf {
+    let mut guard = archive_base_dir_override().lock().expect("archive base dir mutex");
+    *guard = path;
+    guard.clone().unwrap_or_else(|| PathBuf::from(ARCHIVE_BASE_DIR))
+}
+
+pub fn current_archive_symbols() -> Vec<String> {
+    archive_symbols_override()
+        .lock()
+        .expect("archive symbols mutex")
+        .clone()
+        .map(|symbols| normalize_archive_symbols(Some(symbols)))
+        .unwrap_or_else(|| normalize_archive_symbols(None))
+}
+
+pub fn set_archive_symbols(symbols: Option<Vec<String>>) -> Vec<String> {
+    let normalized = normalize_archive_symbols(symbols);
+    let mut guard = archive_symbols_override().lock().expect("archive symbols mutex");
+    *guard = Some(normalized.clone());
+    normalized
+}
+
+pub fn set_archive_mode(mode: Option<ArchiveMode>) {
+    let val = match mode {
+        None => 0,
+        Some(ArchiveMode::Lite) => 1,
+        Some(ArchiveMode::Full) => 2,
+    };
+    ARCHIVE_MODE.store(val, Ordering::SeqCst);
+}
 
 pub fn set_archive_enabled(enabled: bool) {
-    ARCHIVE_ENABLED.store(enabled, Ordering::SeqCst);
+    if enabled {
+        if ARCHIVE_MODE.load(Ordering::SeqCst) == 0 {
+            ARCHIVE_MODE.store(1, Ordering::SeqCst); // Default to Lite
+        }
+    } else {
+        ARCHIVE_MODE.store(0, Ordering::SeqCst);
+    }
+}
+
+pub(crate) fn get_archive_mode() -> Option<ArchiveMode> {
+    match ARCHIVE_MODE.load(Ordering::SeqCst) {
+        1 => Some(ArchiveMode::Lite),
+        2 => Some(ArchiveMode::Full),
+        _ => None,
+    }
 }
 
 pub(crate) fn is_archive_enabled() -> bool {
-    ARCHIVE_ENABLED.load(Ordering::SeqCst)
+    ARCHIVE_MODE.load(Ordering::SeqCst) != 0
 }
 
 #[derive(Debug)]
 pub(crate) struct ArchiveBlock {
-    block_number: u64,
-    fills_line: Vec<u8>,
-    diffs_line: Vec<u8>,
-    order_line: Vec<u8>,
+    pub(crate) block_number: u64,
+    pub(crate) fills_line: Vec<u8>,
+    pub(crate) diffs_line: Vec<u8>,
+    pub(crate) order_line: Vec<u8>,
 }
 
 impl ArchiveBlock {
@@ -45,6 +141,8 @@ impl ArchiveBlock {
 
 #[derive(Deserialize)]
 struct BatchLite<T> {
+    #[serde(rename = "local_time")]
+    local_time: String,
     #[serde(rename = "block_time")]
     block_time: String,
     #[serde(rename = "block_number")]
@@ -54,6 +152,10 @@ struct BatchLite<T> {
 
 #[derive(Deserialize)]
 struct OrderStatusLite {
+    time: String,
+    user: Option<String>,
+    hash: serde_json::Value,
+    builder: serde_json::Value,
     status: String,
     order: OrderLite,
 }
@@ -63,17 +165,28 @@ struct OrderStatusLite {
 struct OrderLite {
     coin: String,
     side: String,
+    limit_px: String,
+    sz: String,
     oid: u64,
-    #[serde(deserialize_with = "deserialize_px_dec")]
-    limit_px: i64,
+    timestamp: u64,
+    trigger_condition: String,
     is_trigger: bool,
+    trigger_px: String,
+    is_position_tpsl: bool,
+    reduce_only: bool,
+    order_type: String,
+    orig_sz: String,
     tif: Option<String>,
+    cloid: serde_json::Value,
 }
 
 #[derive(Deserialize)]
 struct DiffLite {
+    user: String,
     oid: u64,
     coin: String,
+    side: String,
+    px: String,
     #[serde(rename = "raw_book_diff", alias = "rawBookDiff")]
     raw_book_diff: RawDiffLite,
 }
@@ -82,56 +195,104 @@ struct DiffLite {
 #[serde(rename_all = "camelCase")]
 enum RawDiffLite {
     #[serde(alias = "New")]
-    New {
-        #[serde(deserialize_with = "deserialize_sz_dec")]
-        sz: i64,
-    },
+    New { sz: String },
     #[serde(alias = "Update")]
     Update {
-        #[serde(deserialize_with = "deserialize_sz_dec")]
-        _orig_sz: i64,
-        #[serde(deserialize_with = "deserialize_sz_dec")]
-        new_sz: i64,
+        #[serde(rename = "origSz")]
+        orig_sz: String,
+        #[serde(rename = "newSz")]
+        new_sz: String,
     },
     #[serde(alias = "Remove")]
     Remove,
 }
 
 #[derive(Deserialize)]
+struct FillEvent(String, FillLite);
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FillLite {
     coin: String,
+    px: String,
+    sz: String,
     side: String,
-    #[serde(deserialize_with = "deserialize_px_dec")]
-    px: i64,
-    #[serde(deserialize_with = "deserialize_sz_dec")]
-    sz: i64,
+    time: u64,
+    start_position: String,
+    dir: String,
+    closed_pnl: String,
+    hash: String,
+    oid: u64,
     crossed: bool,
+    fee: String,
+    tid: u64,
+    fee_token: String,
+    twap_id: Option<u64>,
 }
 
 #[derive(Debug)]
 struct StatusOut {
+    coin: String,
+    local_time: String,
     status: String,
     oid: u64,
     side: String,
     limit_px: i64,
     is_trigger: bool,
     tif: String,
+    // Full
+    user: String,
+    hash: String,
+    order_type: String,
+    sz: i64,
+    orig_sz: i64,
+    time: String,
+    builder: String,
+    timestamp: i64,
+    trigger_condition: String,
+    trigger_px: i64,
+    is_position_tpsl: bool,
+    reduce_only: bool,
+    cloid: String,
+    raw_event: String,
 }
 
 #[derive(Debug)]
 struct DiffOut {
+    coin: String,
+    local_time: String,
     oid: u64,
     diff_type: u8,
     sz: i64,
+    // Full
+    user: String,
+    side: String,
+    px: i64,
+    orig_sz: i64,
+    raw_event: String,
 }
 
 #[derive(Debug)]
 struct FillOut {
+    coin: String,
+    local_time: String,
     side: String,
     px: i64,
     sz: i64,
     crossed: bool,
+    // Full
+    address: String,
+    closed_pnl: i64,
+    fee: i64,
+    hash: String,
+    oid: u64,
+    tid: u64,
+    time: i64,
+    start_position: i64,
+    dir: String,
+    fee_token: String,
+    twap_id: i64,
+    raw_event: String,
 }
 
 #[derive(Clone, Copy)]
@@ -168,7 +329,7 @@ impl ParquetStreamWriter {
         Self { stream, schema, props, file: None }
     }
 
-    fn ensure_open(&mut self, coin: &str, block: u64) -> parquet::errors::Result<()> {
+    fn ensure_open(&mut self, coin: &str, mode: ArchiveMode, block: u64) -> parquet::errors::Result<()> {
         let (start, end) = rotation_bounds(block);
         let needs_open = match self.file.as_ref() {
             Some(current) => current.start_block != start,
@@ -176,15 +337,19 @@ impl ParquetStreamWriter {
         };
         if needs_open {
             self.close()?;
-            self.open_file(coin, start, end)?;
+            self.open_file(coin, mode, start, end)?;
         }
         Ok(())
     }
 
-    fn open_file(&mut self, coin: &str, start: u64, end: u64) -> parquet::errors::Result<()> {
-        let dir = PathBuf::from(ARCHIVE_BASE_DIR).join(coin).join(self.stream.name());
+    fn open_file(&mut self, coin: &str, mode: ArchiveMode, start: u64, end: u64) -> parquet::errors::Result<()> {
+        let coin_dir = match mode {
+            ArchiveMode::Lite => coin.to_string(),
+            ArchiveMode::Full => format!("{coin}_full"),
+        };
+        let dir = current_archive_base_dir().join(coin_dir).join(self.stream.name());
         fs::create_dir_all(&dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-        let filename = format!("{start}_{end}.parquet");
+        let filename = format!("{}_{}_{start}_{end}.parquet", coin, self.stream.name());
         let path = dir.join(filename);
         let file = fs::File::create(&path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
         let writer = SerializedFileWriter::new(file, self.schema.clone(), self.props.clone())?;
@@ -207,12 +372,13 @@ struct CoinWriters {
 }
 
 struct ArchiveWriters {
-    btc: CoinWriters,
-    eth: CoinWriters,
+    coins: HashMap<String, CoinWriters>,
+    symbols: Vec<String>,
+    mode: ArchiveMode,
 }
 
 impl ArchiveWriters {
-    fn new() -> Self {
+    fn new(mode: ArchiveMode, symbols: Vec<String>) -> Self {
         let zstd_level = ZstdLevel::try_new(3).unwrap_or_default();
         let props = std::sync::Arc::new(
             WriterProperties::builder()
@@ -221,88 +387,158 @@ impl ArchiveWriters {
                 .build(),
         );
 
-        let status_schema = std::sync::Arc::new(
-            parse_message_type(
+        let (status_schema_str, diff_schema_str, fill_schema_str) = match mode {
+            ArchiveMode::Lite => (
                 "message status_schema {\n\
                     REQUIRED INT64 block_number;\n\
+                    REQUIRED BINARY local_time (UTF8);\n\
                     REQUIRED BINARY block_time (UTF8);\n\
                     REQUIRED BINARY status (UTF8);\n\
                     REQUIRED INT64 oid;\n\
                     REQUIRED BINARY side (UTF8);\n\
-                    REQUIRED INT64 limit_px (DECIMAL(7, 1));\n\
-                    REQUIRED BOOLEAN is_trigger;\n\
-                    REQUIRED BINARY tif (UTF8);\n\
+                    REQUIRED INT64 limit_px (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 orig_sz (DECIMAL(18, 8));\n\
                 }",
-            )
-            .expect("invalid status schema"),
-        );
-        let diff_schema = std::sync::Arc::new(
-            parse_message_type(
                 "message diff_schema {\n\
                     REQUIRED INT64 block_number;\n\
+                    REQUIRED BINARY local_time (UTF8);\n\
                     REQUIRED BINARY block_time (UTF8);\n\
                     REQUIRED INT64 oid;\n\
+                    REQUIRED BINARY side (UTF8);\n\
+                    REQUIRED INT64 px (DECIMAL(18, 8));\n\
                     REQUIRED INT32 diff_type;\n\
-                    REQUIRED INT64 sz (DECIMAL(8, 2));\n\
+                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 orig_sz (DECIMAL(18, 8));\n\
                 }",
-            )
-            .expect("invalid diff schema"),
-        );
-        let fill_schema = std::sync::Arc::new(
-            parse_message_type(
                 "message fill_schema {\n\
                     REQUIRED INT64 block_number;\n\
+                    REQUIRED BINARY local_time (UTF8);\n\
                     REQUIRED BINARY block_time (UTF8);\n\
                     REQUIRED BINARY side (UTF8);\n\
-                    REQUIRED INT64 px (DECIMAL(7, 1));\n\
-                    REQUIRED INT64 sz (DECIMAL(8, 2));\n\
+                    REQUIRED INT64 px (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
                     REQUIRED BOOLEAN crossed;\n\
+                    REQUIRED INT64 time;\n\
                 }",
-            )
-            .expect("invalid fill schema"),
-        );
+            ),
+            ArchiveMode::Full => (
+                "message status_schema {\n\
+                    REQUIRED INT64 block_number;\n\
+                    REQUIRED BINARY local_time (UTF8);\n\
+                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED BINARY coin (UTF8);\n\
+                    REQUIRED BINARY status (UTF8);\n\
+                    REQUIRED INT64 oid;\n\
+                    REQUIRED BINARY side (UTF8);\n\
+                    REQUIRED INT64 limit_px (DECIMAL(18, 8));\n\
+                    REQUIRED BOOLEAN is_trigger;\n\
+                    REQUIRED BINARY tif (UTF8);\n\
+                    REQUIRED BINARY user (UTF8);\n\
+                    REQUIRED BINARY hash (UTF8);\n\
+                    REQUIRED BINARY order_type (UTF8);\n\
+                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 orig_sz (DECIMAL(18, 8));\n\
+                    REQUIRED BINARY time (UTF8);\n\
+                    REQUIRED BINARY builder (UTF8);\n\
+                    REQUIRED INT64 timestamp;\n\
+                    REQUIRED BINARY trigger_condition (UTF8);\n\
+                    REQUIRED INT64 trigger_px (DECIMAL(18, 8));\n\
+                    REQUIRED BOOLEAN is_position_tpsl;\n\
+                    REQUIRED BOOLEAN reduce_only;\n\
+                    REQUIRED BINARY cloid (UTF8);\n\
+                    REQUIRED BINARY raw_event (UTF8);\n\
+                }",
+                "message diff_schema {\n\
+                    REQUIRED INT64 block_number;\n\
+                    REQUIRED BINARY local_time (UTF8);\n\
+                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED BINARY coin (UTF8);\n\
+                    REQUIRED INT64 oid;\n\
+                    REQUIRED INT32 diff_type;\n\
+                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                    REQUIRED BINARY user (UTF8);\n\
+                    REQUIRED BINARY side (UTF8);\n\
+                    REQUIRED INT64 px (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 orig_sz (DECIMAL(18, 8));\n\
+                    REQUIRED BINARY raw_event (UTF8);\n\
+                }",
+                "message fill_schema {\n\
+                    REQUIRED INT64 block_number;\n\
+                    REQUIRED BINARY local_time (UTF8);\n\
+                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED BINARY coin (UTF8);\n\
+                    REQUIRED BINARY side (UTF8);\n\
+                    REQUIRED INT64 px (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                    REQUIRED BOOLEAN crossed;\n\
+                    REQUIRED BINARY address (UTF8);\n\
+                    REQUIRED INT64 closed_pnl (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 fee (DECIMAL(18, 8));\n\
+                    REQUIRED BINARY hash (UTF8);\n\
+                    REQUIRED INT64 oid;\n\
+                    REQUIRED INT64 tid;\n\
+                    REQUIRED INT64 time;\n\
+                    REQUIRED INT64 start_position (DECIMAL(18, 8));\n\
+                    REQUIRED BINARY dir (UTF8);\n\
+                    REQUIRED BINARY fee_token (UTF8);\n\
+                    REQUIRED INT64 twap_id;\n\
+                    REQUIRED BINARY raw_event (UTF8);\n\
+                }",
+            ),
+        };
+
+        let status_schema = std::sync::Arc::new(parse_message_type(status_schema_str).expect("invalid status schema"));
+        let diff_schema = std::sync::Arc::new(parse_message_type(diff_schema_str).expect("invalid diff schema"));
+        let fill_schema = std::sync::Arc::new(parse_message_type(fill_schema_str).expect("invalid fill schema"));
+
+        let mut coins = HashMap::new();
+        for coin in &symbols {
+            coins.insert(
+                coin.clone(),
+                CoinWriters {
+                    status: ParquetStreamWriter::new(StreamKind::Status, status_schema.clone(), props.clone()),
+                    diff: ParquetStreamWriter::new(StreamKind::Diff, diff_schema.clone(), props.clone()),
+                    fill: ParquetStreamWriter::new(StreamKind::Fill, fill_schema.clone(), props.clone()),
+                },
+            );
+        }
 
         Self {
-            btc: CoinWriters {
-                status: ParquetStreamWriter::new(StreamKind::Status, status_schema.clone(), props.clone()),
-                diff: ParquetStreamWriter::new(StreamKind::Diff, diff_schema.clone(), props.clone()),
-                fill: ParquetStreamWriter::new(StreamKind::Fill, fill_schema.clone(), props.clone()),
-            },
-            eth: CoinWriters {
-                status: ParquetStreamWriter::new(StreamKind::Status, status_schema, props.clone()),
-                diff: ParquetStreamWriter::new(StreamKind::Diff, diff_schema, props.clone()),
-                fill: ParquetStreamWriter::new(StreamKind::Fill, fill_schema, props),
-            },
+            coins,
+            symbols,
+            mode,
         }
     }
 
     fn coin_mut(&mut self, coin: &str) -> Option<&mut CoinWriters> {
-        match coin {
-            "BTC" => Some(&mut self.btc),
-            "ETH" => Some(&mut self.eth),
-            _ => None,
-        }
+        self.coins.get_mut(coin)
+    }
+
+    fn has_coin(&self, coin: &str) -> bool {
+        self.coins.contains_key(coin)
     }
 
     fn close_all(&mut self) -> parquet::errors::Result<()> {
-        self.btc.status.close()?;
-        self.btc.diff.close()?;
-        self.btc.fill.close()?;
-        self.eth.status.close()?;
-        self.eth.diff.close()?;
-        self.eth.fill.close()?;
+        for writers in self.coins.values_mut() {
+            writers.status.close()?;
+            writers.diff.close()?;
+            writers.fill.close()?;
+        }
         Ok(())
     }
 }
 
 fn rotation_bounds(block: u64) -> (u64, u64) {
-    let start = ((block.saturating_sub(1)) / ROTATION_BLOCKS) * ROTATION_BLOCKS + 1;
-    let end = start + ROTATION_BLOCKS - 1;
+    let rotation = ROTATION_BLOCKS.load(Ordering::SeqCst);
+    let start = ((block.saturating_sub(1)) / rotation) * rotation + 1;
+    let end = start + rotation - 1;
     (start, end)
 }
 
-fn is_target_coin(coin: &str) -> bool {
-    coin == "BTC" || coin == "ETH"
+fn is_rotation_start(block: u64) -> bool {
+    let (start, _) = rotation_bounds(block);
+    start == block
 }
 
 fn parse_scaled(value: &str, scale: u32) -> Option<i64> {
@@ -324,6 +560,8 @@ fn parse_scaled(value: &str, scale: u32) -> Option<i64> {
     let mut frac_digits: u32 = 0;
     let mut seen_dot = false;
     let mut round_up = false;
+    let mut precision_lost = false;
+
     while idx < bytes.len() {
         let b = bytes[idx];
         if b.is_ascii_digit() {
@@ -333,8 +571,13 @@ fn parse_scaled(value: &str, scale: u32) -> Option<i64> {
             } else if frac_digits < scale {
                 frac_part = frac_part.saturating_mul(10).saturating_add(digit);
                 frac_digits += 1;
-            } else if !round_up && digit >= 5 {
-                round_up = true;
+            } else {
+                if digit > 0 {
+                    precision_lost = true;
+                }
+                if !round_up && digit >= 5 {
+                    round_up = true;
+                }
             }
             idx += 1;
             continue;
@@ -346,6 +589,11 @@ fn parse_scaled(value: &str, scale: u32) -> Option<i64> {
         }
         return None;
     }
+
+    if precision_lost {
+        warn!("Precision loss: truncated '{}' to {} decimal places", s, scale);
+    }
+
     while frac_digits < scale {
         frac_part = frac_part.saturating_mul(10);
         frac_digits += 1;
@@ -366,112 +614,17 @@ fn parse_scaled(value: &str, scale: u32) -> Option<i64> {
     Some(value)
 }
 
-fn deserialize_px_dec<'de, D>(deserializer: D) -> Result<i64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct PxVisitor;
-
-    impl serde::de::Visitor<'_> for PxVisitor {
-        type Value = i64;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("string or number for px")
-        }
-
-        fn visit_str<E>(self, v: &str) -> Result<i64, E>
-        where
-            E: serde::de::Error,
-        {
-            parse_scaled(v, 1).ok_or_else(|| E::custom("invalid px"))
-        }
-
-        fn visit_string<E>(self, v: String) -> Result<i64, E>
-        where
-            E: serde::de::Error,
-        {
-            self.visit_str(&v)
-        }
-
-        fn visit_f64<E>(self, v: f64) -> Result<i64, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok((v * 10.0).round() as i64)
-        }
-
-        fn visit_u64<E>(self, v: u64) -> Result<i64, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok((v as i64).saturating_mul(10))
-        }
-
-        fn visit_i64<E>(self, v: i64) -> Result<i64, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(v.saturating_mul(10))
-        }
+fn flatten_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => String::new(),
+        _ => v.to_string(),
     }
-
-    deserializer.deserialize_any(PxVisitor)
-}
-
-fn deserialize_sz_dec<'de, D>(deserializer: D) -> Result<i64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    struct SzVisitor;
-
-    impl serde::de::Visitor<'_> for SzVisitor {
-        type Value = i64;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("string or number for sz")
-        }
-
-        fn visit_str<E>(self, v: &str) -> Result<i64, E>
-        where
-            E: serde::de::Error,
-        {
-            parse_scaled(v, 2).ok_or_else(|| E::custom("invalid sz"))
-        }
-
-        fn visit_string<E>(self, v: String) -> Result<i64, E>
-        where
-            E: serde::de::Error,
-        {
-            self.visit_str(&v)
-        }
-
-        fn visit_f64<E>(self, v: f64) -> Result<i64, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok((v * 100.0).round() as i64)
-        }
-
-        fn visit_u64<E>(self, v: u64) -> Result<i64, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok((v as i64).saturating_mul(100))
-        }
-
-        fn visit_i64<E>(self, v: i64) -> Result<i64, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(v.saturating_mul(100))
-        }
-    }
-
-    deserializer.deserialize_any(SzVisitor)
 }
 
 fn write_status_rows(
     file: &mut SerializedFileWriter<std::fs::File>,
+    mode: ArchiveMode,
     block_number: u64,
     block_time: &str,
     rows: &[StatusOut],
@@ -482,62 +635,233 @@ fn write_status_rows(
     let mut row_group = file.next_row_group()?;
 
     let block_numbers = vec![block_number as i64; rows.len()];
+    let local_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.local_time.as_bytes())).collect();
     let block_times: Vec<ByteArray> =
         std::iter::repeat(block_time.as_bytes()).take(rows.len()).map(ByteArray::from).collect();
     let statuses: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.status.as_bytes())).collect();
     let oids: Vec<i64> = rows.iter().map(|r| r.oid as i64).collect();
     let sides: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.side.as_bytes())).collect();
     let limit_px: Vec<i64> = rows.iter().map(|r| r.limit_px).collect();
-    let is_trigger: Vec<bool> = rows.iter().map(|r| r.is_trigger).collect();
-    let tifs: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.tif.as_bytes())).collect();
+    let sizes: Vec<i64> = rows.iter().map(|r| r.sz).collect();
+    let orig_sizes: Vec<i64> = rows.iter().map(|r| r.orig_sz).collect();
 
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_numbers, None, None)?;
+    if mode == ArchiveMode::Lite {
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_numbers, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_times, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&local_times, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&statuses, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_times, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&oids, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&statuses, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&sides, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&oids, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&limit_px, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sides, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&is_trigger, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&limit_px, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&tifs, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sizes, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&orig_sizes, None, None)?;
+            }
+            col.close()?;
+        }
+    } else {
+        let coins: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.coin.as_bytes())).collect();
+        let is_trigger: Vec<bool> = rows.iter().map(|r| r.is_trigger).collect();
+        let tifs: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.tif.as_bytes())).collect();
+        let users: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.user.as_bytes())).collect();
+        let hashes: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.hash.as_bytes())).collect();
+        let order_types: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.order_type.as_bytes())).collect();
+        let times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.time.as_bytes())).collect();
+        let builders: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.builder.as_bytes())).collect();
+        let timestamps: Vec<i64> = rows.iter().map(|r| r.timestamp).collect();
+        let trigger_conditions: Vec<ByteArray> =
+            rows.iter().map(|r| ByteArray::from(r.trigger_condition.as_bytes())).collect();
+        let trigger_pxs: Vec<i64> = rows.iter().map(|r| r.trigger_px).collect();
+        let is_position_tpsls: Vec<bool> = rows.iter().map(|r| r.is_position_tpsl).collect();
+        let reduce_onlys: Vec<bool> = rows.iter().map(|r| r.reduce_only).collect();
+        let cloids: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.cloid.as_bytes())).collect();
+        let raw_events: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.raw_event.as_bytes())).collect();
+
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_numbers, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&local_times, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_times, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&coins, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&statuses, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&oids, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sides, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&limit_px, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&is_trigger, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&tifs, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&users, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&hashes, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&order_types, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sizes, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&orig_sizes, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&times, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&builders, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&timestamps, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&trigger_conditions, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&trigger_pxs, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&is_position_tpsls, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&reduce_onlys, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&cloids, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&raw_events, None, None)?;
+            }
+            col.close()?;
+        }
     }
 
     row_group.close()?;
@@ -546,6 +870,7 @@ fn write_status_rows(
 
 fn write_diff_rows(
     file: &mut SerializedFileWriter<std::fs::File>,
+    mode: ArchiveMode,
     block_number: u64,
     block_time: &str,
     rows: &[DiffOut],
@@ -556,41 +881,148 @@ fn write_diff_rows(
     let mut row_group = file.next_row_group()?;
 
     let block_numbers = vec![block_number as i64; rows.len()];
+    let local_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.local_time.as_bytes())).collect();
     let block_times: Vec<ByteArray> =
         std::iter::repeat(block_time.as_bytes()).take(rows.len()).map(ByteArray::from).collect();
     let oids: Vec<i64> = rows.iter().map(|r| r.oid as i64).collect();
+    let sides: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.side.as_bytes())).collect();
+    let pxs: Vec<i64> = rows.iter().map(|r| r.px).collect();
     let diff_types: Vec<i32> = rows.iter().map(|r| i32::from(r.diff_type)).collect();
     let sizes: Vec<i64> = rows.iter().map(|r| r.sz).collect();
+    let orig_szs: Vec<i64> = rows.iter().map(|r| r.orig_sz).collect();
 
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_numbers, None, None)?;
+    if mode == ArchiveMode::Lite {
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_numbers, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_times, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&local_times, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&oids, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_times, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&diff_types, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&oids, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&sizes, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sides, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&pxs, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&diff_types, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sizes, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&orig_szs, None, None)?;
+            }
+            col.close()?;
+        }
+    } else {
+        let coins: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.coin.as_bytes())).collect();
+        let users: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.user.as_bytes())).collect();
+        let raw_events: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.raw_event.as_bytes())).collect();
+
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_numbers, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&local_times, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_times, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&coins, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&oids, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&diff_types, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sizes, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&users, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sides, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&pxs, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&orig_szs, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&raw_events, None, None)?;
+            }
+            col.close()?;
+        }
     }
 
     row_group.close()?;
@@ -599,6 +1031,7 @@ fn write_diff_rows(
 
 fn write_fill_rows(
     file: &mut SerializedFileWriter<std::fs::File>,
+    mode: ArchiveMode,
     block_number: u64,
     block_time: &str,
     rows: &[FillOut],
@@ -609,48 +1042,198 @@ fn write_fill_rows(
     let mut row_group = file.next_row_group()?;
 
     let block_numbers = vec![block_number as i64; rows.len()];
+    let local_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.local_time.as_bytes())).collect();
     let block_times: Vec<ByteArray> =
         std::iter::repeat(block_time.as_bytes()).take(rows.len()).map(ByteArray::from).collect();
     let sides: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.side.as_bytes())).collect();
     let px: Vec<i64> = rows.iter().map(|r| r.px).collect();
     let sz: Vec<i64> = rows.iter().map(|r| r.sz).collect();
     let crossed: Vec<bool> = rows.iter().map(|r| r.crossed).collect();
+    let times: Vec<i64> = rows.iter().map(|r| r.time).collect();
 
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_numbers, None, None)?;
+    if mode == ArchiveMode::Lite {
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_numbers, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_times, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&local_times, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&sides, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_times, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&px, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sides, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&sz, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&px, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&crossed, None, None)?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sz, None, None)?;
+            }
+            col.close()?;
         }
-        col.close()?;
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&crossed, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&times, None, None)?;
+            }
+            col.close()?;
+        }
+    } else {
+        let coins: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.coin.as_bytes())).collect();
+        let addresses: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.address.as_bytes())).collect();
+        let pnls: Vec<i64> = rows.iter().map(|r| r.closed_pnl).collect();
+        let fees: Vec<i64> = rows.iter().map(|r| r.fee).collect();
+        let hashes: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.hash.as_bytes())).collect();
+        let oids: Vec<i64> = rows.iter().map(|r| r.oid as i64).collect();
+        let tids: Vec<i64> = rows.iter().map(|r| r.tid as i64).collect();
+        let start_positions: Vec<i64> = rows.iter().map(|r| r.start_position).collect();
+        let dirs: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.dir.as_bytes())).collect();
+        let fee_tokens: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.fee_token.as_bytes())).collect();
+        let twap_ids: Vec<i64> = rows.iter().map(|r| r.twap_id).collect();
+        let raw_events: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.raw_event.as_bytes())).collect();
+
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_numbers, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&local_times, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_times, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&coins, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sides, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&px, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sz, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&crossed, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&addresses, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&pnls, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&fees, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&hashes, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&oids, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&tids, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&times, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&start_positions, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&dirs, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&fee_tokens, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&twap_ids, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&raw_events, None, None)?;
+            }
+            col.close()?;
+        }
     }
 
     row_group.close()?;
@@ -658,19 +1241,40 @@ fn write_fill_rows(
 }
 
 pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBool>) {
-    let mut writers = ArchiveWriters::new();
+    let mut writers: Option<ArchiveWriters> = None;
+    let mut current_mode: Option<ArchiveMode> = None;
+    let mut current_symbols = current_archive_symbols();
+    let mut waiting_for_rotation_start = false;
+    let mut pending_rotation_start: Option<u64> = None;
+
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
+
+        let mode = get_archive_mode();
+        let symbols = current_archive_symbols();
+        if mode != current_mode || symbols != current_symbols {
+            if let Some(mut w) = writers.take() {
+                w.close_all().ok();
+            }
+            writers = mode.map(|mode| ArchiveWriters::new(mode, symbols.clone()));
+            current_mode = mode;
+            current_symbols = symbols;
+            waiting_for_rotation_start = mode.is_some();
+            pending_rotation_start = None;
+        }
+
         let msg = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(msg) => msg,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        if !is_archive_enabled() {
+
+        let Some(writers) = writers.as_mut() else {
             continue;
-        }
+        };
+        let mode = writers.mode;
 
         let order_batch: BatchLite<OrderStatusLite> = match serde_json::from_slice(&msg.order_line) {
             Ok(batch) => batch,
@@ -679,6 +1283,17 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 continue;
             }
         };
+        let order_batch_raw: Option<BatchLite<serde_json::Value>> = if mode == ArchiveMode::Full {
+            match serde_json::from_slice(&msg.order_line) {
+                Ok(batch) => Some(batch),
+                Err(err) => {
+                    warn!("Archive parse error for raw order batch at {}: {err}", msg.block_number);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let diff_batch: BatchLite<DiffLite> = match serde_json::from_slice(&msg.diffs_line) {
             Ok(batch) => batch,
             Err(err) => {
@@ -686,12 +1301,34 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 continue;
             }
         };
-        let fill_batch: BatchLite<FillLite> = match serde_json::from_slice(&msg.fills_line) {
+        let diff_batch_raw: Option<BatchLite<serde_json::Value>> = if mode == ArchiveMode::Full {
+            match serde_json::from_slice(&msg.diffs_line) {
+                Ok(batch) => Some(batch),
+                Err(err) => {
+                    warn!("Archive parse error for raw diff batch at {}: {err}", msg.block_number);
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let fill_batch: BatchLite<FillEvent> = match serde_json::from_slice(&msg.fills_line) {
             Ok(batch) => batch,
             Err(err) => {
                 warn!("Archive parse error for fill batch at {}: {err}", msg.block_number);
                 continue;
             }
+        };
+        let fill_batch_raw: Option<BatchLite<serde_json::Value>> = if mode == ArchiveMode::Full {
+            match serde_json::from_slice(&msg.fills_line) {
+                Ok(batch) => Some(batch),
+                Err(err) => {
+                    warn!("Archive parse error for raw fill batch at {}: {err}", msg.block_number);
+                    continue;
+                }
+            }
+        } else {
+            None
         };
 
         let height = order_batch.block_number;
@@ -702,121 +1339,252 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             );
             continue;
         }
-        let block_time = order_batch.block_time;
 
-        let mut status_btc = Vec::new();
-        let mut status_eth = Vec::new();
-        for status in order_batch.events {
-            let OrderLite { coin, side, oid, limit_px, is_trigger, tif } = status.order;
-            if !is_target_coin(&coin) {
+        if waiting_for_rotation_start {
+            if !is_rotation_start(height) {
+                let (_, current_end) = rotation_bounds(height);
+                let next_rotation_start = current_end.saturating_add(1);
+                if pending_rotation_start != Some(next_rotation_start) {
+                    warn!(
+                        "Archive enabled mid-window at block {}; waiting for next rotation start {} before creating parquet files",
+                        height, next_rotation_start
+                    );
+                    pending_rotation_start = Some(next_rotation_start);
+                }
                 continue;
             }
-            let out =
-                StatusOut { status: status.status, oid, side, limit_px, is_trigger, tif: tif.unwrap_or_default() };
-            match coin.as_str() {
-                "BTC" => status_btc.push(out),
-                "ETH" => status_eth.push(out),
-                _ => {}
-            }
+            waiting_for_rotation_start = false;
+            pending_rotation_start = None;
         }
 
-        let mut diff_btc = Vec::new();
-        let mut diff_eth = Vec::new();
-        for diff in diff_batch.events {
-            let DiffLite { oid, coin, raw_book_diff } = diff;
-            if !is_target_coin(&coin) {
+        let block_time = order_batch.block_time.clone();
+        let order_local_time = order_batch.local_time.clone();
+        let diff_local_time = diff_batch.local_time.clone();
+        let fill_local_time = fill_batch.local_time.clone();
+
+        let mut status_rows: HashMap<String, Vec<StatusOut>> = HashMap::new();
+        for (idx, status) in order_batch.events.into_iter().enumerate() {
+            let OrderLite {
+                coin,
+                side,
+                limit_px,
+                sz,
+                oid,
+                timestamp,
+                trigger_condition,
+                is_trigger,
+                trigger_px,
+                is_position_tpsl,
+                reduce_only,
+                order_type,
+                orig_sz,
+                tif,
+                cloid,
+            } = status.order;
+            if !writers.has_coin(&coin) {
                 continue;
             }
-            let (diff_type, sz) = match raw_book_diff {
-                RawDiffLite::New { sz } => (0u8, sz),
-                RawDiffLite::Update { new_sz, .. } => (1u8, new_sz),
-                RawDiffLite::Remove => (2u8, 0),
+            let (s_px, s_sz, s_orig, s_trig) = if mode == ArchiveMode::Full {
+                (
+                    parse_scaled(&limit_px, 8).unwrap_or(0),
+                    parse_scaled(&sz, 8).unwrap_or(0),
+                    parse_scaled(&orig_sz, 8).unwrap_or(0),
+                    parse_scaled(&trigger_px, 8).unwrap_or(0),
+                )
+            } else {
+                (
+                    parse_scaled(&limit_px, LITE_PRICE_SCALE).unwrap_or(0),
+                    parse_scaled(&sz, LITE_SIZE_SCALE).unwrap_or(0),
+                    parse_scaled(&orig_sz, LITE_SIZE_SCALE).unwrap_or(0),
+                    0,
+                )
             };
-            let out = DiffOut { oid, diff_type, sz };
-            match coin.as_str() {
-                "BTC" => diff_btc.push(out),
-                "ETH" => diff_eth.push(out),
-                _ => {}
-            }
+            let out = StatusOut {
+                coin: coin.clone(),
+                local_time: order_local_time.clone(),
+                status: status.status,
+                oid,
+                side,
+                limit_px: s_px,
+                is_trigger,
+                tif: tif.unwrap_or_default(),
+                user: status.user.unwrap_or_default(),
+                hash: flatten_to_string(&status.hash),
+                order_type,
+                sz: s_sz,
+                orig_sz: s_orig,
+                time: status.time,
+                builder: flatten_to_string(&status.builder),
+                timestamp: timestamp as i64,
+                trigger_condition,
+                trigger_px: s_trig,
+                is_position_tpsl,
+                reduce_only,
+                cloid: flatten_to_string(&cloid),
+                raw_event: order_batch_raw
+                    .as_ref()
+                    .and_then(|batch| batch.events.get(idx))
+                    .map_or_else(String::new, serde_json::Value::to_string),
+            };
+            status_rows.entry(coin).or_default().push(out);
         }
 
-        let mut fill_btc = Vec::new();
-        let mut fill_eth = Vec::new();
-        for fill in fill_batch.events {
-            let FillLite { coin, side, px, sz, crossed } = fill;
-            if !is_target_coin(&coin) {
+        let mut diff_rows: HashMap<String, Vec<DiffOut>> = HashMap::new();
+        for (idx, diff) in diff_batch.events.into_iter().enumerate() {
+            let DiffLite { user, oid, coin, side, px, raw_book_diff } = diff;
+            if !writers.has_coin(&coin) {
                 continue;
             }
-            let out = FillOut { side, px, sz, crossed };
-            match coin.as_str() {
-                "BTC" => fill_btc.push(out),
-                "ETH" => fill_eth.push(out),
-                _ => {}
-            }
+            let (d_px, d_sz, d_orig, diff_type) = if mode == ArchiveMode::Full {
+                let (dt, sz, osz) = match raw_book_diff {
+                    RawDiffLite::New { sz } => (0u8, parse_scaled(&sz, 8).unwrap_or(0), 0i64),
+                    RawDiffLite::Update { orig_sz, new_sz } => {
+                        (1u8, parse_scaled(&new_sz, 8).unwrap_or(0), parse_scaled(&orig_sz, 8).unwrap_or(0))
+                    }
+                    RawDiffLite::Remove => (2u8, 0, 0),
+                };
+                (parse_scaled(&px, 8).unwrap_or(0), sz, osz, dt)
+            } else {
+                let (dt, sz, osz) = match raw_book_diff {
+                    RawDiffLite::New { sz } => (0u8, parse_scaled(&sz, LITE_SIZE_SCALE).unwrap_or(0), 0i64),
+                    RawDiffLite::Update { orig_sz, new_sz } => {
+                        (
+                            1u8,
+                            parse_scaled(&new_sz, LITE_SIZE_SCALE).unwrap_or(0),
+                            parse_scaled(&orig_sz, LITE_SIZE_SCALE).unwrap_or(0),
+                        )
+                    }
+                    RawDiffLite::Remove => (2u8, 0, 0),
+                };
+                (parse_scaled(&px, LITE_PRICE_SCALE).unwrap_or(0), sz, osz, dt)
+            };
+            let out = DiffOut {
+                coin: coin.clone(),
+                local_time: diff_local_time.clone(),
+                oid,
+                diff_type,
+                sz: d_sz,
+                user,
+                side,
+                px: d_px,
+                orig_sz: d_orig,
+                raw_event: diff_batch_raw
+                    .as_ref()
+                    .and_then(|batch| batch.events.get(idx))
+                    .map_or_else(String::new, serde_json::Value::to_string),
+            };
+            diff_rows.entry(coin).or_default().push(out);
         }
 
-        if let Some(coin_writers) = writers.coin_mut("BTC") {
-            if let Err(err) = coin_writers.status.ensure_open("BTC", height).and_then(|_| {
-                if let Some(file) = coin_writers.status.file.as_mut() {
-                    write_status_rows(&mut file.writer, height, &block_time, &status_btc)
-                } else {
-                    Ok(())
-                }
-            }) {
-                warn!("Archive write status BTC failed at {}: {err}", height);
+        let mut fill_rows: HashMap<String, Vec<FillOut>> = HashMap::new();
+        for (idx, fill_event) in fill_batch.events.into_iter().enumerate() {
+            let FillEvent(address, fill_data) = fill_event;
+            let FillLite {
+                coin,
+                px,
+                sz,
+                side,
+                time,
+                start_position,
+                dir,
+                closed_pnl,
+                hash,
+                oid,
+                crossed,
+                fee,
+                tid,
+                fee_token,
+                twap_id,
+                ..
+            } = fill_data;
+            if !writers.has_coin(&coin) {
+                continue;
             }
-            if let Err(err) = coin_writers.diff.ensure_open("BTC", height).and_then(|_| {
-                if let Some(file) = coin_writers.diff.file.as_mut() {
-                    write_diff_rows(&mut file.writer, height, &block_time, &diff_btc)
-                } else {
-                    Ok(())
-                }
-            }) {
-                warn!("Archive write diff BTC failed at {}: {err}", height);
-            }
-            if let Err(err) = coin_writers.fill.ensure_open("BTC", height).and_then(|_| {
-                if let Some(file) = coin_writers.fill.file.as_mut() {
-                    write_fill_rows(&mut file.writer, height, &block_time, &fill_btc)
-                } else {
-                    Ok(())
-                }
-            }) {
-                warn!("Archive write fill BTC failed at {}: {err}", height);
-            }
+            let (f_px, f_sz, f_pnl, f_fee, f_start) = if mode == ArchiveMode::Full {
+                (
+                    parse_scaled(&px, 8).unwrap_or(0),
+                    parse_scaled(&sz, 8).unwrap_or(0),
+                    parse_scaled(&closed_pnl, 8).unwrap_or(0),
+                    parse_scaled(&fee, 8).unwrap_or(0),
+                    parse_scaled(&start_position, 8).unwrap_or(0),
+                )
+            } else {
+                (
+                    parse_scaled(&px, LITE_PRICE_SCALE).unwrap_or(0),
+                    parse_scaled(&sz, LITE_SIZE_SCALE).unwrap_or(0),
+                    0,
+                    0,
+                    0,
+                )
+            };
+            let out = FillOut {
+                coin: coin.clone(),
+                local_time: fill_local_time.clone(),
+                side,
+                px: f_px,
+                sz: f_sz,
+                crossed,
+                address,
+                closed_pnl: f_pnl,
+                fee: f_fee,
+                hash,
+                oid,
+                tid,
+                time: time as i64,
+                start_position: f_start,
+                dir,
+                fee_token,
+                twap_id: twap_id.unwrap_or(0) as i64,
+                raw_event: fill_batch_raw
+                    .as_ref()
+                    .and_then(|batch| batch.events.get(idx))
+                    .map_or_else(String::new, serde_json::Value::to_string),
+            };
+            fill_rows.entry(coin).or_default().push(out);
         }
 
-        if let Some(coin_writers) = writers.coin_mut("ETH") {
-            if let Err(err) = coin_writers.status.ensure_open("ETH", height).and_then(|_| {
-                if let Some(file) = coin_writers.status.file.as_mut() {
-                    write_status_rows(&mut file.writer, height, &block_time, &status_eth)
-                } else {
-                    Ok(())
+        for coin in writers.symbols.clone() {
+            if let Some(coin_writers) = writers.coin_mut(&coin) {
+                if let Some(rows) = status_rows.get(&coin).filter(|rows| !rows.is_empty()) {
+                    if let Err(err) = coin_writers.status.ensure_open(&coin, mode, height).and_then(|_| {
+                        if let Some(file) = coin_writers.status.file.as_mut() {
+                            write_status_rows(&mut file.writer, mode, height, &block_time, rows)
+                        } else {
+                            Ok(())
+                        }
+                    }) {
+                        warn!("Archive write status {} failed at {}: {err}", coin, height);
+                    }
                 }
-            }) {
-                warn!("Archive write status ETH failed at {}: {err}", height);
-            }
-            if let Err(err) = coin_writers.diff.ensure_open("ETH", height).and_then(|_| {
-                if let Some(file) = coin_writers.diff.file.as_mut() {
-                    write_diff_rows(&mut file.writer, height, &block_time, &diff_eth)
-                } else {
-                    Ok(())
+                if let Some(rows) = diff_rows.get(&coin).filter(|rows| !rows.is_empty()) {
+                    if let Err(err) = coin_writers.diff.ensure_open(&coin, mode, height).and_then(|_| {
+                        if let Some(file) = coin_writers.diff.file.as_mut() {
+                            write_diff_rows(&mut file.writer, mode, height, &block_time, rows)
+                        } else {
+                            Ok(())
+                        }
+                    }) {
+                        warn!("Archive write diff {} failed at {}: {err}", coin, height);
+                    }
                 }
-            }) {
-                warn!("Archive write diff ETH failed at {}: {err}", height);
-            }
-            if let Err(err) = coin_writers.fill.ensure_open("ETH", height).and_then(|_| {
-                if let Some(file) = coin_writers.fill.file.as_mut() {
-                    write_fill_rows(&mut file.writer, height, &block_time, &fill_eth)
-                } else {
-                    Ok(())
+                if let Some(rows) = fill_rows.get(&coin).filter(|rows| !rows.is_empty()) {
+                    if let Err(err) = coin_writers.fill.ensure_open(&coin, mode, height).and_then(|_| {
+                        if let Some(file) = coin_writers.fill.file.as_mut() {
+                            write_fill_rows(&mut file.writer, mode, height, &block_time, rows)
+                        } else {
+                            Ok(())
+                        }
+                    }) {
+                        warn!("Archive write fill {} failed at {}: {err}", coin, height);
+                    }
                 }
-            }) {
-                warn!("Archive write fill ETH failed at {}: {err}", height);
             }
         }
     }
 
-    if let Err(err) = writers.close_all() {
-        warn!("Archive writer close failed: {err}");
+    if let Some(mut w) = writers {
+        if let Err(err) = w.close_all() {
+            warn!("Archive writer close failed: {err}");
+        }
     }
 }
