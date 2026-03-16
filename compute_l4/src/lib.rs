@@ -957,10 +957,7 @@ fn find_existing_snapshot_index_path(output_dir: &Path) -> AppResult<Option<Path
 }
 
 fn snapshot_index_filename(index: &DatasetIndex) -> String {
-    let mut heights = index
-        .segments
-        .iter()
-        .flat_map(|segment| segment.entries.iter().map(|entry| entry.block_height));
+    let mut heights = index.segments.iter().flat_map(|segment| segment.entries.iter().map(|entry| entry.block_height));
     let Some(min_height) = heights.next() else {
         return "snapshot_index.json".to_string();
     };
