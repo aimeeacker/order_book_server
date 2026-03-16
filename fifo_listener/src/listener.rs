@@ -534,26 +534,39 @@ fn set_pipe_capacity(fd: i32, capacity: i32) -> std::io::Result<i32> {
     Ok(ret)
 }
 
-fn extract_block_number(bytes: &[u8]) -> Option<u64> {
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
+    let end = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map(|idx| idx + 1).unwrap_or(start);
+    &bytes[start..end]
+}
+
+fn parse_block_number(bytes: &[u8]) -> Result<u64, &'static str> {
+    let trimmed = trim_ascii_whitespace(bytes);
+    if trimmed.first() != Some(&b'{') || trimmed.last() != Some(&b'}') {
+        return Err("missing object boundary");
+    }
+
     const NEEDLE: &[u8] = b"\"block_number\":";
-    let pos = memmem::find(bytes, NEEDLE)?;
+    let pos = memmem::find(trimmed, NEEDLE).ok_or("missing block_number")?;
     let mut idx = pos + NEEDLE.len();
-    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+    while idx < trimmed.len() && trimmed[idx].is_ascii_whitespace() {
         idx += 1;
     }
+
     let mut value: u64 = 0;
     let mut found = false;
-    while idx < bytes.len() {
-        let b = bytes[idx];
-        if b.is_ascii_digit() {
+    while idx < trimmed.len() {
+        let byte = trimmed[idx];
+        if byte.is_ascii_digit() {
             found = true;
-            value = value * 10 + u64::from(b - b'0');
+            value = value.saturating_mul(10).saturating_add(u64::from(byte - b'0'));
             idx += 1;
         } else {
             break;
         }
     }
-    if found { Some(value) } else { None }
+
+    if found { Ok(value) } else { Err("invalid block_number") }
 }
 
 fn listen_fifo(
@@ -651,10 +664,13 @@ fn listen_fifo(
                         if line.is_empty() {
                             continue;
                         }
-                        let Some(height) = extract_block_number(&line) else {
-                            let preview = String::from_utf8_lossy(&line[..line.len().min(120)]);
-                            warn!("{source:?} missing block_number; payload head: {preview:?}");
-                            continue;
+                        let height = match parse_block_number(&line) {
+                            Ok(height) => height,
+                            Err(err) => {
+                                let preview = String::from_utf8_lossy(&line[..line.len().min(120)]);
+                                warn!("{source:?} dropping malformed json ({err}); payload head: {preview:?}");
+                                continue;
+                            }
                         };
                         if let Some(generation) = rollback.generation() {
                             if generation != rollback_generation {
@@ -903,4 +919,33 @@ pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<Liste
     threads.push(thread::spawn(move || run_aggregator(rx, agg_stop, callback, Some(archive_tx))));
 
     Ok(ListenerHandle { stop, stop_eventfd, threads })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_block_number;
+
+    #[test]
+    fn parse_block_number_accepts_complete_json_object() {
+        let line = br#" { "block_number": 123, "data": [] } "#;
+        assert_eq!(parse_block_number(line), Ok(123));
+    }
+
+    #[test]
+    fn parse_block_number_rejects_missing_object_boundary() {
+        let line = br#""block_number": 123"#;
+        assert_eq!(parse_block_number(line), Err("missing object boundary"));
+    }
+
+    #[test]
+    fn parse_block_number_rejects_non_numeric_block_number() {
+        let line = br#"{ "block_number": null, "data": [] }"#;
+        assert_eq!(parse_block_number(line), Err("invalid block_number"));
+    }
+
+    #[test]
+    fn parse_block_number_rejects_missing_block_number() {
+        let line = br#"{ "data": [] }"#;
+        assert_eq!(parse_block_number(line), Err("missing block_number"));
+    }
 }

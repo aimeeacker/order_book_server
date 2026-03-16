@@ -21,6 +21,8 @@ const ARCHIVE_BASE_DIR: &str = "/home/aimee/hl_runtime/dataset";
 const DEFAULT_ARCHIVE_SYMBOLS: &[&str] = &["BTC", "ETH"];
 const LITE_PRICE_SCALE: u32 = 8;
 const LITE_SIZE_SCALE: u32 = 8;
+const CHECKPOINT_BLOCKS: u64 = 10_000;
+const ROW_GROUP_BLOCKS: u64 = 5_000;
 static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
 static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
@@ -142,7 +144,7 @@ impl ArchiveBlock {
 #[derive(Deserialize)]
 struct BatchLite<T> {
     #[serde(rename = "local_time")]
-    local_time: String,
+    _local_time: String,
     #[serde(rename = "block_time")]
     block_time: String,
     #[serde(rename = "block_number")]
@@ -232,8 +234,9 @@ struct FillLite {
 
 #[derive(Debug)]
 struct StatusOut {
+    block_number: u64,
+    block_time: String,
     coin: String,
-    local_time: String,
     status: String,
     oid: u64,
     side: String,
@@ -259,8 +262,9 @@ struct StatusOut {
 
 #[derive(Debug)]
 struct DiffOut {
+    block_number: u64,
+    block_time: String,
     coin: String,
-    local_time: String,
     oid: u64,
     diff_type: u8,
     sz: i64,
@@ -274,8 +278,9 @@ struct DiffOut {
 
 #[derive(Debug)]
 struct FillOut {
+    block_number: u64,
+    block_time: String,
     coin: String,
-    local_time: String,
     side: String,
     px: i64,
     sz: i64,
@@ -295,8 +300,29 @@ struct FillOut {
     raw_event: String,
 }
 
+#[derive(Debug)]
+struct BlockIndexOut {
+    block_number: u64,
+    block_time: String,
+    order_batch_ok: bool,
+    diff_batch_ok: bool,
+    fill_batch_ok: bool,
+    order_n: i32,
+    diff_n: i32,
+    fill_n: i32,
+    btc_status_n: i32,
+    btc_diff_n: i32,
+    btc_fill_n: i32,
+    eth_status_n: i32,
+    eth_diff_n: i32,
+    eth_fill_n: i32,
+    archive_mode: String,
+    tracked_symbols: String,
+}
+
 #[derive(Clone, Copy)]
 enum StreamKind {
+    Blocks,
     Status,
     Diff,
     Fill,
@@ -305,6 +331,7 @@ enum StreamKind {
 impl StreamKind {
     fn name(self) -> &'static str {
         match self {
+            Self::Blocks => "blocks",
             Self::Status => "status",
             Self::Diff => "diff",
             Self::Fill => "fill",
@@ -317,39 +344,45 @@ struct ParquetFile {
     start_block: u64,
 }
 
-struct ParquetStreamWriter {
+struct ParquetStreamWriter<R> {
     stream: StreamKind,
     schema: std::sync::Arc<Type>,
     props: std::sync::Arc<WriterProperties>,
     file: Option<ParquetFile>,
+    pending_rows: Vec<R>,
+    pending_start_block: Option<u64>,
 }
 
-impl ParquetStreamWriter {
+impl<R> ParquetStreamWriter<R> {
     fn new(stream: StreamKind, schema: std::sync::Arc<Type>, props: std::sync::Arc<WriterProperties>) -> Self {
-        Self { stream, schema, props, file: None }
+        Self { stream, schema, props, file: None, pending_rows: Vec::new(), pending_start_block: None }
     }
 
     fn ensure_open(&mut self, coin: &str, mode: ArchiveMode, block: u64) -> parquet::errors::Result<()> {
-        let (start, end) = rotation_bounds(block);
-        let needs_open = match self.file.as_ref() {
-            Some(current) => current.start_block != start,
-            None => true,
-        };
-        if needs_open {
-            self.close()?;
+        if self.file.is_none() {
+            let (start, end) = rotation_bounds(block);
             self.open_file(coin, mode, start, end)?;
         }
         Ok(())
     }
 
     fn open_file(&mut self, coin: &str, mode: ArchiveMode, start: u64, end: u64) -> parquet::errors::Result<()> {
-        let coin_dir = match mode {
-            ArchiveMode::Lite => coin.to_string(),
-            ArchiveMode::Full => format!("{coin}_full"),
+        let (dir, filename) = match self.stream {
+            StreamKind::Blocks => {
+                (current_archive_base_dir().join(self.stream.name()), format!("blocks_{start}_{end}.parquet"))
+            }
+            _ => {
+                let coin_dir = match mode {
+                    ArchiveMode::Lite => coin.to_string(),
+                    ArchiveMode::Full => format!("{coin}_full"),
+                };
+                (
+                    current_archive_base_dir().join(coin_dir).join(self.stream.name()),
+                    format!("{}_{}_{start}_{end}.parquet", coin, self.stream.name()),
+                )
+            }
         };
-        let dir = current_archive_base_dir().join(coin_dir).join(self.stream.name());
         fs::create_dir_all(&dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-        let filename = format!("{}_{}_{start}_{end}.parquet", coin, self.stream.name());
         let path = dir.join(filename);
         let file = fs::File::create(&path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
         let writer = SerializedFileWriter::new(file, self.schema.clone(), self.props.clone())?;
@@ -363,15 +396,81 @@ impl ParquetStreamWriter {
         }
         Ok(())
     }
+
+    fn flush_pending<F>(&mut self, mode: ArchiveMode, write_rows: F) -> parquet::errors::Result<()>
+    where
+        F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+    {
+        if self.pending_rows.is_empty() {
+            self.pending_start_block = None;
+            return Ok(());
+        }
+        if let Some(file) = self.file.as_mut() {
+            write_rows(&mut file.writer, mode, &self.pending_rows)?;
+        }
+        self.pending_rows.clear();
+        self.pending_start_block = None;
+        Ok(())
+    }
+
+    fn advance_block<F>(&mut self, mode: ArchiveMode, block: u64, write_rows: F) -> parquet::errors::Result<()>
+    where
+        F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+    {
+        let current_start = self.file.as_ref().map(|current| current.start_block);
+        let next_start = rotation_bounds(block).0;
+        if current_start.is_some_and(|start| start != next_start) {
+            self.flush_pending(mode, write_rows)?;
+            self.close()?;
+        }
+        if self.pending_start_block.is_some_and(|start| block.saturating_sub(start) + 1 >= ROW_GROUP_BLOCKS) {
+            self.flush_pending(mode, write_rows)?;
+        }
+        Ok(())
+    }
+
+    fn append_rows<F>(
+        &mut self,
+        coin: &str,
+        mode: ArchiveMode,
+        block: u64,
+        rows: Vec<R>,
+        write_rows: F,
+    ) -> parquet::errors::Result<()>
+    where
+        F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+    {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.ensure_open(coin, mode, block)?;
+        if self.pending_start_block.is_none() {
+            self.pending_start_block = Some(block);
+        }
+        self.pending_rows.extend(rows);
+        if self.pending_start_block.is_some_and(|start| block.saturating_sub(start) + 1 >= ROW_GROUP_BLOCKS) {
+            self.flush_pending(mode, write_rows)?;
+        }
+        Ok(())
+    }
+
+    fn close_with_flush<F>(&mut self, mode: ArchiveMode, write_rows: F) -> parquet::errors::Result<()>
+    where
+        F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+    {
+        self.flush_pending(mode, write_rows)?;
+        self.close()
+    }
 }
 
 struct CoinWriters {
-    status: ParquetStreamWriter,
-    diff: ParquetStreamWriter,
-    fill: ParquetStreamWriter,
+    status: ParquetStreamWriter<StatusOut>,
+    diff: ParquetStreamWriter<DiffOut>,
+    fill: ParquetStreamWriter<FillOut>,
 }
 
 struct ArchiveWriters {
+    blocks: ParquetStreamWriter<BlockIndexOut>,
     coins: HashMap<String, CoinWriters>,
     symbols: Vec<String>,
     mode: ArchiveMode,
@@ -387,11 +486,34 @@ impl ArchiveWriters {
                 .build(),
         );
 
+        let blocks_schema = std::sync::Arc::new(
+            parse_message_type(
+                "message blocks_schema {\n\
+                    REQUIRED INT64 block_number;\n\
+                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED BOOLEAN order_batch_ok;\n\
+                    REQUIRED BOOLEAN diff_batch_ok;\n\
+                    REQUIRED BOOLEAN fill_batch_ok;\n\
+                    REQUIRED INT32 order_n;\n\
+                    REQUIRED INT32 diff_n;\n\
+                    REQUIRED INT32 fill_n;\n\
+                    REQUIRED INT32 btc_status_n;\n\
+                    REQUIRED INT32 btc_diff_n;\n\
+                    REQUIRED INT32 btc_fill_n;\n\
+                    REQUIRED INT32 eth_status_n;\n\
+                    REQUIRED INT32 eth_diff_n;\n\
+                    REQUIRED INT32 eth_fill_n;\n\
+                    REQUIRED BINARY archive_mode (UTF8);\n\
+                    REQUIRED BINARY tracked_symbols (UTF8);\n\
+                }",
+            )
+            .expect("invalid blocks schema"),
+        );
+
         let (status_schema_str, diff_schema_str, fill_schema_str) = match mode {
             ArchiveMode::Lite => (
                 "message status_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY local_time (UTF8);\n\
                     REQUIRED BINARY block_time (UTF8);\n\
                     REQUIRED BINARY coin (UTF8);\n\
                     REQUIRED BINARY time (UTF8);\n\
@@ -414,7 +536,6 @@ impl ArchiveWriters {
                 }",
                 "message diff_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY local_time (UTF8);\n\
                     REQUIRED BINARY block_time (UTF8);\n\
                     REQUIRED INT64 oid;\n\
                     REQUIRED BINARY side (UTF8);\n\
@@ -425,7 +546,6 @@ impl ArchiveWriters {
                 }",
                 "message fill_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY local_time (UTF8);\n\
                     REQUIRED BINARY block_time (UTF8);\n\
                     REQUIRED BINARY coin (UTF8);\n\
                     REQUIRED BINARY side (UTF8);\n\
@@ -439,7 +559,6 @@ impl ArchiveWriters {
             ArchiveMode::Full => (
                 "message status_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY local_time (UTF8);\n\
                     REQUIRED BINARY block_time (UTF8);\n\
                     REQUIRED BINARY coin (UTF8);\n\
                     REQUIRED BINARY status (UTF8);\n\
@@ -465,7 +584,6 @@ impl ArchiveWriters {
                 }",
                 "message diff_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY local_time (UTF8);\n\
                     REQUIRED BINARY block_time (UTF8);\n\
                     REQUIRED BINARY coin (UTF8);\n\
                     REQUIRED INT64 oid;\n\
@@ -479,7 +597,6 @@ impl ArchiveWriters {
                 }",
                 "message fill_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY local_time (UTF8);\n\
                     REQUIRED BINARY block_time (UTF8);\n\
                     REQUIRED BINARY coin (UTF8);\n\
                     REQUIRED BINARY side (UTF8);\n\
@@ -518,7 +635,12 @@ impl ArchiveWriters {
             );
         }
 
-        Self { coins, symbols, mode }
+        Self {
+            blocks: ParquetStreamWriter::new(StreamKind::Blocks, blocks_schema, props.clone()),
+            coins,
+            symbols,
+            mode,
+        }
     }
 
     fn coin_mut(&mut self, coin: &str) -> Option<&mut CoinWriters> {
@@ -530,10 +652,11 @@ impl ArchiveWriters {
     }
 
     fn close_all(&mut self) -> parquet::errors::Result<()> {
+        self.blocks.close_with_flush(self.mode, write_block_rows)?;
         for writers in self.coins.values_mut() {
-            writers.status.close()?;
-            writers.diff.close()?;
-            writers.fill.close()?;
+            writers.status.close_with_flush(self.mode, write_status_rows)?;
+            writers.diff.close_with_flush(self.mode, write_diff_rows)?;
+            writers.fill.close_with_flush(self.mode, write_fill_rows)?;
         }
         Ok(())
     }
@@ -546,9 +669,12 @@ fn rotation_bounds(block: u64) -> (u64, u64) {
     (start, end)
 }
 
-fn is_rotation_start(block: u64) -> bool {
-    let (start, _) = rotation_bounds(block);
-    start == block
+fn checkpoint_start(block: u64) -> u64 {
+    ((block.saturating_sub(1)) / CHECKPOINT_BLOCKS) * CHECKPOINT_BLOCKS + 1
+}
+
+fn is_checkpoint_start(block: u64) -> bool {
+    checkpoint_start(block) == block
 }
 
 fn parse_scaled(value: &str, scale: u32) -> Option<i64> {
@@ -635,8 +761,6 @@ fn flatten_to_string(v: &serde_json::Value) -> String {
 fn write_status_rows(
     file: &mut SerializedFileWriter<std::fs::File>,
     mode: ArchiveMode,
-    block_number: u64,
-    block_time: &str,
     rows: &[StatusOut],
 ) -> parquet::errors::Result<()> {
     if rows.is_empty() {
@@ -644,10 +768,8 @@ fn write_status_rows(
     }
     let mut row_group = file.next_row_group()?;
 
-    let block_numbers = vec![block_number as i64; rows.len()];
-    let local_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.local_time.as_bytes())).collect();
-    let block_times: Vec<ByteArray> =
-        std::iter::repeat(block_time.as_bytes()).take(rows.len()).map(ByteArray::from).collect();
+    let block_numbers: Vec<i64> = rows.iter().map(|r| r.block_number as i64).collect();
+    let block_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.block_time.as_bytes())).collect();
     let coins: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.coin.as_bytes())).collect();
     let times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.time.as_bytes())).collect();
     let users: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.user.as_bytes())).collect();
@@ -672,12 +794,6 @@ fn write_status_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&block_numbers, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&local_times, None, None)?;
             }
             col.close()?;
         }
@@ -803,12 +919,6 @@ fn write_status_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&block_numbers, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&local_times, None, None)?;
             }
             col.close()?;
         }
@@ -953,8 +1063,6 @@ fn write_status_rows(
 fn write_diff_rows(
     file: &mut SerializedFileWriter<std::fs::File>,
     mode: ArchiveMode,
-    block_number: u64,
-    block_time: &str,
     rows: &[DiffOut],
 ) -> parquet::errors::Result<()> {
     if rows.is_empty() {
@@ -962,10 +1070,8 @@ fn write_diff_rows(
     }
     let mut row_group = file.next_row_group()?;
 
-    let block_numbers = vec![block_number as i64; rows.len()];
-    let local_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.local_time.as_bytes())).collect();
-    let block_times: Vec<ByteArray> =
-        std::iter::repeat(block_time.as_bytes()).take(rows.len()).map(ByteArray::from).collect();
+    let block_numbers: Vec<i64> = rows.iter().map(|r| r.block_number as i64).collect();
+    let block_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.block_time.as_bytes())).collect();
     let oids: Vec<i64> = rows.iter().map(|r| r.oid as i64).collect();
     let sides: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.side.as_bytes())).collect();
     let pxs: Vec<i64> = rows.iter().map(|r| r.px).collect();
@@ -977,12 +1083,6 @@ fn write_diff_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&block_numbers, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&local_times, None, None)?;
             }
             col.close()?;
         }
@@ -1036,12 +1136,6 @@ fn write_diff_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&block_numbers, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&local_times, None, None)?;
             }
             col.close()?;
         }
@@ -1114,8 +1208,6 @@ fn write_diff_rows(
 fn write_fill_rows(
     file: &mut SerializedFileWriter<std::fs::File>,
     mode: ArchiveMode,
-    block_number: u64,
-    block_time: &str,
     rows: &[FillOut],
 ) -> parquet::errors::Result<()> {
     if rows.is_empty() {
@@ -1123,10 +1215,8 @@ fn write_fill_rows(
     }
     let mut row_group = file.next_row_group()?;
 
-    let block_numbers = vec![block_number as i64; rows.len()];
-    let local_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.local_time.as_bytes())).collect();
-    let block_times: Vec<ByteArray> =
-        std::iter::repeat(block_time.as_bytes()).take(rows.len()).map(ByteArray::from).collect();
+    let block_numbers: Vec<i64> = rows.iter().map(|r| r.block_number as i64).collect();
+    let block_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.block_time.as_bytes())).collect();
     let coins: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.coin.as_bytes())).collect();
     let sides: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.side.as_bytes())).collect();
     let px: Vec<i64> = rows.iter().map(|r| r.px).collect();
@@ -1139,12 +1229,6 @@ fn write_fill_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&block_numbers, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&local_times, None, None)?;
             }
             col.close()?;
         }
@@ -1211,12 +1295,6 @@ fn write_fill_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&block_numbers, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&local_times, None, None)?;
             }
             col.close()?;
         }
@@ -1334,6 +1412,135 @@ fn write_fill_rows(
     Ok(())
 }
 
+fn write_block_rows(
+    file: &mut SerializedFileWriter<std::fs::File>,
+    _mode: ArchiveMode,
+    rows: &[BlockIndexOut],
+) -> parquet::errors::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut row_group = file.next_row_group()?;
+
+    let block_numbers: Vec<i64> = rows.iter().map(|row| row.block_number as i64).collect();
+    let block_times: Vec<ByteArray> = rows.iter().map(|row| ByteArray::from(row.block_time.as_bytes())).collect();
+    let order_batch_ok: Vec<bool> = rows.iter().map(|row| row.order_batch_ok).collect();
+    let diff_batch_ok: Vec<bool> = rows.iter().map(|row| row.diff_batch_ok).collect();
+    let fill_batch_ok: Vec<bool> = rows.iter().map(|row| row.fill_batch_ok).collect();
+    let order_n: Vec<i32> = rows.iter().map(|row| row.order_n).collect();
+    let diff_n: Vec<i32> = rows.iter().map(|row| row.diff_n).collect();
+    let fill_n: Vec<i32> = rows.iter().map(|row| row.fill_n).collect();
+    let btc_status_n: Vec<i32> = rows.iter().map(|row| row.btc_status_n).collect();
+    let btc_diff_n: Vec<i32> = rows.iter().map(|row| row.btc_diff_n).collect();
+    let btc_fill_n: Vec<i32> = rows.iter().map(|row| row.btc_fill_n).collect();
+    let eth_status_n: Vec<i32> = rows.iter().map(|row| row.eth_status_n).collect();
+    let eth_diff_n: Vec<i32> = rows.iter().map(|row| row.eth_diff_n).collect();
+    let eth_fill_n: Vec<i32> = rows.iter().map(|row| row.eth_fill_n).collect();
+    let archive_modes: Vec<ByteArray> = rows.iter().map(|row| ByteArray::from(row.archive_mode.as_bytes())).collect();
+    let tracked_symbols: Vec<ByteArray> =
+        rows.iter().map(|row| ByteArray::from(row.tracked_symbols.as_bytes())).collect();
+
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&block_numbers, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&block_times, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&order_batch_ok, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&diff_batch_ok, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&fill_batch_ok, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&order_n, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&diff_n, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&fill_n, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&btc_status_n, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&btc_diff_n, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&btc_fill_n, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&eth_status_n, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&eth_diff_n, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&eth_fill_n, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&archive_modes, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&tracked_symbols, None, None)?;
+        }
+        col.close()?;
+    }
+
+    row_group.close()?;
+    Ok(())
+}
+
 pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBool>) {
     let mut writers: Option<ArchiveWriters> = None;
     let mut current_mode: Option<ArchiveMode> = None;
@@ -1435,15 +1642,14 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         }
 
         if waiting_for_rotation_start {
-            if !is_rotation_start(height) {
-                let (_, current_end) = rotation_bounds(height);
-                let next_rotation_start = current_end.saturating_add(1);
-                if pending_rotation_start != Some(next_rotation_start) {
+            if !is_checkpoint_start(height) {
+                let next_checkpoint_start = checkpoint_start(height).saturating_add(CHECKPOINT_BLOCKS);
+                if pending_rotation_start != Some(next_checkpoint_start) {
                     warn!(
-                        "Archive enabled mid-window at block {}; waiting for next rotation start {} before creating parquet files",
-                        height, next_rotation_start
+                        "Archive enabled mid-window at block {}; waiting for next checkpoint start {} before creating parquet files",
+                        height, next_checkpoint_start
                     );
-                    pending_rotation_start = Some(next_rotation_start);
+                    pending_rotation_start = Some(next_checkpoint_start);
                 }
                 continue;
             }
@@ -1452,11 +1658,18 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         }
 
         let block_time = order_batch.block_time.clone();
-        let order_local_time = order_batch.local_time.clone();
-        let diff_local_time = diff_batch.local_time.clone();
-        let fill_local_time = fill_batch.local_time.clone();
+        let order_n = order_batch.events.len() as i32;
+        let diff_n = diff_batch.events.len() as i32;
+        let fill_n = fill_batch.events.len() as i32;
+        let tracked_symbols = writers.symbols.join(",");
+        let archive_mode = match mode {
+            ArchiveMode::Lite => "lite".to_string(),
+            ArchiveMode::Full => "full".to_string(),
+        };
 
         let mut status_rows: HashMap<String, Vec<StatusOut>> = HashMap::new();
+        let mut btc_status_n = 0;
+        let mut eth_status_n = 0;
         for (idx, status) in order_batch.events.into_iter().enumerate() {
             let OrderLite {
                 coin,
@@ -1475,6 +1688,11 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 tif,
                 cloid,
             } = status.order;
+            if coin == "BTC" {
+                btc_status_n += 1;
+            } else if coin == "ETH" {
+                eth_status_n += 1;
+            }
             if !writers.has_coin(&coin) {
                 continue;
             }
@@ -1494,8 +1712,9 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 )
             };
             let out = StatusOut {
+                block_number: height,
+                block_time: block_time.clone(),
                 coin: coin.clone(),
-                local_time: order_local_time.clone(),
                 status: status.status,
                 oid,
                 side,
@@ -1524,8 +1743,15 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         }
 
         let mut diff_rows: HashMap<String, Vec<DiffOut>> = HashMap::new();
+        let mut btc_diff_n = 0;
+        let mut eth_diff_n = 0;
         for (idx, diff) in diff_batch.events.into_iter().enumerate() {
             let DiffLite { user, oid, coin, side, px, raw_book_diff } = diff;
+            if coin == "BTC" {
+                btc_diff_n += 1;
+            } else if coin == "ETH" {
+                eth_diff_n += 1;
+            }
             if !writers.has_coin(&coin) {
                 continue;
             }
@@ -1551,8 +1777,9 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 (parse_scaled(&px, LITE_PRICE_SCALE).unwrap_or(0), sz, osz, dt)
             };
             let out = DiffOut {
+                block_number: height,
+                block_time: block_time.clone(),
                 coin: coin.clone(),
-                local_time: diff_local_time.clone(),
                 oid,
                 diff_type,
                 sz: d_sz,
@@ -1569,6 +1796,8 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         }
 
         let mut fill_rows: HashMap<String, Vec<FillOut>> = HashMap::new();
+        let mut btc_fill_n = 0;
+        let mut eth_fill_n = 0;
         for (idx, fill_event) in fill_batch.events.into_iter().enumerate() {
             let FillEvent(address, fill_data) = fill_event;
             let FillLite {
@@ -1589,6 +1818,11 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 twap_id,
                 ..
             } = fill_data;
+            if coin == "BTC" {
+                btc_fill_n += 1;
+            } else if coin == "ETH" {
+                eth_fill_n += 1;
+            }
             if !writers.has_coin(&coin) {
                 continue;
             }
@@ -1610,8 +1844,9 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 )
             };
             let out = FillOut {
+                block_number: height,
+                block_time: block_time.clone(),
                 coin: coin.clone(),
-                local_time: fill_local_time.clone(),
                 side,
                 px: f_px,
                 sz: f_sz,
@@ -1635,38 +1870,59 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             fill_rows.entry(coin).or_default().push(out);
         }
 
+        if let Err(err) = writers.blocks.advance_block(mode, height, write_block_rows) {
+            warn!("Archive advance blocks failed at {}: {err}", height);
+        }
+        if let Err(err) = writers.blocks.append_rows(
+            "blocks",
+            mode,
+            height,
+            vec![BlockIndexOut {
+                block_number: height,
+                block_time: block_time.clone(),
+                order_batch_ok: true,
+                diff_batch_ok: true,
+                fill_batch_ok: true,
+                order_n,
+                diff_n,
+                fill_n,
+                btc_status_n,
+                btc_diff_n,
+                btc_fill_n,
+                eth_status_n,
+                eth_diff_n,
+                eth_fill_n,
+                archive_mode,
+                tracked_symbols,
+            }],
+            write_block_rows,
+        ) {
+            warn!("Archive write blocks failed at {}: {err}", height);
+        }
+
         for coin in writers.symbols.clone() {
             if let Some(coin_writers) = writers.coin_mut(&coin) {
-                if let Some(rows) = status_rows.get(&coin).filter(|rows| !rows.is_empty()) {
-                    if let Err(err) = coin_writers.status.ensure_open(&coin, mode, height).and_then(|_| {
-                        if let Some(file) = coin_writers.status.file.as_mut() {
-                            write_status_rows(&mut file.writer, mode, height, &block_time, rows)
-                        } else {
-                            Ok(())
-                        }
-                    }) {
+                if let Err(err) = coin_writers.status.advance_block(mode, height, write_status_rows) {
+                    warn!("Archive advance status {} failed at {}: {err}", coin, height);
+                }
+                if let Err(err) = coin_writers.diff.advance_block(mode, height, write_diff_rows) {
+                    warn!("Archive advance diff {} failed at {}: {err}", coin, height);
+                }
+                if let Err(err) = coin_writers.fill.advance_block(mode, height, write_fill_rows) {
+                    warn!("Archive advance fill {} failed at {}: {err}", coin, height);
+                }
+                if let Some(rows) = status_rows.remove(&coin).filter(|rows| !rows.is_empty()) {
+                    if let Err(err) = coin_writers.status.append_rows(&coin, mode, height, rows, write_status_rows) {
                         warn!("Archive write status {} failed at {}: {err}", coin, height);
                     }
                 }
-                if let Some(rows) = diff_rows.get(&coin).filter(|rows| !rows.is_empty()) {
-                    if let Err(err) = coin_writers.diff.ensure_open(&coin, mode, height).and_then(|_| {
-                        if let Some(file) = coin_writers.diff.file.as_mut() {
-                            write_diff_rows(&mut file.writer, mode, height, &block_time, rows)
-                        } else {
-                            Ok(())
-                        }
-                    }) {
+                if let Some(rows) = diff_rows.remove(&coin).filter(|rows| !rows.is_empty()) {
+                    if let Err(err) = coin_writers.diff.append_rows(&coin, mode, height, rows, write_diff_rows) {
                         warn!("Archive write diff {} failed at {}: {err}", coin, height);
                     }
                 }
-                if let Some(rows) = fill_rows.get(&coin).filter(|rows| !rows.is_empty()) {
-                    if let Err(err) = coin_writers.fill.ensure_open(&coin, mode, height).and_then(|_| {
-                        if let Some(file) = coin_writers.fill.file.as_mut() {
-                            write_fill_rows(&mut file.writer, mode, height, &block_time, rows)
-                        } else {
-                            Ok(())
-                        }
-                    }) {
+                if let Some(rows) = fill_rows.remove(&coin).filter(|rows| !rows.is_empty()) {
+                    if let Err(err) = coin_writers.fill.append_rows(&coin, mode, height, rows, write_fill_rows) {
                         warn!("Archive write fill {} failed at {}: {err}", coin, height);
                     }
                 }
