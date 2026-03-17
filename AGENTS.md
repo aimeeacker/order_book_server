@@ -61,6 +61,13 @@ This repository hosts a Rust workspace for a local WebSocket server that mirrors
 - Prefer returning recoverable errors over panics in streaming/state-sync paths.
 - Keep snapshot validation and replay paths deterministic; avoid introducing order-dependent hash behavior.
 - When enabling archive writes, monitor disk growth and rotation behavior under restarts.
+- Treat archive row-group policy as stream-specific:
+  - `status`: `5000` blocks per row group
+  - `diff`: `50000` blocks per row group
+  - `fill`: single row group per file
+  - `blocks`: single row group per file
+- Keep the small-file discard rule aligned with ops expectations: finalized archive files spanning fewer than `5000`
+  blocks are dropped instead of handed off to NAS/OSS.
 - Treat `l4Anal` payload shape as protocol: `window_sum_bid/window_sum_ask` are positional arrays with 8 values in order:
   `[fill_sz, fill_notional, change_sz, change_notional, add_sz, add_notional, remove_sz, remove_notional]`.
 - `l4Anal` rollup cadence/semantics: emitted on heights divisible by 10, representing only the most recent 10-block

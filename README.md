@@ -80,6 +80,15 @@ The WebSocket server comes with compression built-in. The compression ratio can 
 - `cargo run -p fifo_listener`: parse and filter FIFO streams, align on block height, and emit timing metrics.
 - Python bindings: build `fifo_listener` as a `cdylib` and see `fifo_listener/python_example.py`.
 
+### Archive Parquet layout
+
+- Archive writes are stream-specific and do not share a single row-group policy.
+- `status` parquet uses `5000` blocks per row group.
+- `diff` parquet uses `50000` blocks per row group.
+- `fill` parquet uses a single row group per file.
+- `blocks` parquet uses a single row group per file.
+- Finalized files smaller than `5000` blocks of actual span are discarded instead of being handed off to NAS/OSS.
+
 ## Caveats
 
 - This server does **not** show untriggered trigger orders.
