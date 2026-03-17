@@ -21,6 +21,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static PY_LOG_INIT: Once = Once::new();
 static PY_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 
+fn parse_archive_mode(mode: Option<&str>) -> PyResult<Option<ArchiveMode>> {
+    match mode {
+        Some("FULL") => Ok(Some(ArchiveMode::Full)),
+        Some("LITE") | None => Ok(Some(ArchiveMode::Lite)),
+        _ => Err(pyo3::exceptions::PyValueError::new_err("mode must be 'FULL' or 'LITE'")),
+    }
+}
+
 fn build_archive_handoff_config(
     move_to_nas: bool,
     upload_to_oss: bool,
@@ -47,6 +55,41 @@ fn build_archive_handoff_config(
         ));
     }
     Ok(ArchiveHandoffConfig::new(move_to_nas, upload_to_oss, oss))
+}
+
+fn configure_archive(
+    mode: Option<&str>,
+    rotation_blocks: Option<u64>,
+    output_dir: Option<std::path::PathBuf>,
+    symbols: Option<Vec<String>>,
+    move_to_nas: bool,
+    upload_to_oss: bool,
+    oss_access_key_id: Option<String>,
+    oss_access_key_secret: Option<String>,
+    oss_endpoint: Option<String>,
+    oss_bucket: Option<String>,
+    oss_prefix: Option<String>,
+) -> PyResult<()> {
+    let mode = parse_archive_mode(mode)?;
+    let handoff = build_archive_handoff_config(
+        move_to_nas,
+        upload_to_oss,
+        oss_access_key_id,
+        oss_access_key_secret,
+        oss_endpoint,
+        oss_bucket,
+        oss_prefix,
+    )?;
+    if output_dir.is_some() {
+        set_archive_base_dir(output_dir);
+    }
+    if let Some(n) = rotation_blocks {
+        set_rotation_blocks(n);
+    }
+    set_archive_handoff_config(handoff);
+    set_archive_symbols(symbols);
+    set_archive_mode(mode);
+    Ok(())
 }
 
 struct PyLogger {
@@ -203,7 +246,7 @@ impl PyFifoListener {
         oss_bucket=None,
         oss_prefix=None
     ))]
-    fn start_write_dataset(
+    fn start_archive(
         &self,
         mode: Option<&str>,
         rotation_blocks: Option<u64>,
@@ -217,12 +260,11 @@ impl PyFifoListener {
         oss_bucket: Option<String>,
         oss_prefix: Option<String>,
     ) -> PyResult<()> {
-        let mode = match mode {
-            Some("FULL") => Some(ArchiveMode::Full),
-            Some("LITE") | None => Some(ArchiveMode::Lite),
-            _ => return Err(pyo3::exceptions::PyValueError::new_err("mode must be 'FULL' or 'LITE'")),
-        };
-        let handoff = build_archive_handoff_config(
+        configure_archive(
+            mode,
+            rotation_blocks,
+            output_dir,
+            symbols,
             move_to_nas,
             upload_to_oss,
             oss_access_key_id,
@@ -230,39 +272,29 @@ impl PyFifoListener {
             oss_endpoint,
             oss_bucket,
             oss_prefix,
-        )?;
-        if output_dir.is_some() {
-            set_archive_base_dir(output_dir);
-        }
-        if let Some(n) = rotation_blocks {
-            set_rotation_blocks(n);
-        }
-        set_archive_handoff_config(handoff);
-        set_archive_symbols(symbols);
-        set_archive_mode(mode);
-        Ok(())
+        )
     }
 
-    fn stop_write_dataset(&self) -> PyResult<()> {
+    fn stop_archive(&self) -> PyResult<()> {
         set_archive_mode(None);
         Ok(())
     }
 
-    fn get_write_dataset_dir(&self) -> String {
+    fn get_archive_dir(&self) -> String {
         current_archive_base_dir().to_string_lossy().into_owned()
     }
 
-    fn get_write_dataset_symbols(&self) -> Vec<String> {
+    fn get_archive_symbols(&self) -> Vec<String> {
         current_archive_symbols()
     }
 
     #[pyo3(signature = (output_dir=None))]
-    fn set_write_dataset_dir(&self, output_dir: Option<std::path::PathBuf>) -> String {
+    fn set_archive_dir(&self, output_dir: Option<std::path::PathBuf>) -> String {
         set_archive_base_dir(output_dir).to_string_lossy().into_owned()
     }
 
     #[pyo3(signature = (symbols=None))]
-    fn set_write_dataset_symbols(&self, symbols: Option<Vec<String>>) -> Vec<String> {
+    fn set_archive_symbols(&self, symbols: Option<Vec<String>>) -> Vec<String> {
         set_archive_symbols(symbols)
     }
 }
