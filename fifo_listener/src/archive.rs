@@ -7,7 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use log::warn;
+use log::{info, warn};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
@@ -18,6 +18,7 @@ use parquet::schema::types::Type;
 use serde::Deserialize;
 
 const ARCHIVE_BASE_DIR: &str = "/home/aimee/hl_runtime/dataset";
+const ARCHIVE_FINALIZE_DIR: &str = "/mnt";
 const DEFAULT_ARCHIVE_SYMBOLS: &[&str] = &["BTC", "ETH"];
 const LITE_PRICE_SCALE: u32 = 8;
 const LITE_SIZE_SCALE: u32 = 8;
@@ -342,6 +343,8 @@ impl StreamKind {
 struct ParquetFile {
     writer: SerializedFileWriter<std::fs::File>,
     start_block: u64,
+    path: PathBuf,
+    relative_path: PathBuf,
 }
 
 struct ParquetStreamWriter<R> {
@@ -367,32 +370,38 @@ impl<R> ParquetStreamWriter<R> {
     }
 
     fn open_file(&mut self, coin: &str, mode: ArchiveMode, start: u64, end: u64) -> parquet::errors::Result<()> {
+        let base_dir = current_archive_base_dir();
         let (dir, filename) = match self.stream {
-            StreamKind::Blocks => {
-                (current_archive_base_dir().join(self.stream.name()), format!("blocks_{start}_{end}.parquet"))
-            }
+            StreamKind::Blocks => (base_dir.join(self.stream.name()), format!("blocks_{start}_{end}.parquet")),
             _ => {
                 let coin_dir = match mode {
                     ArchiveMode::Lite => coin.to_string(),
                     ArchiveMode::Full => format!("{coin}_full"),
                 };
                 (
-                    current_archive_base_dir().join(coin_dir).join(self.stream.name()),
+                    base_dir.join(coin_dir).join(self.stream.name()),
                     format!("{}_{}_{start}_{end}.parquet", coin, self.stream.name()),
                 )
             }
         };
         fs::create_dir_all(&dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
         let path = dir.join(filename);
+        let relative_path = path
+            .strip_prefix(&base_dir)
+            .map(PathBuf::from)
+            .map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
         let file = fs::File::create(&path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
         let writer = SerializedFileWriter::new(file, self.schema.clone(), self.props.clone())?;
-        self.file = Some(ParquetFile { writer, start_block: start });
+        self.file = Some(ParquetFile { writer, start_block: start, path, relative_path });
         Ok(())
     }
 
     fn close(&mut self) -> parquet::errors::Result<()> {
         if let Some(file) = self.file.take() {
+            let path = file.path.clone();
+            let relative_path = file.relative_path.clone();
             file.writer.close()?;
+            move_finalized_parquet(&path, &relative_path)?;
         }
         Ok(())
     }
@@ -675,6 +684,27 @@ fn checkpoint_start(block: u64) -> u64 {
 
 fn is_checkpoint_start(block: u64) -> bool {
     checkpoint_start(block) == block
+}
+
+fn move_finalized_parquet(path: &PathBuf, relative_path: &PathBuf) -> parquet::errors::Result<()> {
+    let dest_root = PathBuf::from(ARCHIVE_FINALIZE_DIR);
+    let dest_path = dest_root.join(relative_path);
+    if *path == dest_path {
+        return Ok(());
+    }
+    if let Some(parent) = dest_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+    }
+    let tmp_name = format!("{}.tmp", dest_path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet"));
+    let tmp_path = dest_path.with_file_name(tmp_name);
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+    }
+    fs::copy(path, &tmp_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+    fs::rename(&tmp_path, &dest_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+    fs::remove_file(path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+    info!("Archive finalized and moved: {} -> {}", path.display(), dest_path.display());
+    Ok(())
 }
 
 fn parse_scaled(value: &str, scale: u32) -> Option<i64> {

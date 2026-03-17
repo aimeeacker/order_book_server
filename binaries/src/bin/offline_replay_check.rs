@@ -1,6 +1,6 @@
 #![allow(unused_crate_dependencies)]
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -898,28 +898,83 @@ fn format_trace(label: &str, oid: u64, traces: &HashMap<u64, OrderTrace>, block_
     }
 }
 
+fn side_diff_summary(
+    side_label: &str,
+    actual_side: &[Order],
+    expected_side: &[Order],
+    traces: &HashMap<u64, OrderTrace>,
+    block_stats: &BlockStats,
+) -> String {
+    let actual_oids: BTreeSet<u64> = actual_side.iter().map(|order| order.oid).collect();
+    let expected_oids: BTreeSet<u64> = expected_side.iter().map(|order| order.oid).collect();
+    let actual_by_oid: BTreeMap<u64, &Order> = actual_side.iter().map(|order| (order.oid, order)).collect();
+    let expected_by_oid: BTreeMap<u64, &Order> = expected_side.iter().map(|order| (order.oid, order)).collect();
+    let extra: Vec<u64> = actual_oids.difference(&expected_oids).copied().collect();
+    let missing: Vec<u64> = expected_oids.difference(&actual_oids).copied().collect();
+    let field_mismatch: Vec<u64> = actual_oids
+        .intersection(&expected_oids)
+        .filter_map(|oid| {
+            let actual_order = actual_by_oid.get(oid)?;
+            let expected_order = expected_by_oid.get(oid)?;
+            if *actual_order != *expected_order { Some(*oid) } else { None }
+        })
+        .collect();
+    let extra_preview = extra
+        .iter()
+        .take(3)
+        .map(|oid| format_trace("extra", *oid, traces, block_stats))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let missing_preview = missing
+        .iter()
+        .take(3)
+        .map(|oid| format_trace("missing", *oid, traces, block_stats))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let field_mismatch_preview = field_mismatch
+        .iter()
+        .take(3)
+        .map(|oid| format_trace("mismatch", *oid, traces, block_stats))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(
+        "{}_oid_diff extra_count={} missing_count={} field_mismatch_count={} extra_preview=[{}] missing_preview=[{}] field_mismatch_preview=[{}]",
+        side_label,
+        extra.len(),
+        missing.len(),
+        field_mismatch.len(),
+        extra_preview,
+        missing_preview,
+        field_mismatch_preview
+    )
+}
+
 fn compare_snapshots(
     actual: [Vec<Order>; 2],
     expected: [Vec<Order>; 2],
     traces: &HashMap<u64, OrderTrace>,
     block_stats: &BlockStats,
 ) -> AppResult<()> {
-    for (side_idx, (actual_side, expected_side)) in actual.into_iter().zip(expected).enumerate() {
+    for (side_idx, (actual_side, expected_side)) in actual.iter().zip(expected.iter()).enumerate() {
+        let side_label = if side_idx == 0 { "bid" } else { "ask" };
         if actual_side.len() != expected_side.len() {
+            let side_diff = side_diff_summary(side_label, &actual_side, &expected_side, traces, block_stats);
             return err(format!(
-                "side {} length mismatch actual={} expected={}",
+                "side {} length mismatch actual={} expected={}\n{}",
                 side_idx,
                 actual_side.len(),
-                expected_side.len()
+                expected_side.len(),
+                side_diff
             ));
         }
-        for (idx, (actual_order, expected_order)) in actual_side.into_iter().zip(expected_side).enumerate() {
+        for (idx, (actual_order, expected_order)) in actual_side.iter().zip(expected_side.iter()).enumerate() {
             if actual_order != expected_order {
                 let actual_trace = format_trace("actual", actual_order.oid, traces, block_stats);
                 let expected_trace = format_trace("expected", expected_order.oid, traces, block_stats);
+                let side_diff = side_diff_summary(side_label, &actual_side, &expected_side, traces, block_stats);
                 return err(format!(
-                    "side {} order {} mismatch\nactual={:?}\nexpected={:?}\n{}\n{}",
-                    side_idx, idx, actual_order, expected_order, actual_trace, expected_trace
+                    "side {} order {} mismatch\nactual={:?}\nexpected={:?}\n{}\n{}\n{}",
+                    side_idx, idx, actual_order, expected_order, actual_trace, expected_trace, side_diff
                 ));
             }
         }

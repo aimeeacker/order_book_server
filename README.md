@@ -49,7 +49,7 @@ The `l4book` subscription first sends a snapshot of the entire book and then for
 ## Setup
 
 1. Run a non-validating node (from [`hyperliquid-dex/node`](https://github.com/hyperliquid-dex/node)). Requires batching by block. Requires recording fills, order statuses, and raw book diffs.
-   - The node should write newline-delimited JSON batches into FIFOs at `/home/aimee/hl_runtime/hl_book/node_fifo`:
+   - The node should write newline-delimited JSON batches into FIFOs at `/home/aimee/hl_runtime/hl_book/runtime_fifo`:
      - `fills`
      - `order`
      - `diffs`

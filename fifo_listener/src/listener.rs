@@ -19,7 +19,7 @@ pub use crate::archive::{
     set_archive_mode, set_archive_symbols, set_rotation_blocks,
 };
 
-const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book/node_fifo";
+const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book/runtime_fifo";
 const ORDER_PIPE_CAPACITY: i32 = 16 * 1024 * 1024;
 const DIFFS_FILLS_PIPE_CAPACITY: i32 = 8 * 1024 * 1024;
 const MAX_PENDING_HEIGHTS: usize = 200;
