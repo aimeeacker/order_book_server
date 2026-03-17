@@ -3,10 +3,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::Duration;
 
+use aliyun_oss_rust_sdk::oss::OSS;
+use aliyun_oss_rust_sdk::request::RequestBuilder;
 use log::{info, warn};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::column::writer::ColumnWriter;
@@ -20,6 +23,7 @@ use serde::Deserialize;
 const ARCHIVE_BASE_DIR: &str = "/home/aimee/hl_runtime/dataset";
 const ARCHIVE_FINALIZE_DIR: &str = "/mnt";
 const DEFAULT_ARCHIVE_SYMBOLS: &[&str] = &["BTC", "ETH"];
+const DEFAULT_OSS_PREFIX: &str = "hyper_data";
 const LITE_PRICE_SCALE: u32 = 8;
 const LITE_SIZE_SCALE: u32 = 8;
 const CHECKPOINT_BLOCKS: u64 = 10_000;
@@ -27,6 +31,7 @@ const ROW_GROUP_BLOCKS: u64 = 5_000;
 static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
 static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
+static ARCHIVE_HANDOFF_CONFIG: OnceLock<Mutex<ArchiveHandoffConfig>> = OnceLock::new();
 pub(crate) const ARCHIVE_QUEUE_BLOCKS: usize = 127;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +41,68 @@ pub enum ArchiveMode {
 }
 
 static ARCHIVE_MODE: AtomicU8 = AtomicU8::new(0);
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ArchiveOssConfig {
+    access_key_id: String,
+    access_key_secret: String,
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+}
+
+impl ArchiveOssConfig {
+    pub fn new(
+        access_key_id: String,
+        access_key_secret: String,
+        endpoint: String,
+        bucket: String,
+        prefix: Option<String>,
+    ) -> Self {
+        Self { access_key_id, access_key_secret, endpoint, bucket, prefix: normalize_oss_prefix(prefix) }
+    }
+}
+
+impl std::fmt::Debug for ArchiveOssConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchiveOssConfig")
+            .field("access_key_id", &redact_secret(&self.access_key_id))
+            .field("access_key_secret", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ArchiveHandoffConfig {
+    pub move_to_nas: bool,
+    pub upload_to_oss: bool,
+    pub oss: Option<ArchiveOssConfig>,
+}
+
+impl ArchiveHandoffConfig {
+    pub fn new(move_to_nas: bool, upload_to_oss: bool, oss: Option<ArchiveOssConfig>) -> Self {
+        Self { move_to_nas, upload_to_oss, oss }
+    }
+}
+
+impl Default for ArchiveHandoffConfig {
+    fn default() -> Self {
+        Self { move_to_nas: true, upload_to_oss: false, oss: None }
+    }
+}
+
+impl std::fmt::Debug for ArchiveHandoffConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchiveHandoffConfig")
+            .field("move_to_nas", &self.move_to_nas)
+            .field("upload_to_oss", &self.upload_to_oss)
+            .field("oss", &self.oss)
+            .finish()
+    }
+}
 
 pub fn set_rotation_blocks(n: u64) {
     if n > 0 {
@@ -49,6 +116,18 @@ fn archive_base_dir_override() -> &'static Mutex<Option<PathBuf>> {
 
 fn archive_symbols_override() -> &'static Mutex<Option<Vec<String>>> {
     ARCHIVE_SYMBOLS_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+fn archive_handoff_config() -> &'static Mutex<ArchiveHandoffConfig> {
+    ARCHIVE_HANDOFF_CONFIG.get_or_init(|| Mutex::new(ArchiveHandoffConfig::default()))
+}
+
+fn redact_secret(value: &str) -> String {
+    match value.len() {
+        0 => String::new(),
+        1..=4 => "*".repeat(value.len()),
+        len => format!("{}***{}", &value[..2], &value[len - 2..]),
+    }
 }
 
 fn normalize_archive_symbols(symbols: Option<Vec<String>>) -> Vec<String> {
@@ -65,6 +144,10 @@ fn normalize_archive_symbols(symbols: Option<Vec<String>>) -> Vec<String> {
     } else {
         normalized
     }
+}
+
+fn normalize_oss_prefix(prefix: Option<String>) -> String {
+    prefix.unwrap_or_else(|| DEFAULT_OSS_PREFIX.to_string()).trim_matches('/').to_string()
 }
 
 pub fn current_archive_base_dir() -> PathBuf {
@@ -95,6 +178,16 @@ pub fn set_archive_symbols(symbols: Option<Vec<String>>) -> Vec<String> {
     let mut guard = archive_symbols_override().lock().expect("archive symbols mutex");
     *guard = Some(normalized.clone());
     normalized
+}
+
+pub(crate) fn current_archive_handoff_config() -> ArchiveHandoffConfig {
+    archive_handoff_config().lock().expect("archive handoff config mutex").clone()
+}
+
+pub fn set_archive_handoff_config(config: ArchiveHandoffConfig) -> ArchiveHandoffConfig {
+    let mut guard = archive_handoff_config().lock().expect("archive handoff config mutex");
+    *guard = config;
+    guard.clone()
 }
 
 pub fn set_archive_mode(mode: Option<ArchiveMode>) {
@@ -347,18 +440,36 @@ struct ParquetFile {
     relative_path: PathBuf,
 }
 
+#[derive(Clone)]
+struct HandoffTask {
+    path: PathBuf,
+    relative_path: PathBuf,
+    config: ArchiveHandoffConfig,
+}
+
+struct ArchiveHandoffWorker {
+    tx: Sender<HandoffTask>,
+    handle: thread::JoinHandle<()>,
+}
+
 struct ParquetStreamWriter<R> {
     stream: StreamKind,
     schema: std::sync::Arc<Type>,
     props: std::sync::Arc<WriterProperties>,
+    handoff_tx: Sender<HandoffTask>,
     file: Option<ParquetFile>,
     pending_rows: Vec<R>,
     pending_start_block: Option<u64>,
 }
 
 impl<R> ParquetStreamWriter<R> {
-    fn new(stream: StreamKind, schema: std::sync::Arc<Type>, props: std::sync::Arc<WriterProperties>) -> Self {
-        Self { stream, schema, props, file: None, pending_rows: Vec::new(), pending_start_block: None }
+    fn new(
+        stream: StreamKind,
+        schema: std::sync::Arc<Type>,
+        props: std::sync::Arc<WriterProperties>,
+        handoff_tx: Sender<HandoffTask>,
+    ) -> Self {
+        Self { stream, schema, props, handoff_tx, file: None, pending_rows: Vec::new(), pending_start_block: None }
     }
 
     fn ensure_open(&mut self, coin: &str, mode: ArchiveMode, block: u64) -> parquet::errors::Result<()> {
@@ -401,7 +512,7 @@ impl<R> ParquetStreamWriter<R> {
             let path = file.path.clone();
             let relative_path = file.relative_path.clone();
             file.writer.close()?;
-            move_finalized_parquet(&path, &relative_path)?;
+            enqueue_handoff_task(&self.handoff_tx, path, relative_path)?;
         }
         Ok(())
     }
@@ -486,7 +597,7 @@ struct ArchiveWriters {
 }
 
 impl ArchiveWriters {
-    fn new(mode: ArchiveMode, symbols: Vec<String>) -> Self {
+    fn new(mode: ArchiveMode, symbols: Vec<String>, handoff_tx: Sender<HandoffTask>) -> Self {
         let zstd_level = ZstdLevel::try_new(3).unwrap_or_default();
         let props = std::sync::Arc::new(
             WriterProperties::builder()
@@ -637,15 +748,30 @@ impl ArchiveWriters {
             coins.insert(
                 coin.clone(),
                 CoinWriters {
-                    status: ParquetStreamWriter::new(StreamKind::Status, status_schema.clone(), props.clone()),
-                    diff: ParquetStreamWriter::new(StreamKind::Diff, diff_schema.clone(), props.clone()),
-                    fill: ParquetStreamWriter::new(StreamKind::Fill, fill_schema.clone(), props.clone()),
+                    status: ParquetStreamWriter::new(
+                        StreamKind::Status,
+                        status_schema.clone(),
+                        props.clone(),
+                        handoff_tx.clone(),
+                    ),
+                    diff: ParquetStreamWriter::new(
+                        StreamKind::Diff,
+                        diff_schema.clone(),
+                        props.clone(),
+                        handoff_tx.clone(),
+                    ),
+                    fill: ParquetStreamWriter::new(
+                        StreamKind::Fill,
+                        fill_schema.clone(),
+                        props.clone(),
+                        handoff_tx.clone(),
+                    ),
                 },
             );
         }
 
         Self {
-            blocks: ParquetStreamWriter::new(StreamKind::Blocks, blocks_schema, props.clone()),
+            blocks: ParquetStreamWriter::new(StreamKind::Blocks, blocks_schema, props.clone(), handoff_tx),
             coins,
             symbols,
             mode,
@@ -686,24 +812,120 @@ fn is_checkpoint_start(block: u64) -> bool {
     checkpoint_start(block) == block
 }
 
-fn move_finalized_parquet(path: &PathBuf, relative_path: &PathBuf) -> parquet::errors::Result<()> {
+fn io_to_parquet_error<E>(err: E) -> parquet::errors::ParquetError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    parquet::errors::ParquetError::External(Box::new(err))
+}
+
+fn io_other<M: Into<String>>(msg: M) -> std::io::Error {
+    std::io::Error::other(msg.into())
+}
+
+fn start_archive_handoff_worker(stop: Arc<AtomicBool>) -> ArchiveHandoffWorker {
+    let (tx, rx) = channel::<HandoffTask>();
+    let handle = thread::spawn(move || {
+        while let Ok(task) = rx.recv() {
+            if let Err(err) = handoff_finalized_parquet(&task) {
+                warn!(
+                    "Archive handoff failed for {} (stop={}): {err}",
+                    task.path.display(),
+                    stop.load(Ordering::SeqCst)
+                );
+            }
+        }
+    });
+    ArchiveHandoffWorker { tx, handle }
+}
+
+fn enqueue_handoff_task(
+    handoff_tx: &Sender<HandoffTask>,
+    path: PathBuf,
+    relative_path: PathBuf,
+) -> parquet::errors::Result<()> {
+    let config = current_archive_handoff_config();
+    let task = HandoffTask { path, relative_path, config };
+    let task_path = task.path.display().to_string();
+    handoff_tx.send(task).map_err(|err| {
+        io_to_parquet_error(io_other(format!("failed to enqueue archive handoff for {task_path}: {err}")))
+    })?;
+    Ok(())
+}
+
+fn copy_to_nas(path: &PathBuf, relative_path: &PathBuf) -> parquet::errors::Result<PathBuf> {
     let dest_root = PathBuf::from(ARCHIVE_FINALIZE_DIR);
     let dest_path = dest_root.join(relative_path);
     if *path == dest_path {
-        return Ok(());
+        return Ok(dest_path);
     }
     if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+        fs::create_dir_all(parent).map_err(io_to_parquet_error)?;
     }
     let tmp_name = format!("{}.tmp", dest_path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet"));
     let tmp_path = dest_path.with_file_name(tmp_name);
     if tmp_path.exists() {
-        fs::remove_file(&tmp_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+        fs::remove_file(&tmp_path).map_err(io_to_parquet_error)?;
     }
-    fs::copy(path, &tmp_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-    fs::rename(&tmp_path, &dest_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-    fs::remove_file(path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-    info!("Archive finalized and moved: {} -> {}", path.display(), dest_path.display());
+    fs::copy(path, &tmp_path).map_err(io_to_parquet_error)?;
+    fs::rename(&tmp_path, &dest_path).map_err(io_to_parquet_error)?;
+    info!("Archive finalized and copied to NAS: {} -> {}", path.display(), dest_path.display());
+    Ok(dest_path)
+}
+
+fn upload_finalized_parquet_to_oss(
+    source_path: &PathBuf,
+    relative_path: &PathBuf,
+    oss_config: &ArchiveOssConfig,
+) -> parquet::errors::Result<()> {
+    let oss = OSS::new(
+        oss_config.access_key_id.clone(),
+        oss_config.access_key_secret.clone(),
+        oss_config.endpoint.clone(),
+        oss_config.bucket.clone(),
+    );
+    let object_key = if oss_config.prefix.is_empty() {
+        relative_path.to_string_lossy().replace('\\', "/")
+    } else {
+        format!("{}/{}", oss_config.prefix, relative_path.to_string_lossy().replace('\\', "/"))
+    };
+    let file_path = source_path.to_string_lossy().into_owned();
+    oss.put_object_from_file(object_key.as_str(), file_path.as_str(), RequestBuilder::new())
+        .map_err(|err| io_to_parquet_error(io_other(format!("OSS upload failed for {}: {err}", object_key))))?;
+    info!(
+        "Archive finalized and uploaded to OSS bucket={} object_key={} source={}",
+        oss_config.bucket,
+        object_key,
+        source_path.display()
+    );
+    Ok(())
+}
+
+fn handoff_finalized_parquet(task: &HandoffTask) -> parquet::errors::Result<()> {
+    let path = &task.path;
+    let relative_path = &task.relative_path;
+    let config = &task.config;
+    let nas_dest = if config.move_to_nas { Some(copy_to_nas(path, relative_path)?) } else { None };
+
+    if config.upload_to_oss {
+        let Some(oss_config) = config.oss.as_ref() else {
+            return Err(io_to_parquet_error(io_other(
+                "upload_to_oss enabled but OSS credentials/config were not provided",
+            )));
+        };
+        upload_finalized_parquet_to_oss(path, relative_path, oss_config)?;
+    }
+
+    if config.move_to_nas {
+        fs::remove_file(path).map_err(io_to_parquet_error)?;
+        if let Some(dest_path) = nas_dest {
+            info!("Archive handoff complete: local={} nas={}", path.display(), dest_path.display());
+        }
+    } else if config.upload_to_oss {
+        info!("Archive handoff complete: local={} retained after OSS upload", path.display());
+    } else {
+        info!("Archive finalized locally without handoff: {}", path.display());
+    }
     Ok(())
 }
 
@@ -1572,6 +1794,8 @@ fn write_block_rows(
 }
 
 pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBool>) {
+    let handoff_worker = start_archive_handoff_worker(stop.clone());
+    let handoff_tx = handoff_worker.tx.clone();
     let mut writers: Option<ArchiveWriters> = None;
     let mut current_mode: Option<ArchiveMode> = None;
     let mut current_symbols = current_archive_symbols();
@@ -1589,7 +1813,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             if let Some(mut w) = writers.take() {
                 w.close_all().ok();
             }
-            writers = mode.map(|mode| ArchiveWriters::new(mode, symbols.clone()));
+            writers = mode.map(|mode| ArchiveWriters::new(mode, symbols.clone(), handoff_tx.clone()));
             current_mode = mode;
             current_symbols = symbols;
             waiting_for_rotation_start = mode.is_some();
@@ -1960,9 +2184,15 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         }
     }
 
-    if let Some(mut w) = writers {
+    if let Some(mut w) = writers.take() {
         if let Err(err) = w.close_all() {
             warn!("Archive writer close failed: {err}");
         }
+    }
+    let ArchiveHandoffWorker { tx: handoff_worker_tx, handle } = handoff_worker;
+    drop(handoff_tx);
+    drop(handoff_worker_tx);
+    if let Err(err) = handle.join() {
+        warn!("Archive handoff worker panicked: {err:?}");
     }
 }

@@ -11,8 +11,9 @@ use compute_l4::{
     set_current_dataset_dir,
 };
 use fifo_listener::{
-    ArchiveMode, HeightCallback, ListenerHandle, current_archive_base_dir, current_archive_symbols,
-    set_archive_base_dir, set_archive_mode, set_archive_symbols, set_rotation_blocks, start_listener,
+    ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, HeightCallback, ListenerHandle, current_archive_base_dir,
+    current_archive_symbols, set_archive_base_dir, set_archive_handoff_config, set_archive_mode, set_archive_symbols,
+    set_rotation_blocks, start_listener,
 };
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use pyo3::prelude::*;
@@ -27,6 +28,34 @@ use pyo3_asyncio as _;
 
 static PY_LOG_INIT: Once = Once::new();
 static PY_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+fn build_archive_handoff_config(
+    move_to_nas: bool,
+    upload_to_oss: bool,
+    oss_access_key_id: Option<String>,
+    oss_access_key_secret: Option<String>,
+    oss_endpoint: Option<String>,
+    oss_bucket: Option<String>,
+    oss_prefix: Option<String>,
+) -> PyResult<ArchiveHandoffConfig> {
+    let oss = match (oss_access_key_id, oss_access_key_secret, oss_endpoint, oss_bucket, oss_prefix) {
+        (Some(access_key_id), Some(access_key_secret), Some(endpoint), Some(bucket), prefix) => {
+            Some(ArchiveOssConfig::new(access_key_id, access_key_secret, endpoint, bucket, prefix))
+        }
+        (None, None, None, None, None) => None,
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "OSS config must include access_key_id, access_key_secret, endpoint, and bucket",
+            ));
+        }
+    };
+    if upload_to_oss && oss.is_none() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "upload_to_oss requires OSS access_key_id, access_key_secret, endpoint, and bucket",
+        ));
+    }
+    Ok(ArchiveHandoffConfig::new(move_to_nas, upload_to_oss, oss))
+}
 
 struct PyLogger {
     logger: Py<PyAny>,
@@ -171,25 +200,54 @@ impl PyFifoListener {
         Ok(())
     }
 
-    #[pyo3(signature = (mode=None, rotation_blocks=None, output_dir=None, symbols=None))]
+    #[pyo3(signature = (
+        mode=None,
+        rotation_blocks=None,
+        output_dir=None,
+        symbols=None,
+        move_to_nas=true,
+        upload_to_oss=false,
+        oss_access_key_id=None,
+        oss_access_key_secret=None,
+        oss_endpoint=None,
+        oss_bucket=None,
+        oss_prefix=None
+    ))]
     fn start_write_dataset(
         &self,
         mode: Option<&str>,
         rotation_blocks: Option<u64>,
         output_dir: Option<PathBuf>,
         symbols: Option<Vec<String>>,
+        move_to_nas: bool,
+        upload_to_oss: bool,
+        oss_access_key_id: Option<String>,
+        oss_access_key_secret: Option<String>,
+        oss_endpoint: Option<String>,
+        oss_bucket: Option<String>,
+        oss_prefix: Option<String>,
     ) -> PyResult<()> {
         let mode = match mode {
             Some("FULL") => Some(ArchiveMode::Full),
             Some("LITE") | None => Some(ArchiveMode::Lite),
             _ => return Err(pyo3::exceptions::PyValueError::new_err("mode must be 'FULL' or 'LITE'")),
         };
+        let handoff = build_archive_handoff_config(
+            move_to_nas,
+            upload_to_oss,
+            oss_access_key_id,
+            oss_access_key_secret,
+            oss_endpoint,
+            oss_bucket,
+            oss_prefix,
+        )?;
         if output_dir.is_some() {
             set_archive_base_dir(output_dir);
         }
         if let Some(n) = rotation_blocks {
             set_rotation_blocks(n);
         }
+        set_archive_handoff_config(handoff);
         set_archive_symbols(symbols);
         set_archive_mode(mode);
         Ok(())
