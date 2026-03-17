@@ -6,6 +6,7 @@ use pyo3 as _;
 use rmp_serde as _;
 use serde as _;
 use serde_json as _;
+use simd_json as _;
 use zstd as _;
 
 #[derive(Parser, Debug)]

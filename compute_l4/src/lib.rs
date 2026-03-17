@@ -16,6 +16,7 @@ use rmp_serde as _;
 use serde as _;
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json as _;
+use simd_json as _;
 
 #[derive(Debug, Clone, Default)]
 pub struct ComputeOptions {
@@ -28,7 +29,7 @@ pub struct ComputeOptions {
 pub struct AppError(String);
 
 pub type AppResult<T> = Result<T, AppError>;
-pub const DEFAULT_DATASET_DIR: &str = "/home/aimee/hl_runtime/dataset";
+pub const DEFAULT_DATASET_DIR: &str = "/home/aimee/hl_runtime/hl/dataset";
 const SEGMENT_MAGIC: &[u8; 8] = b"L4SEG001";
 const SEGMENT_VERSION: u32 = 2;
 const ZSTD_LEVEL: i32 = 3;
@@ -64,6 +65,12 @@ impl From<rmp_serde::encode::Error> for AppError {
 
 impl From<serde_json::Error> for AppError {
     fn from(value: serde_json::Error) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<simd_json::Error> for AppError {
+    fn from(value: simd_json::Error) -> Self {
         Self(value.to_string())
     }
 }
@@ -453,7 +460,18 @@ pub fn append_l4_checkpoint(
         assets: options.assets.clone(),
         snapshot,
     };
-    write_checkpoint_record(output_dir.unwrap_or_else(current_dataset_dir), record)
+    write_checkpoint_record(output_dir.unwrap_or_else(current_dataset_dir), record, true)
+}
+
+pub fn append_l4_checkpoint_from_snapshot_json(
+    input: impl AsRef<Path>,
+    output_dir: Option<PathBuf>,
+    options: &ComputeOptions,
+    block_time: impl Into<String>,
+) -> AppResult<CheckpointWriteResult> {
+    let bytes = fs::read(input)?;
+    let record = checkpoint_record_from_snapshot_json_bytes(&bytes, options, block_time.into())?;
+    write_checkpoint_record(output_dir.unwrap_or_else(current_dataset_dir), record, false)
 }
 
 fn load_root_and_specs(input: impl AsRef<Path>, options: &ComputeOptions) -> AppResult<(Root, Vec<BookSpec>)> {
@@ -796,9 +814,65 @@ fn build_trigger_records<'a>(book: &'a Book) -> (HashMap<u64, TriggerRecord<'a>>
     (records, sequence)
 }
 
-fn write_checkpoint_record(output_dir: PathBuf, record: CheckpointRecord) -> AppResult<CheckpointWriteResult> {
+fn normalize_output_entry(entry: OutputOrderEntry, include_users: bool) -> OutputOrderEntry {
+    match (include_users, entry) {
+        (true, entry) => entry,
+        (false, OutputOrderEntry::Plain(order)) => OutputOrderEntry::Plain(order),
+        (false, OutputOrderEntry::WithUser(UserWrappedOrder(_, order))) => OutputOrderEntry::Plain(order),
+    }
+}
+
+fn checkpoint_record_from_snapshot_json_bytes(
+    bytes: &[u8],
+    options: &ComputeOptions,
+    block_time: String,
+) -> AppResult<CheckpointRecord> {
+    if options.include_trigger_orders {
+        return Err(AppError(
+            "snapshot json checkpoint append does not support include_trigger_orders=true".to_string(),
+        ));
+    }
+
+    let mut owned = bytes.to_vec();
+    #[allow(clippy::type_complexity)]
+    let (block_height, snapshot): (u64, Vec<(String, [Vec<OutputOrderEntry>; 2])>) = simd_json::from_slice(&mut owned)?;
+    let assets = options.assets.clone();
+    let filtered = snapshot
+        .into_iter()
+        .filter(|(coin, _)| assets.as_ref().is_none_or(|items| items.iter().any(|asset| asset == coin)))
+        .map(|(coin, levels)| {
+            let levels = levels.map(|side| {
+                side.into_iter().map(|entry| normalize_output_entry(entry, options.include_users)).collect::<Vec<_>>()
+            });
+            (coin, BookPayload::Levels(LevelsPayload { block_height, block_time: block_time.clone(), levels }))
+        })
+        .map(|(coin, payload)| BookSnapshotEntry(coin, payload))
+        .collect::<Vec<_>>();
+
+    if filtered.is_empty() {
+        return Err(AppError("asset filter matched no books in snapshot json".to_string()));
+    }
+
+    Ok(CheckpointRecord {
+        block_height,
+        block_time: match &filtered[0] {
+            BookSnapshotEntry(_, BookPayload::Levels(levels)) => levels.block_time.clone(),
+            BookSnapshotEntry(_, BookPayload::Trigger(trigger)) => trigger.block_time.clone(),
+        },
+        include_users: options.include_users,
+        include_trigger_orders: false,
+        assets: options.assets.clone(),
+        snapshot: filtered,
+    })
+}
+
+fn write_checkpoint_record(
+    output_dir: PathBuf,
+    record: CheckpointRecord,
+    enforce_10k_boundary: bool,
+) -> AppResult<CheckpointWriteResult> {
     fs::create_dir_all(&output_dir)?;
-    validate_checkpoint_height(record.block_height)?;
+    validate_checkpoint_height(record.block_height, enforce_10k_boundary)?;
     let (segment_start, segment_end) = checkpoint_segment_bounds(record.block_height);
     let segment_path = output_dir.join(format!("segment_{segment_start}_{segment_end}.l4seg"));
     let existing_snapshot_index_path =
@@ -870,8 +944,11 @@ fn write_checkpoint_record(output_dir: PathBuf, record: CheckpointRecord) -> App
     })
 }
 
-fn validate_checkpoint_height(block_height: u64) -> AppResult<()> {
-    if block_height == 0 || block_height % 10_000 != 0 {
+fn validate_checkpoint_height(block_height: u64, enforce_10k_boundary: bool) -> AppResult<()> {
+    if block_height == 0 {
+        return Err(AppError("checkpoint height must be positive".to_string()));
+    }
+    if enforce_10k_boundary && block_height % 10_000 != 0 {
         return Err(AppError(format!("checkpoint height must be a positive multiple of 10000, got {block_height}")));
     }
     Ok(())
@@ -1232,9 +1309,12 @@ fn _compute_l4_native(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BookSource, BookSpec, ComputeOptions, DEFAULT_DATASET_DIR, checkpoint_segment_bounds, current_dataset_dir,
-        order_type_from_code, scaled_to_condition_string, scaled_to_string, select_specs, trigger_condition,
+        BookPayload, BookSnapshotEntry, BookSource, BookSpec, ComputeOptions, DEFAULT_DATASET_DIR, LevelsPayload,
+        OutputOrderEntry, SnapshotOrder, UserWrappedOrder, checkpoint_record_from_snapshot_json_bytes,
+        checkpoint_segment_bounds, current_dataset_dir, order_type_from_code, scaled_to_condition_string,
+        scaled_to_string, select_specs, trigger_condition,
     };
+    use serde_json::json;
 
     #[test]
     fn formats_scaled_strings() {
@@ -1297,5 +1377,178 @@ mod tests {
     #[test]
     fn reports_default_dataset_dir() {
         assert_eq!(current_dataset_dir().to_string_lossy(), DEFAULT_DATASET_DIR);
+    }
+
+    #[test]
+    fn snapshot_json_checkpoint_record_matches_levels_schema_with_users() {
+        let snapshot_json = json!([
+            925072353u64,
+            [
+                [
+                    "ETH",
+                    [
+                        [
+                            [
+                                "0xabc",
+                                {
+                                    "coin": "ETH",
+                                    "side": "A",
+                                    "limitPx": "35621.0",
+                                    "sz": "1.5",
+                                    "oid": 350184080623u64,
+                                    "timestamp": 1u64,
+                                    "triggerCondition": "PriceBelow",
+                                    "isTrigger": true,
+                                    "triggerPx": "35621.0",
+                                    "children": [],
+                                    "isPositionTpsl": false,
+                                    "reduceOnly": false,
+                                    "orderType": "Stop Market",
+                                    "origSz": "1.5",
+                                    "tif": null,
+                                    "cloid": null
+                                }
+                            ]
+                        ],
+                        []
+                    ]
+                ]
+            ]
+        ]);
+        let options = ComputeOptions {
+            include_users: true,
+            include_trigger_orders: false,
+            assets: Some(vec!["ETH".to_string()]),
+        };
+
+        let json_text = serde_json::to_string(&snapshot_json).expect("snapshot json");
+        let record = checkpoint_record_from_snapshot_json_bytes(
+            json_text.as_bytes(),
+            &options,
+            "2026-03-16T02:00:12.176475729".to_string(),
+        )
+        .expect("record from snapshot json");
+
+        let expected_snapshot = vec![BookSnapshotEntry(
+            "ETH".to_string(),
+            BookPayload::Levels(LevelsPayload {
+                block_height: 925072353,
+                block_time: "2026-03-16T02:00:12.176475729".to_string(),
+                levels: [
+                    vec![OutputOrderEntry::WithUser(UserWrappedOrder(
+                        "0xabc".to_string(),
+                        SnapshotOrder {
+                            coin: "ETH".to_string(),
+                            side: "A".to_string(),
+                            limit_px: "35621.0".to_string(),
+                            sz: "1.5".to_string(),
+                            oid: 350184080623,
+                            timestamp: 1,
+                            trigger_condition: "PriceBelow".to_string(),
+                            is_trigger: true,
+                            trigger_px: "35621.0".to_string(),
+                            children: Vec::new(),
+                            is_position_tpsl: false,
+                            reduce_only: false,
+                            order_type: "Stop Market".to_string(),
+                            orig_sz: "1.5".to_string(),
+                            tif: None,
+                            cloid: None,
+                        },
+                    ))],
+                    vec![],
+                ],
+            }),
+        )];
+
+        assert_eq!(
+            serde_json::to_value(&record.snapshot).expect("encode record snapshot"),
+            serde_json::to_value(expected_snapshot).expect("encode expected snapshot")
+        );
+    }
+
+    #[test]
+    fn snapshot_json_checkpoint_record_strips_user_wrapper_when_include_users_false() {
+        let snapshot_json = json!([
+            925072353u64,
+            [
+                [
+                    "ETH",
+                    [
+                        [
+                            [
+                                "0xabc",
+                                {
+                                    "coin": "ETH",
+                                    "side": "A",
+                                    "limitPx": "35621.0",
+                                    "sz": "1.5",
+                                    "oid": 350184080623u64,
+                                    "timestamp": 1u64,
+                                    "triggerCondition": "PriceBelow",
+                                    "isTrigger": true,
+                                    "triggerPx": "35621.0",
+                                    "children": [],
+                                    "isPositionTpsl": false,
+                                    "reduceOnly": false,
+                                    "orderType": "Stop Market",
+                                    "origSz": "1.5",
+                                    "tif": null,
+                                    "cloid": null
+                                }
+                            ]
+                        ],
+                        []
+                    ]
+                ]
+            ]
+        ]);
+        let options = ComputeOptions {
+            include_users: false,
+            include_trigger_orders: false,
+            assets: Some(vec!["ETH".to_string()]),
+        };
+
+        let json_text = serde_json::to_string(&snapshot_json).expect("snapshot json");
+        let record = checkpoint_record_from_snapshot_json_bytes(
+            json_text.as_bytes(),
+            &options,
+            "2026-03-16T02:00:12.176475729".to_string(),
+        )
+        .expect("record from snapshot json");
+
+        assert_eq!(
+            serde_json::to_value(&record.snapshot).expect("encode record snapshot"),
+            json!([
+                [
+                    "ETH",
+                    {
+                        "block_height": 925072353u64,
+                        "block_time": "2026-03-16T02:00:12.176475729",
+                        "levels": [
+                            [{
+                                "coin": "ETH",
+                                "side": "A",
+                                "limitPx": "35621.0",
+                                "sz": "1.5",
+                                "oid": 350184080623u64,
+                                "timestamp": 1u64,
+                                "triggerCondition": "PriceBelow",
+                                "isTrigger": true,
+                                "triggerPx": "35621.0",
+                                "children": [],
+                                "isPositionTpsl": false,
+                                "reduceOnly": false,
+                                "orderType": "Stop Market",
+                                "origSz": "1.5",
+                                "tif": null,
+                                "cloid": null
+                            }],
+                            []
+                        ]
+                    }
+                ]
+            ])
+        );
     }
 }

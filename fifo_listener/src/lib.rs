@@ -10,10 +10,12 @@ pub use listener::{
     set_archive_handoff_config, set_archive_mode, set_archive_symbols, set_rotation_blocks, start_listener,
 };
 
+use compute_l4::set_current_dataset_dir;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3_asyncio::TaskLocals;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,7 +62,7 @@ fn build_archive_handoff_config(
 fn configure_archive(
     mode: Option<&str>,
     rotation_blocks: Option<u64>,
-    output_dir: Option<std::path::PathBuf>,
+    output_dir: Option<PathBuf>,
     symbols: Option<Vec<String>>,
     move_to_nas: bool,
     upload_to_oss: bool,
@@ -80,8 +82,9 @@ fn configure_archive(
         oss_bucket,
         oss_prefix,
     )?;
-    if output_dir.is_some() {
-        set_archive_base_dir(output_dir);
+    if let Some(output_dir) = output_dir {
+        set_current_dataset_dir(Some(output_dir.clone()));
+        set_archive_base_dir(Some(output_dir));
     }
     if let Some(n) = rotation_blocks {
         set_rotation_blocks(n);
@@ -250,7 +253,7 @@ impl PyFifoListener {
         &self,
         mode: Option<&str>,
         rotation_blocks: Option<u64>,
-        output_dir: Option<std::path::PathBuf>,
+        output_dir: Option<PathBuf>,
         symbols: Option<Vec<String>>,
         move_to_nas: bool,
         upload_to_oss: bool,
@@ -289,8 +292,17 @@ impl PyFifoListener {
     }
 
     #[pyo3(signature = (output_dir=None))]
-    fn set_archive_dir(&self, output_dir: Option<std::path::PathBuf>) -> String {
-        set_archive_base_dir(output_dir).to_string_lossy().into_owned()
+    fn set_archive_dir(&self, output_dir: Option<PathBuf>) -> String {
+        let snapshot_dir = set_current_dataset_dir(output_dir.clone());
+        let archive_dir = set_archive_base_dir(output_dir);
+        if snapshot_dir != archive_dir {
+            log::warn!(
+                "snapshot dataset dir ({}) differs from archive dataset dir ({}) after set_archive_dir",
+                snapshot_dir.display(),
+                archive_dir.display()
+            );
+        }
+        archive_dir.to_string_lossy().into_owned()
     }
 
     #[pyo3(signature = (symbols=None))]

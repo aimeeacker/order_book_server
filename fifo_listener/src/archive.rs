@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -10,7 +11,8 @@ use std::time::Duration;
 
 use aliyun_oss_rust_sdk::oss::OSS;
 use aliyun_oss_rust_sdk::request::RequestBuilder;
-use log::{info, warn};
+use compute_l4::{ComputeOptions, append_l4_checkpoint_from_snapshot_json};
+use log::{error, info, warn};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
@@ -18,16 +20,24 @@ use parquet::file::properties::WriterProperties;
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::Type;
+use reqwest::blocking::Client;
 use serde::Deserialize;
+use serde_json::json;
 
-const ARCHIVE_BASE_DIR: &str = "/home/aimee/hl_runtime/dataset";
+const ARCHIVE_BASE_DIR: &str = "/home/aimee/hl_runtime/hl/dataset";
 const ARCHIVE_FINALIZE_DIR: &str = "/mnt";
 const DEFAULT_ARCHIVE_SYMBOLS: &[&str] = &["BTC", "ETH"];
 const DEFAULT_OSS_PREFIX: &str = "hyper_data";
+const INFO_SNAPSHOT_URL: &str = "http://localhost:3001/info";
+const INPROGRESS_SUFFIX: &str = ".inprogress";
 const LITE_PRICE_SCALE: u32 = 8;
 const LITE_SIZE_SCALE: u32 = 8;
 const CHECKPOINT_BLOCKS: u64 = 10_000;
-const ROW_GROUP_BLOCKS: u64 = 5_000;
+const STATUS_ROW_GROUP_BLOCKS: u64 = 5_000;
+const DIFF_ROW_GROUP_BLOCKS: u64 = 50_000;
+const MIN_HANDOFF_BLOCK_SPAN: u64 = 5_000;
+const MIN_ARCHIVE_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_DISK_USED_BPS: u64 = 9_500;
 static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
 static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
@@ -431,13 +441,30 @@ impl StreamKind {
             Self::Fill => "fill",
         }
     }
+
+    fn row_group_block_limit(self) -> Option<u64> {
+        match self {
+            Self::Status => Some(STATUS_ROW_GROUP_BLOCKS),
+            Self::Diff => Some(DIFF_ROW_GROUP_BLOCKS),
+            Self::Blocks | Self::Fill => None,
+        }
+    }
 }
 
 struct ParquetFile {
     writer: SerializedFileWriter<std::fs::File>,
-    start_block: u64,
-    path: PathBuf,
-    relative_path: PathBuf,
+    window_start_block: u64,
+    actual_start_block: u64,
+    last_block: u64,
+    tmp_path: PathBuf,
+    final_dir: PathBuf,
+    final_filename_prefix: String,
+    final_filename_suffix: String,
+}
+
+struct ArchiveDiskStatus {
+    available_bytes: u64,
+    used_basis_points: u64,
 }
 
 #[derive(Clone)]
@@ -447,8 +474,13 @@ struct HandoffTask {
     config: ArchiveHandoffConfig,
 }
 
+enum HandoffMessage {
+    File(HandoffTask),
+    Barrier(Sender<()>),
+}
+
 struct ArchiveHandoffWorker {
-    tx: Sender<HandoffTask>,
+    tx: Sender<HandoffMessage>,
     handle: thread::JoinHandle<()>,
 }
 
@@ -456,7 +488,7 @@ struct ParquetStreamWriter<R> {
     stream: StreamKind,
     schema: std::sync::Arc<Type>,
     props: std::sync::Arc<WriterProperties>,
-    handoff_tx: Sender<HandoffTask>,
+    handoff_tx: Sender<HandoffMessage>,
     file: Option<ParquetFile>,
     pending_rows: Vec<R>,
     pending_start_block: Option<u64>,
@@ -467,23 +499,30 @@ impl<R> ParquetStreamWriter<R> {
         stream: StreamKind,
         schema: std::sync::Arc<Type>,
         props: std::sync::Arc<WriterProperties>,
-        handoff_tx: Sender<HandoffTask>,
+        handoff_tx: Sender<HandoffMessage>,
     ) -> Self {
         Self { stream, schema, props, handoff_tx, file: None, pending_rows: Vec::new(), pending_start_block: None }
     }
 
     fn ensure_open(&mut self, coin: &str, mode: ArchiveMode, block: u64) -> parquet::errors::Result<()> {
         if self.file.is_none() {
-            let (start, end) = rotation_bounds(block);
-            self.open_file(coin, mode, start, end)?;
+            let (window_start, end) = rotation_bounds(block);
+            self.open_file(coin, mode, block, window_start, end)?;
         }
         Ok(())
     }
 
-    fn open_file(&mut self, coin: &str, mode: ArchiveMode, start: u64, end: u64) -> parquet::errors::Result<()> {
+    fn open_file(
+        &mut self,
+        coin: &str,
+        mode: ArchiveMode,
+        actual_start: u64,
+        window_start: u64,
+        end: u64,
+    ) -> parquet::errors::Result<()> {
         let base_dir = current_archive_base_dir();
-        let (dir, filename) = match self.stream {
-            StreamKind::Blocks => (base_dir.join(self.stream.name()), format!("blocks_{start}_{end}.parquet")),
+        let (dir, filename_prefix, filename_suffix) = match self.stream {
+            StreamKind::Blocks => (base_dir.join(self.stream.name()), "blocks".to_string(), ".parquet".to_string()),
             _ => {
                 let coin_dir = match mode {
                     ArchiveMode::Lite => coin.to_string(),
@@ -491,30 +530,75 @@ impl<R> ParquetStreamWriter<R> {
                 };
                 (
                     base_dir.join(coin_dir).join(self.stream.name()),
-                    format!("{}_{}_{start}_{end}.parquet", coin, self.stream.name()),
+                    format!("{}_{}", coin, self.stream.name()),
+                    ".parquet".to_string(),
                 )
             }
         };
         fs::create_dir_all(&dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-        let path = dir.join(filename);
-        let relative_path = path
-            .strip_prefix(&base_dir)
-            .map(PathBuf::from)
-            .map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-        let file = fs::File::create(&path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+        let final_path = dir.join(format!("{filename_prefix}_{actual_start}_{end}{filename_suffix}"));
+        let tmp_path = final_path.with_file_name(format!(
+            "{}{}",
+            final_path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet"),
+            INPROGRESS_SUFFIX
+        ));
+        if tmp_path.exists() {
+            fs::remove_file(&tmp_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+        }
+        let file = fs::File::create(&tmp_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
         let writer = SerializedFileWriter::new(file, self.schema.clone(), self.props.clone())?;
-        self.file = Some(ParquetFile { writer, start_block: start, path, relative_path });
+        self.file = Some(ParquetFile {
+            writer,
+            window_start_block: window_start,
+            actual_start_block: actual_start,
+            last_block: actual_start,
+            tmp_path,
+            final_dir: dir,
+            final_filename_prefix: filename_prefix,
+            final_filename_suffix: filename_suffix,
+        });
         Ok(())
     }
 
     fn close(&mut self) -> parquet::errors::Result<()> {
         if let Some(file) = self.file.take() {
-            let path = file.path.clone();
-            let relative_path = file.relative_path.clone();
+            let tmp_path = file.tmp_path.clone();
+            let final_path = file.final_dir.join(format!(
+                "{}_{}_{}{}",
+                file.final_filename_prefix, file.actual_start_block, file.last_block, file.final_filename_suffix
+            ));
+            let relative_path = final_path
+                .strip_prefix(current_archive_base_dir())
+                .map(PathBuf::from)
+                .map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
             file.writer.close()?;
-            enqueue_handoff_task(&self.handoff_tx, path, relative_path)?;
+            fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
+            let span_blocks = file.last_block.saturating_sub(file.actual_start_block) + 1;
+            if span_blocks < MIN_HANDOFF_BLOCK_SPAN {
+                info!(
+                    "Archive finalized but dropping short parquet span={} path={}",
+                    span_blocks,
+                    final_path.display()
+                );
+                fs::remove_file(&final_path).map_err(io_to_parquet_error)?;
+            } else {
+                enqueue_handoff_task(&self.handoff_tx, final_path, relative_path)?;
+            }
         }
         Ok(())
+    }
+
+    fn abort(&mut self) {
+        self.pending_rows.clear();
+        self.pending_start_block = None;
+        if let Some(file) = self.file.take() {
+            drop(file.writer);
+            if let Err(err) = fs::remove_file(&file.tmp_path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    warn!("Failed to remove incomplete parquet {}: {err}", file.tmp_path.display());
+                }
+            }
+        }
     }
 
     fn flush_pending<F>(&mut self, mode: ArchiveMode, write_rows: F) -> parquet::errors::Result<()>
@@ -537,13 +621,20 @@ impl<R> ParquetStreamWriter<R> {
     where
         F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
     {
-        let current_start = self.file.as_ref().map(|current| current.start_block);
+        let current_start = self.file.as_ref().map(|current| current.window_start_block);
         let next_start = rotation_bounds(block).0;
         if current_start.is_some_and(|start| start != next_start) {
             self.flush_pending(mode, write_rows)?;
             self.close()?;
         }
-        if self.pending_start_block.is_some_and(|start| block.saturating_sub(start) + 1 >= ROW_GROUP_BLOCKS) {
+        if let Some(file) = self.file.as_mut() {
+            file.last_block = block;
+        }
+        if self
+            .stream
+            .row_group_block_limit()
+            .is_some_and(|limit| self.pending_start_block.is_some_and(|start| block.saturating_sub(start) + 1 >= limit))
+        {
             self.flush_pending(mode, write_rows)?;
         }
         Ok(())
@@ -564,11 +655,18 @@ impl<R> ParquetStreamWriter<R> {
             return Ok(());
         }
         self.ensure_open(coin, mode, block)?;
+        if let Some(file) = self.file.as_mut() {
+            file.last_block = block;
+        }
         if self.pending_start_block.is_none() {
             self.pending_start_block = Some(block);
         }
         self.pending_rows.extend(rows);
-        if self.pending_start_block.is_some_and(|start| block.saturating_sub(start) + 1 >= ROW_GROUP_BLOCKS) {
+        if self
+            .stream
+            .row_group_block_limit()
+            .is_some_and(|limit| self.pending_start_block.is_some_and(|start| block.saturating_sub(start) + 1 >= limit))
+        {
             self.flush_pending(mode, write_rows)?;
         }
         Ok(())
@@ -597,7 +695,7 @@ struct ArchiveWriters {
 }
 
 impl ArchiveWriters {
-    fn new(mode: ArchiveMode, symbols: Vec<String>, handoff_tx: Sender<HandoffTask>) -> Self {
+    fn new(mode: ArchiveMode, symbols: Vec<String>, handoff_tx: Sender<HandoffMessage>) -> Self {
         let zstd_level = ZstdLevel::try_new(3).unwrap_or_default();
         let props = std::sync::Arc::new(
             WriterProperties::builder()
@@ -795,6 +893,15 @@ impl ArchiveWriters {
         }
         Ok(())
     }
+
+    fn abort_all(&mut self) {
+        self.blocks.abort();
+        for writers in self.coins.values_mut() {
+            writers.status.abort();
+            writers.diff.abort();
+            writers.fill.abort();
+        }
+    }
 }
 
 fn rotation_bounds(block: u64) -> (u64, u64) {
@@ -823,16 +930,89 @@ fn io_other<M: Into<String>>(msg: M) -> std::io::Error {
     std::io::Error::other(msg.into())
 }
 
+#[allow(unsafe_code)]
+fn archive_disk_status(path: &Path) -> std::io::Result<ArchiveDiskStatus> {
+    let path_bytes = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| io_other(format!("path contains interior nul byte: {}", path.display())))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let rc = unsafe { libc::statvfs(path_bytes.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    let block_size = u128::from(stat.f_frsize.max(stat.f_bsize));
+    let total_blocks = u128::from(stat.f_blocks);
+    let available_blocks = u128::from(stat.f_bavail);
+    let total_bytes = block_size.saturating_mul(total_blocks);
+    let available_bytes = block_size.saturating_mul(available_blocks);
+    let used_basis_points = if total_bytes == 0 {
+        0
+    } else {
+        let used_bytes = total_bytes.saturating_sub(available_bytes);
+        ((used_bytes.saturating_mul(10_000)) / total_bytes) as u64
+    };
+    Ok(ArchiveDiskStatus { available_bytes: available_bytes as u64, used_basis_points })
+}
+
+fn ensure_archive_disk_headroom(base_dir: &Path) -> std::io::Result<()> {
+    let status = archive_disk_status(base_dir)?;
+    if status.available_bytes < MIN_ARCHIVE_FREE_BYTES || status.used_basis_points >= MAX_ARCHIVE_DISK_USED_BPS {
+        return Err(io_other(format!(
+            "archive disk headroom low at {}: available_bytes={} used_pct={:.2}",
+            base_dir.display(),
+            status.available_bytes,
+            status.used_basis_points as f64 / 100.0
+        )));
+    }
+    Ok(())
+}
+
+fn cleanup_stale_inprogress_files(base_dir: &Path) {
+    let mut stack = vec![base_dir.to_path_buf()];
+    let mut removed = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.ends_with(INPROGRESS_SUFFIX)) {
+                match fs::remove_file(&path) {
+                    Ok(()) => removed += 1,
+                    Err(err) => warn!("Failed to remove stale in-progress parquet {}: {err}", path.display()),
+                }
+            }
+        }
+    }
+    if removed > 0 {
+        warn!("Removed {} stale in-progress parquet files under {}", removed, base_dir.display());
+    }
+}
+
 fn start_archive_handoff_worker(stop: Arc<AtomicBool>) -> ArchiveHandoffWorker {
-    let (tx, rx) = channel::<HandoffTask>();
+    let (tx, rx) = channel::<HandoffMessage>();
     let handle = thread::spawn(move || {
-        while let Ok(task) = rx.recv() {
-            if let Err(err) = handoff_finalized_parquet(&task) {
-                warn!(
-                    "Archive handoff failed for {} (stop={}): {err}",
-                    task.path.display(),
-                    stop.load(Ordering::SeqCst)
-                );
+        while let Ok(message) = rx.recv() {
+            match message {
+                HandoffMessage::File(task) => {
+                    if let Err(err) = handoff_finalized_parquet(&task) {
+                        warn!(
+                            "Archive handoff failed for {} (stop={}): {err}",
+                            task.path.display(),
+                            stop.load(Ordering::SeqCst)
+                        );
+                    }
+                }
+                HandoffMessage::Barrier(done_tx) => {
+                    let _unused = done_tx.send(());
+                }
             }
         }
     });
@@ -840,17 +1020,93 @@ fn start_archive_handoff_worker(stop: Arc<AtomicBool>) -> ArchiveHandoffWorker {
 }
 
 fn enqueue_handoff_task(
-    handoff_tx: &Sender<HandoffTask>,
+    handoff_tx: &Sender<HandoffMessage>,
     path: PathBuf,
     relative_path: PathBuf,
 ) -> parquet::errors::Result<()> {
     let config = current_archive_handoff_config();
     let task = HandoffTask { path, relative_path, config };
     let task_path = task.path.display().to_string();
-    handoff_tx.send(task).map_err(|err| {
+    handoff_tx.send(HandoffMessage::File(task)).map_err(|err| {
         io_to_parquet_error(io_other(format!("failed to enqueue archive handoff for {task_path}: {err}")))
     })?;
     Ok(())
+}
+
+fn drain_handoff_tasks(handoff_tx: &Sender<HandoffMessage>) -> parquet::errors::Result<()> {
+    let (done_tx, done_rx) = channel::<()>();
+    handoff_tx
+        .send(HandoffMessage::Barrier(done_tx))
+        .map_err(|err| io_to_parquet_error(io_other(format!("failed to enqueue archive handoff barrier: {err}"))))?;
+    done_rx
+        .recv()
+        .map_err(|err| io_to_parquet_error(io_other(format!("failed to wait for archive handoff barrier: {err}"))))?;
+    Ok(())
+}
+
+fn snapshot_bootstrap_path(base_dir: &Path, height: u64) -> PathBuf {
+    base_dir.join(format!(".archive_bootstrap_snapshot_{height}.json"))
+}
+
+fn fetch_snapshot_to_path(output_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let payload = json!({
+        "type": "fileSnapshot",
+        "request": {
+            "type": "l4Snapshots",
+            "includeUsers": true,
+            "includeTriggerOrders": false
+        },
+        "outPath": output_path,
+        "includeHeightInOutput": true
+    });
+    Client::new()
+        .post(INFO_SNAPSHOT_URL)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()?
+        .error_for_status()?;
+    Ok(())
+}
+
+fn write_mid_window_checkpoint(
+    dataset_dir: PathBuf,
+    trigger_height: u64,
+    block_time: String,
+    symbols: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let snapshot_path = snapshot_bootstrap_path(&dataset_dir, trigger_height);
+    fetch_snapshot_to_path(&snapshot_path)?;
+    let options = ComputeOptions { include_users: true, include_trigger_orders: false, assets: Some(symbols.clone()) };
+    let result =
+        append_l4_checkpoint_from_snapshot_json(&snapshot_path, Some(dataset_dir.clone()), &options, block_time)?;
+    info!(
+        "Archive bootstrap checkpoint written from snapshot json trigger_height={} checkpoint_height={} segment={}",
+        trigger_height,
+        result.block_height,
+        result.segment_path.display()
+    );
+    if let Err(err) = fs::remove_file(&snapshot_path) {
+        warn!("Failed to remove bootstrap snapshot {}: {err}", snapshot_path.display());
+    }
+    Ok(())
+}
+
+fn spawn_mid_window_checkpoint_fetch(trigger_height: u64, block_time: String, symbols: Vec<String>) {
+    let dataset_dir = current_archive_base_dir();
+    thread::spawn(move || {
+        if let Err(err) = write_mid_window_checkpoint(dataset_dir.clone(), trigger_height, block_time, symbols.clone())
+        {
+            warn!(
+                "Archive bootstrap checkpoint fetch failed trigger_height={} dataset_dir={} symbols={}: {err}",
+                trigger_height,
+                dataset_dir.display(),
+                symbols.join(",")
+            );
+        }
+    });
 }
 
 fn copy_to_nas(path: &PathBuf, relative_path: &PathBuf) -> parquet::errors::Result<PathBuf> {
@@ -927,6 +1183,82 @@ fn handoff_finalized_parquet(task: &HandoffTask) -> parquet::errors::Result<()> 
         info!("Archive finalized locally without handoff: {}", path.display());
     }
     Ok(())
+}
+
+fn disable_archive_after_failure(
+    writers: &mut Option<ArchiveWriters>,
+    current_mode: &mut Option<ArchiveMode>,
+    current_symbols: &mut Vec<String>,
+    height: u64,
+    context: &str,
+) {
+    error!("Disabling archive after fatal failure at block {}: {}", height, context);
+    if let Some(mut active) = writers.take() {
+        active.abort_all();
+    }
+    *current_mode = None;
+    *current_symbols = current_archive_symbols();
+    set_archive_mode(None);
+}
+
+fn restart_archive_after_handoff(
+    writers: &mut Option<ArchiveWriters>,
+    handoff_tx: &Sender<HandoffMessage>,
+    current_mode: &mut Option<ArchiveMode>,
+    current_symbols: &mut Vec<String>,
+    bootstrap_checkpoint_evaluated: &mut bool,
+    height: u64,
+) {
+    let Some(mode) = *current_mode else {
+        return;
+    };
+    let symbols = current_symbols.clone();
+    let mut active = writers.take().expect("archive writers should exist when restarting");
+    match active.close_all() {
+        Ok(()) => {}
+        Err(err) => {
+            warn!("Archive close during disk-pressure restart failed at {}: {err}", height);
+            active.abort_all();
+            disable_archive_after_failure(
+                writers,
+                current_mode,
+                current_symbols,
+                height,
+                &format!("archive restart close failed: {err}"),
+            );
+            return;
+        }
+    }
+    if let Err(err) = drain_handoff_tasks(handoff_tx) {
+        disable_archive_after_failure(
+            writers,
+            current_mode,
+            current_symbols,
+            height,
+            &format!("archive restart handoff drain failed: {err}"),
+        );
+        return;
+    }
+    match ensure_archive_disk_headroom(&current_archive_base_dir()) {
+        Ok(()) => {
+            info!(
+                "Archive restarted after disk-pressure handoff at block {} with symbols={}",
+                height,
+                symbols.join(",")
+            );
+            *writers = Some(ArchiveWriters::new(mode, symbols, handoff_tx.clone()));
+            *bootstrap_checkpoint_evaluated = false;
+        }
+        Err(err) => {
+            disable_archive_after_failure(
+                writers,
+                current_mode,
+                current_symbols,
+                height,
+                &format!("archive restart still blocked after handoff: {err}"),
+            );
+        }
+    }
 }
 
 fn parse_scaled(value: &str, scale: u32) -> Option<i64> {
@@ -1799,37 +2131,51 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
     let mut writers: Option<ArchiveWriters> = None;
     let mut current_mode: Option<ArchiveMode> = None;
     let mut current_symbols = current_archive_symbols();
-    let mut waiting_for_rotation_start = false;
-    let mut pending_rotation_start: Option<u64> = None;
+    let mut bootstrap_checkpoint_evaluated = false;
 
     loop {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-
         let mode = get_archive_mode();
         let symbols = current_archive_symbols();
         if mode != current_mode || symbols != current_symbols {
             if let Some(mut w) = writers.take() {
-                w.close_all().ok();
+                if let Err(err) = w.close_all() {
+                    warn!("Archive writer close failed during reconfigure: {err}");
+                    w.abort_all();
+                }
+            }
+            if mode.is_some() {
+                let base_dir = current_archive_base_dir();
+                cleanup_stale_inprogress_files(&base_dir);
+                if let Err(err) = ensure_archive_disk_headroom(&base_dir) {
+                    error!("Refusing to enable archive: {err}");
+                    set_archive_mode(None);
+                    current_mode = None;
+                    current_symbols = symbols;
+                    bootstrap_checkpoint_evaluated = false;
+                    continue;
+                }
             }
             writers = mode.map(|mode| ArchiveWriters::new(mode, symbols.clone(), handoff_tx.clone()));
             current_mode = mode;
             current_symbols = symbols;
-            waiting_for_rotation_start = mode.is_some();
-            pending_rotation_start = None;
+            bootstrap_checkpoint_evaluated = false;
         }
 
         let msg = match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(msg) => msg,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::SeqCst) {
+                    continue;
+                }
+                continue;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
-        let Some(writers) = writers.as_mut() else {
+        if writers.is_none() {
             continue;
-        };
-        let mode = writers.mode;
+        }
+        let mode = writers.as_ref().expect("writers checked above").mode;
 
         let order_batch: BatchLite<OrderStatusLite> = match serde_json::from_slice(&msg.order_line) {
             Ok(batch) => batch,
@@ -1895,27 +2241,23 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             continue;
         }
 
-        if waiting_for_rotation_start {
+        if !bootstrap_checkpoint_evaluated {
+            bootstrap_checkpoint_evaluated = true;
             if !is_checkpoint_start(height) {
-                let next_checkpoint_start = checkpoint_start(height).saturating_add(CHECKPOINT_BLOCKS);
-                if pending_rotation_start != Some(next_checkpoint_start) {
-                    warn!(
-                        "Archive enabled mid-window at block {}; waiting for next checkpoint start {} before creating parquet files",
-                        height, next_checkpoint_start
-                    );
-                    pending_rotation_start = Some(next_checkpoint_start);
-                }
-                continue;
+                info!(
+                    "Archive enabled mid-window at block {}; starting parquet immediately and bootstrapping snapshot checkpoint in background",
+                    height
+                );
+                let bootstrap_symbols = writers.as_ref().expect("writers checked above").symbols.clone();
+                spawn_mid_window_checkpoint_fetch(height, order_batch.block_time.clone(), bootstrap_symbols);
             }
-            waiting_for_rotation_start = false;
-            pending_rotation_start = None;
         }
 
         let block_time = order_batch.block_time.clone();
         let order_n = order_batch.events.len() as i32;
         let diff_n = diff_batch.events.len() as i32;
         let fill_n = fill_batch.events.len() as i32;
-        let tracked_symbols = writers.symbols.join(",");
+        let tracked_symbols = writers.as_ref().expect("writers checked above").symbols.join(",");
         let archive_mode = match mode {
             ArchiveMode::Lite => "lite".to_string(),
             ArchiveMode::Full => "full".to_string(),
@@ -1947,7 +2289,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             } else if coin == "ETH" {
                 eth_status_n += 1;
             }
-            if !writers.has_coin(&coin) {
+            if !writers.as_ref().expect("writers checked above").has_coin(&coin) {
                 continue;
             }
             let (s_px, s_sz, s_orig, s_trig) = if mode == ArchiveMode::Full {
@@ -2006,7 +2348,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             } else if coin == "ETH" {
                 eth_diff_n += 1;
             }
-            if !writers.has_coin(&coin) {
+            if !writers.as_ref().expect("writers checked above").has_coin(&coin) {
                 continue;
             }
             let (d_px, d_sz, d_orig, diff_type) = if mode == ArchiveMode::Full {
@@ -2077,7 +2419,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             } else if coin == "ETH" {
                 eth_fill_n += 1;
             }
-            if !writers.has_coin(&coin) {
+            if !writers.as_ref().expect("writers checked above").has_coin(&coin) {
                 continue;
             }
             let (f_px, f_sz, f_pnl, f_fee, f_start) = if mode == ArchiveMode::Full {
@@ -2124,10 +2466,19 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             fill_rows.entry(coin).or_default().push(out);
         }
 
-        if let Err(err) = writers.blocks.advance_block(mode, height, write_block_rows) {
-            warn!("Archive advance blocks failed at {}: {err}", height);
+        let mut fatal_error: Option<String> = None;
+        let writers_ref = writers.as_mut().expect("writers checked above");
+        if let Err(err) = writers_ref.blocks.advance_block(mode, height, write_block_rows) {
+            disable_archive_after_failure(
+                &mut writers,
+                &mut current_mode,
+                &mut current_symbols,
+                height,
+                &format!("blocks advance failed: {err}"),
+            );
+            continue;
         }
-        if let Err(err) = writers.blocks.append_rows(
+        if let Err(err) = writers_ref.blocks.append_rows(
             "blocks",
             mode,
             height,
@@ -2151,34 +2502,70 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             }],
             write_block_rows,
         ) {
-            warn!("Archive write blocks failed at {}: {err}", height);
+            disable_archive_after_failure(
+                &mut writers,
+                &mut current_mode,
+                &mut current_symbols,
+                height,
+                &format!("blocks write failed: {err}"),
+            );
+            continue;
         }
 
-        for coin in writers.symbols.clone() {
-            if let Some(coin_writers) = writers.coin_mut(&coin) {
+        for coin in writers_ref.symbols.clone() {
+            if let Some(coin_writers) = writers_ref.coin_mut(&coin) {
                 if let Err(err) = coin_writers.status.advance_block(mode, height, write_status_rows) {
-                    warn!("Archive advance status {} failed at {}: {err}", coin, height);
+                    fatal_error = Some(format!("status advance failed for {coin}: {err}"));
+                    break;
                 }
                 if let Err(err) = coin_writers.diff.advance_block(mode, height, write_diff_rows) {
-                    warn!("Archive advance diff {} failed at {}: {err}", coin, height);
+                    fatal_error = Some(format!("diff advance failed for {coin}: {err}"));
+                    break;
                 }
                 if let Err(err) = coin_writers.fill.advance_block(mode, height, write_fill_rows) {
-                    warn!("Archive advance fill {} failed at {}: {err}", coin, height);
+                    fatal_error = Some(format!("fill advance failed for {coin}: {err}"));
+                    break;
                 }
                 if let Some(rows) = status_rows.remove(&coin).filter(|rows| !rows.is_empty()) {
                     if let Err(err) = coin_writers.status.append_rows(&coin, mode, height, rows, write_status_rows) {
-                        warn!("Archive write status {} failed at {}: {err}", coin, height);
+                        fatal_error = Some(format!("status write failed for {coin}: {err}"));
+                        break;
                     }
                 }
                 if let Some(rows) = diff_rows.remove(&coin).filter(|rows| !rows.is_empty()) {
                     if let Err(err) = coin_writers.diff.append_rows(&coin, mode, height, rows, write_diff_rows) {
-                        warn!("Archive write diff {} failed at {}: {err}", coin, height);
+                        fatal_error = Some(format!("diff write failed for {coin}: {err}"));
+                        break;
                     }
                 }
                 if let Some(rows) = fill_rows.remove(&coin).filter(|rows| !rows.is_empty()) {
                     if let Err(err) = coin_writers.fill.append_rows(&coin, mode, height, rows, write_fill_rows) {
-                        warn!("Archive write fill {} failed at {}: {err}", coin, height);
+                        fatal_error = Some(format!("fill write failed for {coin}: {err}"));
+                        break;
                     }
+                }
+            }
+        }
+        if let Some(context) = fatal_error {
+            disable_archive_after_failure(&mut writers, &mut current_mode, &mut current_symbols, height, &context);
+            continue;
+        }
+        if height % CHECKPOINT_BLOCKS == 0 {
+            match ensure_archive_disk_headroom(&current_archive_base_dir()) {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!(
+                        "Archive disk headroom low at checkpoint block {}; closing current parquet files and draining handoff before restart: {err}",
+                        height
+                    );
+                    restart_archive_after_handoff(
+                        &mut writers,
+                        &handoff_tx,
+                        &mut current_mode,
+                        &mut current_symbols,
+                        &mut bootstrap_checkpoint_evaluated,
+                        height,
+                    );
                 }
             }
         }
@@ -2187,6 +2574,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
     if let Some(mut w) = writers.take() {
         if let Err(err) = w.close_all() {
             warn!("Archive writer close failed: {err}");
+            w.abort_all();
         }
     }
     let ArchiveHandoffWorker { tx: handoff_worker_tx, handle } = handoff_worker;

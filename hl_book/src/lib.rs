@@ -88,8 +88,9 @@ fn configure_archive(
         oss_bucket,
         oss_prefix,
     )?;
-    if output_dir.is_some() {
-        set_archive_base_dir(output_dir);
+    if let Some(output_dir) = output_dir {
+        set_current_dataset_dir(Some(output_dir.clone()));
+        set_archive_base_dir(Some(output_dir));
     }
     if let Some(n) = rotation_blocks {
         set_rotation_blocks(n);
@@ -300,7 +301,16 @@ impl PyFifoListener {
 
     #[pyo3(signature = (output_dir=None))]
     fn set_archive_dir(&self, output_dir: Option<PathBuf>) -> String {
-        set_archive_base_dir(output_dir).to_string_lossy().into_owned()
+        let snapshot_dir = set_current_dataset_dir(output_dir.clone());
+        let archive_dir = set_archive_base_dir(output_dir);
+        if snapshot_dir != archive_dir {
+            log::warn!(
+                "snapshot dataset dir ({}) differs from archive dataset dir ({}) after set_archive_dir",
+                snapshot_dir.display(),
+                archive_dir.display()
+            );
+        }
+        archive_dir.to_string_lossy().into_owned()
     }
 
     #[pyo3(signature = (symbols=None))]

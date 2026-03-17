@@ -746,20 +746,23 @@ fn run_aggregator(
             return;
         }
     };
+    let mut input_disconnected = false;
 
     loop {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        let msg = match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(msg) => msg,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        match msg.source {
-            FifoSource::Order => queues.order.push_back(msg),
-            FifoSource::Diffs => queues.diffs.push_back(msg),
-            FifoSource::Fills => queues.fills.push_back(msg),
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(msg) => match msg.source {
+                FifoSource::Order => queues.order.push_back(msg),
+                FifoSource::Diffs => queues.diffs.push_back(msg),
+                FifoSource::Fills => queues.fills.push_back(msg),
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::SeqCst) && input_disconnected {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                input_disconnected = true;
+            }
         }
 
         while queues.order.len() > MAX_PENDING_HEIGHTS {
@@ -812,12 +815,15 @@ fn run_aggregator(
                     let mut msg: Option<ArchiveBlock> =
                         Some(ArchiveBlock::new(height, fills_line, diffs_line, order_line));
                     while let Some(block) = msg.take() {
-                        match tx.try_send(block) {
+                        let shutdown = stop.load(Ordering::SeqCst);
+                        let send_res: Result<(), TrySendError<ArchiveBlock>> = if shutdown {
+                            tx.send(block).map_err(|err| TrySendError::Disconnected(err.0))
+                        } else {
+                            tx.try_send(block)
+                        };
+                        match send_res {
                             Ok(()) => break,
                             Err(TrySendError::Full(block)) => {
-                                if stop.load(Ordering::SeqCst) {
-                                    break;
-                                }
                                 msg = Some(block);
                                 thread::sleep(Duration::from_millis(5));
                             }
@@ -832,6 +838,10 @@ fn run_aggregator(
             if height % 2000 == 0 {
                 info!("Processed block height {}", height);
             }
+        }
+
+        if input_disconnected && queues.order.is_empty() && queues.diffs.is_empty() && queues.fills.is_empty() {
+            break;
         }
     }
 }
