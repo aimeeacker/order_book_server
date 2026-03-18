@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
@@ -11,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use aliyun_oss_rust_sdk::oss::OSS;
 use aliyun_oss_rust_sdk::request::RequestBuilder;
-use compute_l4::{ComputeOptions, append_l4_checkpoint_from_snapshot_json};
 use log::{error, info, warn};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::column::writer::ColumnWriter;
@@ -29,6 +29,22 @@ const DEFAULT_ARCHIVE_FINALIZE_DIR: &str = "/mnt";
 const DEFAULT_ARCHIVE_SYMBOLS: &[&str] = &["BTC", "ETH"];
 const DEFAULT_OSS_PREFIX: &str = "hyper_data";
 const INFO_SNAPSHOT_URL: &str = "http://localhost:3001/info";
+const SNAPSHOT_CHECKPOINT_SUBPROCESS: &str = r#"
+import json
+import sys
+
+import _hl_book_native as hl_book
+
+meta = hl_book.append_checkpoint_from_snapshot_json(
+    sys.argv[1],
+    output_dir=sys.argv[2],
+    block_time=sys.argv[3],
+    include_users=True,
+    include_trigger_orders=False,
+    assets=sys.argv[4:],
+)
+print(json.dumps(meta, separators=(",", ":")))
+"#;
 const TEMP_FILE_SUFFIX: &str = ".tmp";
 const LITE_PRICE_SCALE: u32 = 8;
 const LITE_SIZE_SCALE: u32 = 8;
@@ -1446,14 +1462,43 @@ fn write_mid_window_checkpoint(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let snapshot_path = snapshot_bootstrap_path(&dataset_dir, trigger_height);
     fetch_snapshot_to_path(&snapshot_path)?;
-    let options = ComputeOptions { include_users: true, include_trigger_orders: false, assets: Some(symbols.clone()) };
-    let result =
-        append_l4_checkpoint_from_snapshot_json(&snapshot_path, Some(dataset_dir.clone()), &options, block_time)?;
+    let python = std::env::current_exe()?;
+    let output = Command::new(&python)
+        .arg("-c")
+        .arg(SNAPSHOT_CHECKPOINT_SUBPROCESS)
+        .arg(&snapshot_path)
+        .arg(&dataset_dir)
+        .arg(&block_time)
+        .args(&symbols)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "snapshot checkpoint child failed status={} exe={} stderr={stderr}",
+            output.status,
+            python.display()
+        )
+        .into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let meta: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|err| {
+        format!(
+            "snapshot checkpoint child returned invalid json exe={} stdout={} err={err}",
+            python.display(),
+            stdout.trim()
+        )
+    })?;
+    let checkpoint_height = meta
+        .get("block_height")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("snapshot checkpoint child json missing block_height: {}", meta))?;
+    let segment = meta
+        .get("segment_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("snapshot checkpoint child json missing segment_path: {}", meta))?;
     info!(
         "Archive bootstrap checkpoint written from snapshot json trigger_height={} checkpoint_height={} segment={}",
-        trigger_height,
-        result.block_height,
-        result.segment_path.display()
+        trigger_height, checkpoint_height, segment
     );
     if let Err(err) = fs::remove_file(&snapshot_path) {
         warn!("Failed to remove bootstrap snapshot {}: {err}", snapshot_path.display());

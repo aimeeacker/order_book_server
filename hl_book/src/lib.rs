@@ -7,8 +7,8 @@ use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use compute_l4::{
-    ComputeOptions, append_l4_checkpoint, compute_l4_json, compute_l4_to_file, current_dataset_dir,
-    set_current_dataset_dir,
+    ComputeOptions, append_l4_checkpoint, append_l4_checkpoint_from_snapshot_json, compute_l4_json, compute_l4_to_file,
+    current_dataset_dir, set_current_dataset_dir,
 };
 use fifo_listener::{
     ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, HeightCallback, ListenerHandle, current_archive_base_dir,
@@ -395,6 +395,23 @@ fn py_append_checkpoint(
     checkpoint_result_to_py(py, result)
 }
 
+#[pyfunction(name = "append_checkpoint_from_snapshot_json")]
+#[pyo3(signature = (input, block_time, output_dir=None, include_users=false, include_trigger_orders=false, assets=None))]
+fn py_append_checkpoint_from_snapshot_json(
+    py: Python<'_>,
+    input: PathBuf,
+    block_time: String,
+    output_dir: Option<PathBuf>,
+    include_users: bool,
+    include_trigger_orders: bool,
+    assets: Option<Vec<String>>,
+) -> PyResult<PyObject> {
+    let options = ComputeOptions { include_users, include_trigger_orders, assets };
+    let result =
+        append_l4_checkpoint_from_snapshot_json(input, output_dir, &options, block_time).map_err(into_py_err)?;
+    checkpoint_result_to_py(py, result)
+}
+
 #[pyfunction(name = "get_dataset_dir")]
 fn py_get_dataset_dir() -> String {
     let snapshot_dir = current_dataset_dir();
@@ -430,6 +447,7 @@ fn _hl_book_native(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_compute_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_compute_to_file, m)?)?;
     m.add_function(wrap_pyfunction!(py_append_checkpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(py_append_checkpoint_from_snapshot_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_get_dataset_dir, m)?)?;
     m.add_function(wrap_pyfunction!(py_set_dataset_dir, m)?)?;
     Ok(())
