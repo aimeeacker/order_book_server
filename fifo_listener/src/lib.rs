@@ -33,6 +33,7 @@ fn parse_archive_mode(mode: Option<&str>) -> PyResult<Option<ArchiveMode>> {
 
 fn build_archive_handoff_config(
     move_to_nas: bool,
+    nas_output_dir: Option<PathBuf>,
     upload_to_oss: bool,
     oss_access_key_id: Option<String>,
     oss_access_key_secret: Option<String>,
@@ -56,7 +57,7 @@ fn build_archive_handoff_config(
             "upload_to_oss requires OSS access_key_id, access_key_secret, endpoint, and bucket",
         ));
     }
-    Ok(ArchiveHandoffConfig::new(move_to_nas, upload_to_oss, oss))
+    Ok(ArchiveHandoffConfig::new(move_to_nas, nas_output_dir, upload_to_oss, oss))
 }
 
 fn configure_archive(
@@ -65,6 +66,7 @@ fn configure_archive(
     output_dir: Option<PathBuf>,
     symbols: Option<Vec<String>>,
     move_to_nas: bool,
+    nas_output_dir: Option<PathBuf>,
     upload_to_oss: bool,
     oss_access_key_id: Option<String>,
     oss_access_key_secret: Option<String>,
@@ -75,6 +77,7 @@ fn configure_archive(
     let mode = parse_archive_mode(mode)?;
     let handoff = build_archive_handoff_config(
         move_to_nas,
+        nas_output_dir,
         upload_to_oss,
         oss_access_key_id,
         oss_access_key_secret,
@@ -242,6 +245,7 @@ impl PyFifoListener {
         output_dir=None,
         symbols=None,
         move_to_nas=true,
+        nas_output_dir=None,
         upload_to_oss=false,
         oss_access_key_id=None,
         oss_access_key_secret=None,
@@ -256,6 +260,7 @@ impl PyFifoListener {
         output_dir: Option<PathBuf>,
         symbols: Option<Vec<String>>,
         move_to_nas: bool,
+        nas_output_dir: Option<PathBuf>,
         upload_to_oss: bool,
         oss_access_key_id: Option<String>,
         oss_access_key_secret: Option<String>,
@@ -269,6 +274,7 @@ impl PyFifoListener {
             output_dir,
             symbols,
             move_to_nas,
+            nas_output_dir,
             upload_to_oss,
             oss_access_key_id,
             oss_access_key_secret,

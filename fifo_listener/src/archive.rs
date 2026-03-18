@@ -4,7 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 const ARCHIVE_BASE_DIR: &str = "/home/aimee/hl_runtime/hl/dataset";
-const ARCHIVE_FINALIZE_DIR: &str = "/mnt";
+const DEFAULT_ARCHIVE_FINALIZE_DIR: &str = "/mnt";
 const DEFAULT_ARCHIVE_SYMBOLS: &[&str] = &["BTC", "ETH"];
 const DEFAULT_OSS_PREFIX: &str = "hyper_data";
 const INFO_SNAPSHOT_URL: &str = "http://localhost:3001/info";
@@ -33,11 +33,12 @@ const INPROGRESS_SUFFIX: &str = ".inprogress";
 const LITE_PRICE_SCALE: u32 = 8;
 const LITE_SIZE_SCALE: u32 = 8;
 const CHECKPOINT_BLOCKS: u64 = 10_000;
-const STATUS_ROW_GROUP_BLOCKS: u64 = 5_000;
+const STATUS_ROW_GROUP_BLOCKS: u64 = 2_000;
 const DIFF_ROW_GROUP_BLOCKS: u64 = 50_000;
 const MIN_HANDOFF_BLOCK_SPAN: u64 = 5_000;
 const MIN_ARCHIVE_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_DISK_USED_BPS: u64 = 9_500;
+const STATUS_WORKER_QUEUE_BLOCKS: usize = 64;
 static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
 static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
@@ -88,19 +89,30 @@ impl std::fmt::Debug for ArchiveOssConfig {
 #[derive(Clone, PartialEq, Eq)]
 pub struct ArchiveHandoffConfig {
     pub move_to_nas: bool,
+    pub nas_output_dir: PathBuf,
     pub upload_to_oss: bool,
     pub oss: Option<ArchiveOssConfig>,
 }
 
 impl ArchiveHandoffConfig {
-    pub fn new(move_to_nas: bool, upload_to_oss: bool, oss: Option<ArchiveOssConfig>) -> Self {
-        Self { move_to_nas, upload_to_oss, oss }
+    pub fn new(
+        move_to_nas: bool,
+        nas_output_dir: Option<PathBuf>,
+        upload_to_oss: bool,
+        oss: Option<ArchiveOssConfig>,
+    ) -> Self {
+        Self {
+            move_to_nas,
+            nas_output_dir: nas_output_dir.unwrap_or_else(default_archive_finalize_dir),
+            upload_to_oss,
+            oss,
+        }
     }
 }
 
 impl Default for ArchiveHandoffConfig {
     fn default() -> Self {
-        Self { move_to_nas: true, upload_to_oss: false, oss: None }
+        Self { move_to_nas: true, nas_output_dir: default_archive_finalize_dir(), upload_to_oss: false, oss: None }
     }
 }
 
@@ -108,6 +120,7 @@ impl std::fmt::Debug for ArchiveHandoffConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArchiveHandoffConfig")
             .field("move_to_nas", &self.move_to_nas)
+            .field("nas_output_dir", &self.nas_output_dir)
             .field("upload_to_oss", &self.upload_to_oss)
             .field("oss", &self.oss)
             .finish()
@@ -158,6 +171,10 @@ fn normalize_archive_symbols(symbols: Option<Vec<String>>) -> Vec<String> {
 
 fn normalize_oss_prefix(prefix: Option<String>) -> String {
     prefix.unwrap_or_else(|| DEFAULT_OSS_PREFIX.to_string()).trim_matches('/').to_string()
+}
+
+fn default_archive_finalize_dir() -> PathBuf {
+    PathBuf::from(DEFAULT_ARCHIVE_FINALIZE_DIR)
 }
 
 pub fn current_archive_base_dir() -> PathBuf {
@@ -449,6 +466,10 @@ impl StreamKind {
             Self::Blocks | Self::Fill => None,
         }
     }
+
+    fn uses_delayed_flush(self) -> bool {
+        matches!(self, Self::Status | Self::Diff)
+    }
 }
 
 struct ParquetFile {
@@ -484,14 +505,42 @@ struct ArchiveHandoffWorker {
     handle: thread::JoinHandle<()>,
 }
 
+struct PendingRowGroup<R> {
+    rows: Vec<R>,
+    start_block: Option<u64>,
+    end_block: Option<u64>,
+}
+
+impl<R> PendingRowGroup<R> {
+    fn new() -> Self {
+        Self { rows: Vec::new(), start_block: None, end_block: None }
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.start_block = None;
+        self.end_block = None;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    fn take_rows(&mut self) -> Vec<R> {
+        self.start_block = None;
+        self.end_block = None;
+        std::mem::take(&mut self.rows)
+    }
+}
+
 struct ParquetStreamWriter<R> {
     stream: StreamKind,
     schema: std::sync::Arc<Type>,
     props: std::sync::Arc<WriterProperties>,
     handoff_tx: Sender<HandoffMessage>,
     file: Option<ParquetFile>,
-    pending_rows: Vec<R>,
-    pending_start_block: Option<u64>,
+    active: PendingRowGroup<R>,
+    delayed: PendingRowGroup<R>,
 }
 
 impl<R> ParquetStreamWriter<R> {
@@ -501,7 +550,15 @@ impl<R> ParquetStreamWriter<R> {
         props: std::sync::Arc<WriterProperties>,
         handoff_tx: Sender<HandoffMessage>,
     ) -> Self {
-        Self { stream, schema, props, handoff_tx, file: None, pending_rows: Vec::new(), pending_start_block: None }
+        Self {
+            stream,
+            schema,
+            props,
+            handoff_tx,
+            file: None,
+            active: PendingRowGroup::new(),
+            delayed: PendingRowGroup::new(),
+        }
     }
 
     fn ensure_open(&mut self, coin: &str, mode: ArchiveMode, block: u64) -> parquet::errors::Result<()> {
@@ -589,8 +646,8 @@ impl<R> ParquetStreamWriter<R> {
     }
 
     fn abort(&mut self) {
-        self.pending_rows.clear();
-        self.pending_start_block = None;
+        self.active.clear();
+        self.delayed.clear();
         if let Some(file) = self.file.take() {
             drop(file.writer);
             if let Err(err) = fs::remove_file(&file.tmp_path) {
@@ -601,19 +658,83 @@ impl<R> ParquetStreamWriter<R> {
         }
     }
 
-    fn flush_pending<F>(&mut self, mode: ArchiveMode, write_rows: F) -> parquet::errors::Result<()>
+    fn write_buffer<F>(&mut self, mode: ArchiveMode, rows: Vec<R>, write_rows: F) -> parquet::errors::Result<()>
     where
         F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
     {
-        if self.pending_rows.is_empty() {
-            self.pending_start_block = None;
+        if rows.is_empty() {
             return Ok(());
         }
         if let Some(file) = self.file.as_mut() {
-            write_rows(&mut file.writer, mode, &self.pending_rows)?;
+            write_rows(&mut file.writer, mode, &rows)?;
         }
-        self.pending_rows.clear();
-        self.pending_start_block = None;
+        Ok(())
+    }
+
+    fn flush_immediate<F>(&mut self, mode: ArchiveMode, write_rows: F) -> parquet::errors::Result<()>
+    where
+        F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+    {
+        let rows = self.active.take_rows();
+        self.write_buffer(mode, rows, write_rows)
+    }
+
+    fn flush_delayed_buffer<F>(&mut self, mode: ArchiveMode, write_rows: F) -> parquet::errors::Result<()>
+    where
+        F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+    {
+        let rows = self.delayed.take_rows();
+        self.write_buffer(mode, rows, write_rows)
+    }
+
+    fn finalize_active_window<F>(&mut self, mode: ArchiveMode, write_rows: F) -> parquet::errors::Result<()>
+    where
+        F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+    {
+        if !self.delayed.is_empty() {
+            self.flush_delayed_buffer(mode, write_rows)?;
+        }
+        if !self.active.is_empty() {
+            let start_block = self.active.start_block.take();
+            let end_block = self.active.end_block.take();
+            self.delayed.rows = self.active.take_rows();
+            self.delayed.start_block = start_block;
+            self.delayed.end_block = end_block;
+        } else {
+            self.active.start_block = None;
+            self.active.end_block = None;
+        }
+        Ok(())
+    }
+
+    fn ensure_active_window(&mut self, block: u64) {
+        if self.active.end_block.is_none() {
+            if let Some(span) = self.stream.row_group_block_limit() {
+                let (start, end) = aligned_row_group_bounds(block, span);
+                self.active.start_block = Some(start);
+                self.active.end_block = Some(end);
+            }
+        }
+    }
+
+    fn advance_delayed_windows<F>(
+        &mut self,
+        mode: ArchiveMode,
+        block: u64,
+        write_rows: F,
+    ) -> parquet::errors::Result<()>
+    where
+        F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+    {
+        self.ensure_active_window(block);
+        while self.active.end_block.is_some_and(|end| block > end) {
+            let current_end = self.active.end_block.expect("active end checked above");
+            self.finalize_active_window(mode, write_rows)?;
+            if let Some(span) = self.stream.row_group_block_limit() {
+                self.active.start_block = Some(current_end + 1);
+                self.active.end_block = Some(current_end + span);
+            }
+        }
         Ok(())
     }
 
@@ -624,18 +745,19 @@ impl<R> ParquetStreamWriter<R> {
         let current_start = self.file.as_ref().map(|current| current.window_start_block);
         let next_start = rotation_bounds(block).0;
         if current_start.is_some_and(|start| start != next_start) {
-            self.flush_pending(mode, write_rows)?;
-            self.close()?;
+            self.close_with_flush(mode, write_rows)?;
         }
         if let Some(file) = self.file.as_mut() {
             file.last_block = block;
         }
-        if self
+        if self.stream.uses_delayed_flush() {
+            self.advance_delayed_windows(mode, block, write_rows)?;
+        } else if self
             .stream
             .row_group_block_limit()
-            .is_some_and(|limit| self.pending_start_block.is_some_and(|start| block.saturating_sub(start) + 1 >= limit))
+            .is_some_and(|limit| self.active.start_block.is_some_and(|start| block.saturating_sub(start) + 1 >= limit))
         {
-            self.flush_pending(mode, write_rows)?;
+            self.flush_immediate(mode, write_rows)?;
         }
         Ok(())
     }
@@ -658,31 +780,169 @@ impl<R> ParquetStreamWriter<R> {
         if let Some(file) = self.file.as_mut() {
             file.last_block = block;
         }
-        if self.pending_start_block.is_none() {
-            self.pending_start_block = Some(block);
+        if self.stream.uses_delayed_flush() {
+            self.ensure_active_window(block);
+        } else if self.active.start_block.is_none() {
+            self.active.start_block = Some(block);
         }
-        self.pending_rows.extend(rows);
-        if self
+        self.active.rows.extend(rows);
+        if self.stream.uses_delayed_flush() {
+            if self.active.end_block == Some(block) {
+                self.finalize_active_window(mode, write_rows)?;
+            }
+        } else if self
             .stream
             .row_group_block_limit()
-            .is_some_and(|limit| self.pending_start_block.is_some_and(|start| block.saturating_sub(start) + 1 >= limit))
+            .is_some_and(|limit| self.active.start_block.is_some_and(|start| block.saturating_sub(start) + 1 >= limit))
         {
-            self.flush_pending(mode, write_rows)?;
+            self.flush_immediate(mode, write_rows)?;
         }
         Ok(())
+    }
+
+    fn should_merge_tail(&self) -> bool {
+        let Some(span) = self.stream.row_group_block_limit() else {
+            return false;
+        };
+        let Some(file) = self.file.as_ref() else {
+            return false;
+        };
+        let Some(active_start) = self.active.start_block else {
+            return false;
+        };
+        let observed_span = file.last_block.saturating_sub(active_start) + 1;
+        observed_span < span
     }
 
     fn close_with_flush<F>(&mut self, mode: ArchiveMode, write_rows: F) -> parquet::errors::Result<()>
     where
         F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
     {
-        self.flush_pending(mode, write_rows)?;
+        if self.stream.uses_delayed_flush() {
+            if !self.delayed.is_empty() {
+                if !self.active.is_empty() && self.should_merge_tail() {
+                    let mut rows = self.delayed.take_rows();
+                    rows.extend(self.active.take_rows());
+                    self.write_buffer(mode, rows, write_rows)?;
+                } else {
+                    self.flush_delayed_buffer(mode, write_rows)?;
+                    self.flush_immediate(mode, write_rows)?;
+                }
+            } else {
+                self.flush_immediate(mode, write_rows)?;
+            }
+            self.active.start_block = None;
+            self.active.end_block = None;
+            self.delayed.start_block = None;
+            self.delayed.end_block = None;
+        } else {
+            self.flush_immediate(mode, write_rows)?;
+        }
         self.close()
     }
 }
 
+enum StatusWorkerMessage {
+    Block { height: u64, rows: Vec<StatusOut> },
+    Close,
+    Abort,
+}
+
+struct StatusWorkerHandle {
+    coin: String,
+    tx: SyncSender<StatusWorkerMessage>,
+    error_rx: Receiver<String>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl StatusWorkerHandle {
+    fn new(
+        coin: String,
+        mode: ArchiveMode,
+        schema: std::sync::Arc<Type>,
+        props: std::sync::Arc<WriterProperties>,
+        handoff_tx: Sender<HandoffMessage>,
+    ) -> Self {
+        let (tx, rx) = sync_channel(STATUS_WORKER_QUEUE_BLOCKS);
+        let (error_tx, error_rx) = channel();
+        let worker_coin = coin.clone();
+        let handle = thread::spawn(move || {
+            let mut writer = ParquetStreamWriter::new(StreamKind::Status, schema, props, handoff_tx);
+            while let Ok(message) = rx.recv() {
+                let result = match message {
+                    StatusWorkerMessage::Block { height, rows } => {
+                        writer.advance_block(mode, height, write_status_rows).and_then(|_| {
+                            if rows.is_empty() {
+                                Ok(())
+                            } else {
+                                writer.append_rows(&worker_coin, mode, height, rows, write_status_rows)
+                            }
+                        })
+                    }
+                    StatusWorkerMessage::Close => {
+                        let result = writer.close_with_flush(mode, write_status_rows);
+                        if result.is_err() {
+                            writer.abort();
+                        }
+                        if let Err(err) = result {
+                            let _unused = error_tx.send(err.to_string());
+                        }
+                        break;
+                    }
+                    StatusWorkerMessage::Abort => {
+                        writer.abort();
+                        break;
+                    }
+                };
+                if let Err(err) = result {
+                    writer.abort();
+                    let _unused = error_tx.send(err.to_string());
+                    break;
+                }
+            }
+        });
+        Self { coin, tx, error_rx, handle: Some(handle) }
+    }
+
+    fn check_error(&self) -> parquet::errors::Result<()> {
+        match self.error_rx.try_recv() {
+            Ok(err) => Err(io_to_parquet_error(io_other(format!("status worker failed for {}: {err}", self.coin)))),
+            Err(TryRecvError::Empty) => Ok(()),
+            Err(TryRecvError::Disconnected) => Ok(()),
+        }
+    }
+
+    fn send_block(&self, height: u64, rows: Vec<StatusOut>) -> parquet::errors::Result<()> {
+        self.check_error()?;
+        self.tx.send(StatusWorkerMessage::Block { height, rows }).map_err(|err| {
+            io_to_parquet_error(io_other(format!("status worker send failed for {}: {err}", self.coin)))
+        })?;
+        self.check_error()
+    }
+
+    fn close(mut self) -> parquet::errors::Result<()> {
+        self.check_error()?;
+        self.tx.send(StatusWorkerMessage::Close).map_err(|err| {
+            io_to_parquet_error(io_other(format!("status worker close send failed for {}: {err}", self.coin)))
+        })?;
+        if let Some(handle) = self.handle.take() {
+            handle.join().map_err(|err| {
+                io_to_parquet_error(io_other(format!("status worker join failed for {}: {err:?}", self.coin)))
+            })?;
+        }
+        self.check_error()
+    }
+
+    fn abort(mut self) {
+        let _unused = self.tx.send(StatusWorkerMessage::Abort);
+        if let Some(handle) = self.handle.take() {
+            let _unused = handle.join();
+        }
+    }
+}
+
 struct CoinWriters {
-    status: ParquetStreamWriter<StatusOut>,
+    status: StatusWorkerHandle,
     diff: ParquetStreamWriter<DiffOut>,
     fill: ParquetStreamWriter<FillOut>,
 }
@@ -846,8 +1106,9 @@ impl ArchiveWriters {
             coins.insert(
                 coin.clone(),
                 CoinWriters {
-                    status: ParquetStreamWriter::new(
-                        StreamKind::Status,
+                    status: StatusWorkerHandle::new(
+                        coin.clone(),
+                        mode,
                         status_schema.clone(),
                         props.clone(),
                         handoff_tx.clone(),
@@ -886,8 +1147,9 @@ impl ArchiveWriters {
 
     fn close_all(&mut self) -> parquet::errors::Result<()> {
         self.blocks.close_with_flush(self.mode, write_block_rows)?;
-        for writers in self.coins.values_mut() {
-            writers.status.close_with_flush(self.mode, write_status_rows)?;
+        for (_, writers) in std::mem::take(&mut self.coins) {
+            let mut writers = writers;
+            writers.status.close()?;
             writers.diff.close_with_flush(self.mode, write_diff_rows)?;
             writers.fill.close_with_flush(self.mode, write_fill_rows)?;
         }
@@ -896,7 +1158,8 @@ impl ArchiveWriters {
 
     fn abort_all(&mut self) {
         self.blocks.abort();
-        for writers in self.coins.values_mut() {
+        for (_, writers) in std::mem::take(&mut self.coins) {
+            let mut writers = writers;
             writers.status.abort();
             writers.diff.abort();
             writers.fill.abort();
@@ -908,6 +1171,12 @@ fn rotation_bounds(block: u64) -> (u64, u64) {
     let rotation = ROTATION_BLOCKS.load(Ordering::SeqCst);
     let start = ((block.saturating_sub(1)) / rotation) * rotation + 1;
     let end = start + rotation - 1;
+    (start, end)
+}
+
+fn aligned_row_group_bounds(block: u64, span: u64) -> (u64, u64) {
+    let end = ((block.saturating_sub(1)) / span + 1) * span;
+    let start = end.saturating_sub(span) + 1;
     (start, end)
 }
 
@@ -1109,8 +1378,7 @@ fn spawn_mid_window_checkpoint_fetch(trigger_height: u64, block_time: String, sy
     });
 }
 
-fn copy_to_nas(path: &PathBuf, relative_path: &PathBuf) -> parquet::errors::Result<PathBuf> {
-    let dest_root = PathBuf::from(ARCHIVE_FINALIZE_DIR);
+fn copy_to_nas(path: &PathBuf, relative_path: &PathBuf, dest_root: &Path) -> parquet::errors::Result<PathBuf> {
     let dest_path = dest_root.join(relative_path);
     if *path == dest_path {
         return Ok(dest_path);
@@ -1161,7 +1429,8 @@ fn handoff_finalized_parquet(task: &HandoffTask) -> parquet::errors::Result<()> 
     let path = &task.path;
     let relative_path = &task.relative_path;
     let config = &task.config;
-    let nas_dest = if config.move_to_nas { Some(copy_to_nas(path, relative_path)?) } else { None };
+    let nas_dest =
+        if config.move_to_nas { Some(copy_to_nas(path, relative_path, &config.nas_output_dir)?) } else { None };
 
     if config.upload_to_oss {
         let Some(oss_config) = config.oss.as_ref() else {
@@ -2514,10 +2783,6 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
 
         for coin in writers_ref.symbols.clone() {
             if let Some(coin_writers) = writers_ref.coin_mut(&coin) {
-                if let Err(err) = coin_writers.status.advance_block(mode, height, write_status_rows) {
-                    fatal_error = Some(format!("status advance failed for {coin}: {err}"));
-                    break;
-                }
                 if let Err(err) = coin_writers.diff.advance_block(mode, height, write_diff_rows) {
                     fatal_error = Some(format!("diff advance failed for {coin}: {err}"));
                     break;
@@ -2526,11 +2791,10 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     fatal_error = Some(format!("fill advance failed for {coin}: {err}"));
                     break;
                 }
-                if let Some(rows) = status_rows.remove(&coin).filter(|rows| !rows.is_empty()) {
-                    if let Err(err) = coin_writers.status.append_rows(&coin, mode, height, rows, write_status_rows) {
-                        fatal_error = Some(format!("status write failed for {coin}: {err}"));
-                        break;
-                    }
+                let status_for_block = status_rows.remove(&coin).unwrap_or_default();
+                if let Err(err) = coin_writers.status.send_block(height, status_for_block) {
+                    fatal_error = Some(format!("status write failed for {coin}: {err}"));
+                    break;
                 }
                 if let Some(rows) = diff_rows.remove(&coin).filter(|rows| !rows.is_empty()) {
                     if let Err(err) = coin_writers.diff.append_rows(&coin, mode, height, rows, write_diff_rows) {
