@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aliyun_oss_rust_sdk::oss::OSS;
 use aliyun_oss_rust_sdk::request::RequestBuilder;
@@ -29,7 +29,7 @@ const DEFAULT_ARCHIVE_FINALIZE_DIR: &str = "/mnt";
 const DEFAULT_ARCHIVE_SYMBOLS: &[&str] = &["BTC", "ETH"];
 const DEFAULT_OSS_PREFIX: &str = "hyper_data";
 const INFO_SNAPSHOT_URL: &str = "http://localhost:3001/info";
-const INPROGRESS_SUFFIX: &str = ".inprogress";
+const TEMP_FILE_SUFFIX: &str = ".tmp";
 const LITE_PRICE_SCALE: u32 = 8;
 const LITE_SIZE_SCALE: u32 = 8;
 const CHECKPOINT_BLOCKS: u64 = 10_000;
@@ -597,7 +597,7 @@ impl<R> ParquetStreamWriter<R> {
         let tmp_path = final_path.with_file_name(format!(
             "{}{}",
             final_path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet"),
-            INPROGRESS_SUFFIX
+            TEMP_FILE_SUFFIX
         ));
         if tmp_path.exists() {
             fs::remove_file(&tmp_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
@@ -851,6 +851,7 @@ enum StatusWorkerMessage {
 struct StatusWorkerHandle {
     coin: String,
     tx: SyncSender<StatusWorkerMessage>,
+    ack_rx: Receiver<u64>,
     error_rx: Receiver<String>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -864,6 +865,7 @@ impl StatusWorkerHandle {
         handoff_tx: Sender<HandoffMessage>,
     ) -> Self {
         let (tx, rx) = sync_channel(STATUS_WORKER_QUEUE_BLOCKS);
+        let (ack_tx, ack_rx) = channel();
         let (error_tx, error_rx) = channel();
         let worker_coin = coin.clone();
         let handle = thread::spawn(move || {
@@ -873,9 +875,21 @@ impl StatusWorkerHandle {
                     StatusWorkerMessage::Block { height, rows } => {
                         writer.advance_block(mode, height, write_status_rows).and_then(|_| {
                             if rows.is_empty() {
-                                Ok(())
+                                ack_tx.send(height).map_err(|err| {
+                                    io_to_parquet_error(io_other(format!(
+                                        "status worker ack send failed for {} at {}: {err}",
+                                        worker_coin, height
+                                    )))
+                                })
                             } else {
-                                writer.append_rows(&worker_coin, mode, height, rows, write_status_rows)
+                                writer.append_rows(&worker_coin, mode, height, rows, write_status_rows).and_then(|_| {
+                                    ack_tx.send(height).map_err(|err| {
+                                        io_to_parquet_error(io_other(format!(
+                                            "status worker ack send failed for {} at {}: {err}",
+                                            worker_coin, height
+                                        )))
+                                    })
+                                })
                             }
                         })
                     }
@@ -901,7 +915,7 @@ impl StatusWorkerHandle {
                 }
             }
         });
-        Self { coin, tx, error_rx, handle: Some(handle) }
+        Self { coin, tx, ack_rx, error_rx, handle: Some(handle) }
     }
 
     fn check_error(&self) -> parquet::errors::Result<()> {
@@ -918,6 +932,20 @@ impl StatusWorkerHandle {
             io_to_parquet_error(io_other(format!("status worker send failed for {}: {err}", self.coin)))
         })?;
         self.check_error()
+    }
+
+    fn drain_acked_heights(&self) -> parquet::errors::Result<Vec<u64>> {
+        self.check_error()?;
+        let mut heights = Vec::new();
+        loop {
+            match self.ack_rx.try_recv() {
+                Ok(height) => heights.push(height),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        self.check_error()?;
+        Ok(heights)
     }
 
     fn close(mut self) -> parquet::errors::Result<()> {
@@ -952,6 +980,9 @@ struct ArchiveWriters {
     coins: HashMap<String, CoinWriters>,
     symbols: Vec<String>,
     mode: ArchiveMode,
+    pending_status_acks: HashMap<u64, usize>,
+    next_uncommitted_height: Option<u64>,
+    last_archived_height: Option<u64>,
 }
 
 impl ArchiveWriters {
@@ -1134,6 +1165,9 @@ impl ArchiveWriters {
             coins,
             symbols,
             mode,
+            pending_status_acks: HashMap::new(),
+            next_uncommitted_height: None,
+            last_archived_height: None,
         }
     }
 
@@ -1143,6 +1177,51 @@ impl ArchiveWriters {
 
     fn has_coin(&self, coin: &str) -> bool {
         self.coins.contains_key(coin)
+    }
+
+    fn last_archived_height(&self) -> Option<u64> {
+        self.last_archived_height
+    }
+
+    fn register_status_block(&mut self, height: u64) {
+        if self.symbols.is_empty() {
+            self.last_archived_height = Some(height);
+            return;
+        }
+        self.pending_status_acks.insert(height, self.symbols.len());
+        if self.next_uncommitted_height.is_none() {
+            self.next_uncommitted_height = Some(height);
+        }
+    }
+
+    fn advance_last_archived_height(&mut self) {
+        let Some(mut next) = self.next_uncommitted_height else {
+            return;
+        };
+        while self.pending_status_acks.get(&next).is_some_and(|remaining| *remaining == 0) {
+            self.pending_status_acks.remove(&next);
+            self.last_archived_height = Some(next);
+            next = next.saturating_add(1);
+        }
+        self.next_uncommitted_height = if self.pending_status_acks.is_empty() { None } else { Some(next) };
+    }
+
+    fn drain_status_progress(&mut self) -> parquet::errors::Result<()> {
+        for writers in self.coins.values() {
+            for height in writers.status.drain_acked_heights()? {
+                let Some(remaining) = self.pending_status_acks.get_mut(&height) else {
+                    warn!("Dropping unexpected status worker ack at height {}", height);
+                    continue;
+                };
+                if *remaining == 0 {
+                    warn!("Dropping duplicate status worker ack at height {}", height);
+                    continue;
+                }
+                *remaining -= 1;
+            }
+        }
+        self.advance_last_archived_height();
+        Ok(())
     }
 
     fn close_all(&mut self) -> parquet::errors::Result<()> {
@@ -1236,7 +1315,7 @@ fn ensure_archive_disk_headroom(base_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn cleanup_stale_inprogress_files(base_dir: &Path) {
+fn cleanup_stale_temp_files(base_dir: &Path) {
     let mut stack = vec![base_dir.to_path_buf()];
     let mut removed = 0usize;
     while let Some(dir) = stack.pop() {
@@ -1252,7 +1331,7 @@ fn cleanup_stale_inprogress_files(base_dir: &Path) {
                 stack.push(path);
                 continue;
             }
-            if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.ends_with(INPROGRESS_SUFFIX)) {
+            if path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.ends_with(TEMP_FILE_SUFFIX)) {
                 match fs::remove_file(&path) {
                     Ok(()) => removed += 1,
                     Err(err) => warn!("Failed to remove stale in-progress parquet {}: {err}", path.display()),
@@ -1527,6 +1606,152 @@ fn restart_archive_after_handoff(
                 &format!("archive restart still blocked after handoff: {err}"),
             );
         }
+    }
+}
+
+fn rotate_archive_after_discontinuity(
+    writers: &mut Option<ArchiveWriters>,
+    handoff_tx: &Sender<HandoffMessage>,
+    current_mode: &mut Option<ArchiveMode>,
+    current_symbols: &mut Vec<String>,
+    bootstrap_checkpoint_evaluated: &mut bool,
+    last_input_height: &mut Option<u64>,
+    previous_height: u64,
+    next_height: u64,
+) {
+    let Some(mode) = *current_mode else {
+        return;
+    };
+    let symbols = current_symbols.clone();
+    let mut active = writers.take().expect("archive writers should exist when rotating after discontinuity");
+    match active.close_all() {
+        Ok(()) => {}
+        Err(err) => {
+            warn!(
+                "Archive close during discontinuity rotate failed at prev_height={} next_height={}: {err}",
+                previous_height, next_height
+            );
+            active.abort_all();
+            disable_archive_after_failure(
+                writers,
+                current_mode,
+                current_symbols,
+                next_height,
+                &format!("archive discontinuity rotate close failed: {err}"),
+            );
+            return;
+        }
+    }
+    if let Err(err) = drain_handoff_tasks(handoff_tx) {
+        disable_archive_after_failure(
+            writers,
+            current_mode,
+            current_symbols,
+            next_height,
+            &format!("archive discontinuity rotate handoff drain failed: {err}"),
+        );
+        return;
+    }
+    match ensure_archive_disk_headroom(&current_archive_base_dir()) {
+        Ok(()) => {
+            info!(
+                "Archive rotated after discontinuity prev_height={} next_height={} symbols={}",
+                previous_height,
+                next_height,
+                symbols.join(",")
+            );
+            *writers = Some(ArchiveWriters::new(mode, symbols, handoff_tx.clone()));
+            *bootstrap_checkpoint_evaluated = false;
+            *last_input_height = None;
+        }
+        Err(err) => {
+            disable_archive_after_failure(
+                writers,
+                current_mode,
+                current_symbols,
+                next_height,
+                &format!("archive discontinuity rotate blocked by disk headroom: {err}"),
+            );
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReplaySkipLogState {
+    first_height: Option<u64>,
+    last_height: Option<u64>,
+    last_archived_height: Option<u64>,
+    started_at: Option<Instant>,
+    last_warn_at: Option<Instant>,
+    skipped_blocks: u64,
+}
+
+impl ReplaySkipLogState {
+    fn record_skip(&mut self, height: u64, last_archived_height: u64) {
+        let now = Instant::now();
+        if self.skipped_blocks == 0 {
+            self.first_height = Some(height);
+            self.started_at = Some(now);
+            self.last_warn_at = Some(now);
+            self.last_archived_height = Some(last_archived_height);
+        }
+        self.last_height = Some(height);
+        self.last_archived_height = Some(last_archived_height);
+        self.skipped_blocks = self.skipped_blocks.saturating_add(1);
+    }
+
+    fn should_warn(&self) -> bool {
+        self.skipped_blocks > 0
+            && self.last_warn_at.is_some_and(|last_warn_at| {
+                Instant::now().saturating_duration_since(last_warn_at) >= Duration::from_secs(10)
+            })
+    }
+
+    fn log_warn(&mut self) {
+        let Some(first_height) = self.first_height else {
+            return;
+        };
+        let Some(last_height) = self.last_height else {
+            return;
+        };
+        let Some(last_archived_height) = self.last_archived_height else {
+            return;
+        };
+        let elapsed =
+            self.started_at.map(|started_at| Instant::now().saturating_duration_since(started_at)).unwrap_or_default();
+        warn!(
+            "Archive replay dedupe skipping old blocks first_height={} last_height={} count={} last_archived_height={} elapsed_s={:.1}",
+            first_height,
+            last_height,
+            self.skipped_blocks,
+            last_archived_height,
+            elapsed.as_secs_f64()
+        );
+        self.last_warn_at = Some(Instant::now());
+    }
+
+    fn log_resume_and_reset(&mut self, next_height: u64) {
+        let Some(first_height) = self.first_height else {
+            return;
+        };
+        let Some(last_height) = self.last_height else {
+            return;
+        };
+        let Some(last_archived_height) = self.last_archived_height else {
+            return;
+        };
+        let elapsed =
+            self.started_at.map(|started_at| Instant::now().saturating_duration_since(started_at)).unwrap_or_default();
+        info!(
+            "Archive replay dedupe resumed writes at height={} after skipping old blocks first_height={} last_height={} count={} last_archived_height={} elapsed_s={:.1}",
+            next_height,
+            first_height,
+            last_height,
+            self.skipped_blocks,
+            last_archived_height,
+            elapsed.as_secs_f64()
+        );
+        *self = Self::default();
     }
 }
 
@@ -2401,6 +2626,8 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
     let mut current_mode: Option<ArchiveMode> = None;
     let mut current_symbols = current_archive_symbols();
     let mut bootstrap_checkpoint_evaluated = false;
+    let mut last_input_height: Option<u64> = None;
+    let mut replay_skip_log = ReplaySkipLogState::default();
 
     loop {
         let mode = get_archive_mode();
@@ -2414,7 +2641,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             }
             if mode.is_some() {
                 let base_dir = current_archive_base_dir();
-                cleanup_stale_inprogress_files(&base_dir);
+                cleanup_stale_temp_files(&base_dir);
                 if let Err(err) = ensure_archive_disk_headroom(&base_dir) {
                     error!("Refusing to enable archive: {err}");
                     set_archive_mode(None);
@@ -2428,6 +2655,8 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             current_mode = mode;
             current_symbols = symbols;
             bootstrap_checkpoint_evaluated = false;
+            last_input_height = None;
+            replay_skip_log = ReplaySkipLogState::default();
         }
 
         let msg = match rx.recv_timeout(Duration::from_millis(200)) {
@@ -2445,6 +2674,18 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             continue;
         }
         let mode = writers.as_ref().expect("writers checked above").mode;
+        if let Some(writers_ref) = writers.as_mut() {
+            if let Err(err) = writers_ref.drain_status_progress() {
+                disable_archive_after_failure(
+                    &mut writers,
+                    &mut current_mode,
+                    &mut current_symbols,
+                    msg.block_number,
+                    &format!("status progress drain failed: {err}"),
+                );
+                continue;
+            }
+        }
 
         let order_batch: BatchLite<OrderStatusLite> = match serde_json::from_slice(&msg.order_line) {
             Ok(batch) => batch,
@@ -2508,6 +2749,40 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 height, diff_batch.block_number, fill_batch.block_number
             );
             continue;
+        }
+
+        if writers.as_ref().and_then(ArchiveWriters::last_archived_height).is_some_and(|last_archived_height| {
+            if height <= last_archived_height {
+                replay_skip_log.record_skip(height, last_archived_height);
+                if replay_skip_log.should_warn() {
+                    replay_skip_log.log_warn();
+                }
+                true
+            } else {
+                false
+            }
+        }) {
+            continue;
+        }
+
+        if replay_skip_log.skipped_blocks > 0 {
+            replay_skip_log.log_resume_and_reset(height);
+        }
+
+        if let Some(previous_height) = last_input_height.filter(|last| height > last.saturating_add(1)) {
+            rotate_archive_after_discontinuity(
+                &mut writers,
+                &handoff_tx,
+                &mut current_mode,
+                &mut current_symbols,
+                &mut bootstrap_checkpoint_evaluated,
+                &mut last_input_height,
+                previous_height,
+                height,
+            );
+            if writers.is_none() {
+                continue;
+            }
         }
 
         if !bootstrap_checkpoint_evaluated {
@@ -2781,6 +3056,8 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             continue;
         }
 
+        writers_ref.register_status_block(height);
+
         for coin in writers_ref.symbols.clone() {
             if let Some(coin_writers) = writers_ref.coin_mut(&coin) {
                 if let Err(err) = coin_writers.diff.advance_block(mode, height, write_diff_rows) {
@@ -2814,6 +3091,19 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             disable_archive_after_failure(&mut writers, &mut current_mode, &mut current_symbols, height, &context);
             continue;
         }
+        if let Some(writers_ref) = writers.as_mut() {
+            if let Err(err) = writers_ref.drain_status_progress() {
+                disable_archive_after_failure(
+                    &mut writers,
+                    &mut current_mode,
+                    &mut current_symbols,
+                    height,
+                    &format!("status progress drain failed: {err}"),
+                );
+                continue;
+            }
+        }
+        last_input_height = Some(height);
         if height % CHECKPOINT_BLOCKS == 0 {
             match ensure_archive_disk_headroom(&current_archive_base_dir()) {
                 Ok(()) => {}
