@@ -13,6 +13,7 @@ use pyo3 as _;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rmp_serde as _;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde as _;
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use serde_json as _;
@@ -35,6 +36,7 @@ const SEGMENT_VERSION: u32 = 2;
 const ZSTD_LEVEL: i32 = 3;
 const CODEC_ZSTD: &str = "zstd";
 const CODEC_MSGPACK: &str = "msgpack";
+const SNAPSHOT_INDEX_DB_FILENAME: &str = "snapshot_index.sqlite";
 static DATASET_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 impl Display for AppError {
@@ -71,6 +73,12 @@ impl From<serde_json::Error> for AppError {
 
 impl From<simd_json::Error> for AppError {
     fn from(value: simd_json::Error) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for AppError {
+    fn from(value: rusqlite::Error) -> Self {
         Self(value.to_string())
     }
 }
@@ -384,23 +392,6 @@ struct SegmentIndexEntry {
     include_users: bool,
     include_trigger_orders: bool,
     assets: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct DatasetIndex {
-    version: u32,
-    segments: Vec<DatasetSegmentSummary>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DatasetSegmentSummary {
-    segment_start: u64,
-    segment_end: u64,
-    segment_path: String,
-    checkpoint_count: usize,
-    min_block_height: Option<u64>,
-    max_block_height: Option<u64>,
-    entries: Vec<SegmentIndexEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -875,23 +866,9 @@ fn write_checkpoint_record(
     validate_checkpoint_height(record.block_height, enforce_10k_boundary)?;
     let (segment_start, segment_end) = checkpoint_segment_bounds(record.block_height);
     let segment_path = output_dir.join(format!("segment_{segment_start}_{segment_end}.l4seg"));
-    let existing_snapshot_index_path =
-        find_existing_snapshot_index_path(&output_dir)?.unwrap_or_else(|| output_dir.join("snapshot_index.json"));
 
     let mut file = OpenOptions::new().create(true).read(true).append(true).open(&segment_path)?;
     ensure_segment_header(&mut file, segment_start, segment_end)?;
-
-    let mut dataset_index = load_or_create_dataset_index(&existing_snapshot_index_path)?;
-    {
-        let segment = get_or_create_segment_summary(&mut dataset_index, segment_start, segment_end, &segment_path);
-        if segment.entries.iter().any(|entry| entry.block_height == record.block_height) {
-            return Err(AppError(format!(
-                "checkpoint {} already exists in {}",
-                record.block_height,
-                segment_path.display()
-            )));
-        }
-    }
 
     let payload = rmp_serde::to_vec(&record)?;
     let raw_len = u64::try_from(payload.len()).map_err(|_| AppError("checkpoint payload too large".to_string()))?;
@@ -902,31 +879,22 @@ fn write_checkpoint_record(
     file.write_all(&len.to_le_bytes())?;
     file.write_all(&payload)?;
     file.flush()?;
-
-    let checkpoint_count = {
-        let segment = get_or_create_segment_summary(&mut dataset_index, segment_start, segment_end, &segment_path);
-        segment.entries.push(SegmentIndexEntry {
-            block_height: record.block_height,
-            block_time: record.block_time.clone(),
-            offset: prefix_offset + 8,
-            len,
-            codec: CODEC_ZSTD.to_string(),
-            compression_level: Some(ZSTD_LEVEL),
-            raw_len: Some(raw_len),
-            asset_count: record.snapshot.len(),
-            include_users: record.include_users,
-            include_trigger_orders: record.include_trigger_orders,
-            assets: record.assets.clone(),
-        });
-        segment.entries.sort_by_key(|entry| entry.block_height);
-        segment.checkpoint_count = segment.entries.len();
-        segment.min_block_height = segment.entries.first().map(|entry| entry.block_height);
-        segment.max_block_height = segment.entries.last().map(|entry| entry.block_height);
-        segment.checkpoint_count
+    let snapshot_index_path = output_dir.join(SNAPSHOT_INDEX_DB_FILENAME);
+    let entry = SegmentIndexEntry {
+        block_height: record.block_height,
+        block_time: record.block_time.clone(),
+        offset: prefix_offset + 8,
+        len,
+        codec: CODEC_ZSTD.to_string(),
+        compression_level: Some(ZSTD_LEVEL),
+        raw_len: Some(raw_len),
+        asset_count: record.snapshot.len(),
+        include_users: record.include_users,
+        include_trigger_orders: record.include_trigger_orders,
+        assets: record.assets.clone(),
     };
-    let snapshot_index_path = output_dir.join(snapshot_index_filename(&dataset_index));
-    save_dataset_index(&snapshot_index_path, &dataset_index)?;
-    cleanup_old_snapshot_index_files(&output_dir, &snapshot_index_path)?;
+    let checkpoint_count =
+        insert_checkpoint_manifest_entry(&snapshot_index_path, segment_start, segment_end, &segment_path, &entry)?;
 
     Ok(CheckpointWriteResult {
         block_height: record.block_height,
@@ -996,108 +964,118 @@ fn ensure_segment_header(file: &mut File, segment_start: u64, segment_end: u64) 
     Ok(())
 }
 
-fn load_or_create_dataset_index(path: &Path) -> AppResult<DatasetIndex> {
-    if path.exists() {
-        let bytes = fs::read(path)?;
-        let mut index: DatasetIndex = serde_json::from_slice(&bytes)?;
-        index.version = SEGMENT_VERSION;
-        return Ok(index);
-    }
-    Ok(DatasetIndex { version: SEGMENT_VERSION, segments: Vec::new() })
+fn open_snapshot_index_db(path: &Path) -> AppResult<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE IF NOT EXISTS manifest_meta (
+             key TEXT PRIMARY KEY,
+             value TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS segment_summaries (
+             segment_start INTEGER NOT NULL,
+             segment_end INTEGER NOT NULL,
+             segment_path TEXT NOT NULL,
+             checkpoint_count INTEGER NOT NULL,
+             min_block_height INTEGER,
+             max_block_height INTEGER,
+             PRIMARY KEY (segment_start, segment_end)
+         );
+         CREATE TABLE IF NOT EXISTS checkpoint_entries (
+             block_height INTEGER PRIMARY KEY,
+             block_time TEXT NOT NULL,
+             segment_start INTEGER NOT NULL,
+             segment_end INTEGER NOT NULL,
+             segment_path TEXT NOT NULL,
+             offset INTEGER NOT NULL,
+             len INTEGER NOT NULL,
+             codec TEXT NOT NULL,
+             compression_level INTEGER,
+             raw_len INTEGER,
+             asset_count INTEGER NOT NULL,
+             include_users INTEGER NOT NULL,
+             include_trigger_orders INTEGER NOT NULL,
+             assets_json TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_checkpoint_entries_segment
+         ON checkpoint_entries (segment_start, segment_end, block_height);
+         COMMIT;",
+    )?;
+    conn.execute(
+        "INSERT INTO manifest_meta(key, value) VALUES('version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![SEGMENT_VERSION.to_string()],
+    )?;
+    Ok(conn)
 }
 
-fn save_dataset_index(path: &Path, index: &DatasetIndex) -> AppResult<()> {
-    let file = File::create(path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), index)?;
-    Ok(())
-}
-
-fn find_existing_snapshot_index_path(output_dir: &Path) -> AppResult<Option<PathBuf>> {
-    let legacy = output_dir.join("snapshot_index.json");
-    if legacy.exists() {
-        return Ok(Some(legacy));
-    }
-
-    let mut candidates = Vec::new();
-    for entry in fs::read_dir(output_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if name.starts_with("snapshot_index_") && name.ends_with(".json") {
-            candidates.push(path);
-        }
-    }
-    candidates.sort();
-    Ok(candidates.pop())
-}
-
-fn snapshot_index_filename(index: &DatasetIndex) -> String {
-    let mut heights = index.segments.iter().flat_map(|segment| segment.entries.iter().map(|entry| entry.block_height));
-    let Some(min_height) = heights.next() else {
-        return "snapshot_index.json".to_string();
-    };
-    let max_height = index
-        .segments
-        .iter()
-        .flat_map(|segment| segment.entries.iter().map(|entry| entry.block_height))
-        .max()
-        .unwrap_or(min_height);
-    format!("snapshot_index_{}_{}.json", min_height / 10_000, max_height / 10_000)
-}
-
-fn cleanup_old_snapshot_index_files(output_dir: &Path, keep_path: &Path) -> AppResult<()> {
-    for entry in fs::read_dir(output_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path == keep_path {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if name == "snapshot_index.json" || (name.starts_with("snapshot_index_") && name.ends_with(".json")) {
-            fs::remove_file(path)?;
-        }
-    }
-    Ok(())
-}
-
-fn get_or_create_segment_summary<'a>(
-    dataset_index: &'a mut DatasetIndex,
+fn insert_checkpoint_manifest_entry(
+    manifest_path: &Path,
     segment_start: u64,
     segment_end: u64,
     segment_path: &Path,
-) -> &'a mut DatasetSegmentSummary {
-    if let Some(pos) = dataset_index
-        .segments
-        .iter()
-        .position(|segment| segment.segment_start == segment_start && segment.segment_end == segment_end)
-    {
-        let segment = &mut dataset_index.segments[pos];
-        segment.segment_path = segment_path.to_string_lossy().into_owned();
-        segment.segment_start = segment_start;
-        segment.segment_end = segment_end;
-        return segment;
-    }
+    entry: &SegmentIndexEntry,
+) -> AppResult<usize> {
+    let mut conn = open_snapshot_index_db(manifest_path)?;
+    let tx = conn.transaction()?;
+    ensure_checkpoint_absent(&tx, entry.block_height, segment_path)?;
+    let assets_json = entry.assets.as_ref().map(serde_json::to_string).transpose()?;
+    tx.execute(
+        "INSERT INTO checkpoint_entries (
+             block_height, block_time, segment_start, segment_end, segment_path,
+             offset, len, codec, compression_level, raw_len, asset_count,
+             include_users, include_trigger_orders, assets_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            entry.block_height,
+            entry.block_time,
+            segment_start,
+            segment_end,
+            segment_path.to_string_lossy().into_owned(),
+            entry.offset,
+            entry.len,
+            entry.codec,
+            entry.compression_level,
+            entry.raw_len,
+            i64::try_from(entry.asset_count).map_err(|_| AppError("asset_count overflow".to_string()))?,
+            entry.include_users,
+            entry.include_trigger_orders,
+            assets_json,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO segment_summaries (
+             segment_start, segment_end, segment_path, checkpoint_count, min_block_height, max_block_height
+         ) VALUES (?1, ?2, ?3, 1, ?4, ?4)
+         ON CONFLICT(segment_start, segment_end) DO UPDATE SET
+             segment_path = excluded.segment_path,
+             checkpoint_count = segment_summaries.checkpoint_count + 1,
+             min_block_height = MIN(segment_summaries.min_block_height, excluded.min_block_height),
+             max_block_height = MAX(segment_summaries.max_block_height, excluded.max_block_height)",
+        params![segment_start, segment_end, segment_path.to_string_lossy().into_owned(), entry.block_height,],
+    )?;
+    let checkpoint_count: usize = tx.query_row(
+        "SELECT checkpoint_count FROM segment_summaries WHERE segment_start = ?1 AND segment_end = ?2",
+        params![segment_start, segment_end],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(checkpoint_count)
+}
 
-    dataset_index.segments.push(DatasetSegmentSummary {
-        segment_start,
-        segment_end,
-        segment_path: segment_path.to_string_lossy().into_owned(),
-        checkpoint_count: 0,
-        min_block_height: None,
-        max_block_height: None,
-        entries: Vec::new(),
-    });
-    dataset_index.segments.sort_by_key(|segment| segment.segment_start);
-    let pos = dataset_index
-        .segments
-        .iter()
-        .position(|segment| segment.segment_start == segment_start && segment.segment_end == segment_end)
-        .expect("segment inserted");
-    &mut dataset_index.segments[pos]
+fn ensure_checkpoint_absent(tx: &Transaction<'_>, block_height: u64, segment_path: &Path) -> AppResult<()> {
+    let existing: Option<u64> = tx
+        .query_row(
+            "SELECT block_height FROM checkpoint_entries WHERE block_height = ?1",
+            params![block_height],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if existing.is_some() {
+        return Err(AppError(format!("checkpoint {} already exists in {}", block_height, segment_path.display())));
+    }
+    Ok(())
 }
 
 fn collect_book_specs(exchange: &Exchange) -> AppResult<Vec<BookSpec>> {

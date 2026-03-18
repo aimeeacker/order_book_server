@@ -475,7 +475,8 @@ impl StreamKind {
 struct ParquetFile {
     writer: SerializedFileWriter<std::fs::File>,
     window_start_block: u64,
-    actual_start_block: u64,
+    name_start_block: u64,
+    name_end_block: u64,
     last_block: u64,
     tmp_path: PathBuf,
     final_dir: PathBuf,
@@ -539,6 +540,7 @@ struct ParquetStreamWriter<R> {
     props: std::sync::Arc<WriterProperties>,
     handoff_tx: Sender<HandoffMessage>,
     file: Option<ParquetFile>,
+    pending_start_block: Option<u64>,
     active: PendingRowGroup<R>,
     delayed: PendingRowGroup<R>,
 }
@@ -556,6 +558,7 @@ impl<R> ParquetStreamWriter<R> {
             props,
             handoff_tx,
             file: None,
+            pending_start_block: None,
             active: PendingRowGroup::new(),
             delayed: PendingRowGroup::new(),
         }
@@ -564,7 +567,8 @@ impl<R> ParquetStreamWriter<R> {
     fn ensure_open(&mut self, coin: &str, mode: ArchiveMode, block: u64) -> parquet::errors::Result<()> {
         if self.file.is_none() {
             let (window_start, end) = rotation_bounds(block);
-            self.open_file(coin, mode, block, window_start, end)?;
+            let name_start = self.pending_start_block.unwrap_or(block);
+            self.open_file(coin, mode, name_start, block, window_start, end)?;
         }
         Ok(())
     }
@@ -573,6 +577,7 @@ impl<R> ParquetStreamWriter<R> {
         &mut self,
         coin: &str,
         mode: ArchiveMode,
+        name_start: u64,
         actual_start: u64,
         window_start: u64,
         end: u64,
@@ -593,7 +598,7 @@ impl<R> ParquetStreamWriter<R> {
             }
         };
         fs::create_dir_all(&dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-        let final_path = dir.join(format!("{filename_prefix}_{actual_start}_{end}{filename_suffix}"));
+        let final_path = dir.join(format!("{filename_prefix}_{name_start}_{end}{filename_suffix}"));
         let tmp_path = final_path.with_file_name(format!(
             "{}{}",
             final_path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet"),
@@ -607,13 +612,15 @@ impl<R> ParquetStreamWriter<R> {
         self.file = Some(ParquetFile {
             writer,
             window_start_block: window_start,
-            actual_start_block: actual_start,
+            name_start_block: name_start,
+            name_end_block: actual_start,
             last_block: actual_start,
             tmp_path,
             final_dir: dir,
             final_filename_prefix: filename_prefix,
             final_filename_suffix: filename_suffix,
         });
+        self.pending_start_block = None;
         Ok(())
     }
 
@@ -622,7 +629,7 @@ impl<R> ParquetStreamWriter<R> {
             let tmp_path = file.tmp_path.clone();
             let final_path = file.final_dir.join(format!(
                 "{}_{}_{}{}",
-                file.final_filename_prefix, file.actual_start_block, file.last_block, file.final_filename_suffix
+                file.final_filename_prefix, file.name_start_block, file.name_end_block, file.final_filename_suffix
             ));
             let relative_path = final_path
                 .strip_prefix(current_archive_base_dir())
@@ -630,7 +637,7 @@ impl<R> ParquetStreamWriter<R> {
                 .map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
             file.writer.close()?;
             fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
-            let span_blocks = file.last_block.saturating_sub(file.actual_start_block) + 1;
+            let span_blocks = file.name_end_block.saturating_sub(file.name_start_block) + 1;
             if span_blocks < MIN_HANDOFF_BLOCK_SPAN {
                 info!(
                     "Archive finalized but dropping short parquet span={} path={}",
@@ -642,12 +649,14 @@ impl<R> ParquetStreamWriter<R> {
                 enqueue_handoff_task(&self.handoff_tx, final_path, relative_path)?;
             }
         }
+        self.pending_start_block = None;
         Ok(())
     }
 
     fn abort(&mut self) {
         self.active.clear();
         self.delayed.clear();
+        self.pending_start_block = None;
         if let Some(file) = self.file.take() {
             drop(file.writer);
             if let Err(err) = fs::remove_file(&file.tmp_path) {
@@ -744,11 +753,20 @@ impl<R> ParquetStreamWriter<R> {
     {
         let current_start = self.file.as_ref().map(|current| current.window_start_block);
         let next_start = rotation_bounds(block).0;
+        if self.file.is_none() {
+            match self.pending_start_block {
+                Some(start) if rotation_bounds(start).0 != next_start => self.pending_start_block = Some(block),
+                Some(_) => {}
+                None => self.pending_start_block = Some(block),
+            }
+        }
         if current_start.is_some_and(|start| start != next_start) {
             self.close_with_flush(mode, write_rows)?;
+            self.pending_start_block = Some(block);
         }
         if let Some(file) = self.file.as_mut() {
             file.last_block = block;
+            file.name_end_block = block;
         }
         if self.stream.uses_delayed_flush() {
             self.advance_delayed_windows(mode, block, write_rows)?;
@@ -779,6 +797,7 @@ impl<R> ParquetStreamWriter<R> {
         self.ensure_open(coin, mode, block)?;
         if let Some(file) = self.file.as_mut() {
             file.last_block = block;
+            file.name_end_block = block;
         }
         if self.stream.uses_delayed_flush() {
             self.ensure_active_window(block);

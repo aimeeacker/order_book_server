@@ -28,10 +28,23 @@ const UDS_PATH: &str = "/home/aimee/hl_runtime/hl_book/fifo_listener.sock";
 const SOCKET_BUFFER: i32 = 16 * 1024 * 1024;
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const DROP_LOG_THRESHOLD: u64 = 50;
+const CHECKPOINT_DEBUG_BLOCKS: u64 = 10_000;
 
 static LOG_INIT: Once = Once::new();
 
 pub type HeightCallback = Arc<dyn Fn(u64) + Send + Sync + 'static>;
+
+fn is_checkpoint_probe_height(height: u64) -> bool {
+    height % CHECKPOINT_DEBUG_BLOCKS == 1
+}
+
+fn rollback_buffer_span(rollback_buffer: &VecDeque<StreamLine>) -> (usize, Option<u64>, Option<u64>) {
+    (
+        rollback_buffer.len(),
+        rollback_buffer.front().map(|msg| msg.block_number),
+        rollback_buffer.back().map(|msg| msg.block_number),
+    )
+}
 
 struct RollbackTracker {
     state: Mutex<RollbackState>,
@@ -570,6 +583,34 @@ fn parse_block_number(bytes: &[u8]) -> Result<u64, &'static str> {
     if found { Ok(value) } else { Err("invalid block_number") }
 }
 
+fn flush_rollback_buffer(
+    source: FifoSource,
+    rollback: &RollbackTracker,
+    tx: &SyncSender<StreamLine>,
+    last_height: &mut Option<u64>,
+    rollback_buffer: &mut VecDeque<StreamLine>,
+) -> bool {
+    let (count, first_height, last_height_in_buffer) = rollback_buffer_span(rollback_buffer);
+    if count > 0 {
+        warn!(
+            "Rollback confirmed for {source:?}; flushing buffered blocks count={} first_height={:?} last_height={:?}",
+            count, first_height, last_height_in_buffer
+        );
+    }
+    while let Some(msg) = rollback_buffer.pop_front() {
+        if is_checkpoint_probe_height(msg.block_number) {
+            warn!("Rollback flush replays checkpoint-boundary block for {source:?} height={}", msg.block_number);
+        }
+        *last_height = Some(msg.block_number);
+        rollback.clear_rollback(source);
+        if tx.send(msg).is_err() {
+            warn!("Aggregator dropped; exiting {source:?} listener");
+            return false;
+        }
+    }
+    true
+}
+
 fn listen_fifo(
     source: FifoSource,
     path: PathBuf,
@@ -611,6 +652,7 @@ fn listen_fifo(
         let mut pending: Vec<u8> = Vec::new();
         let mut last_height: Option<u64> = None;
         let mut rollback_generation = rollback.generation().unwrap_or(0);
+        let mut rollback_buffer: VecDeque<StreamLine> = VecDeque::new();
 
         loop {
             if stop.load(Ordering::SeqCst) {
@@ -644,6 +686,11 @@ fn listen_fifo(
                 continue;
             }
 
+            if warmup_active && std::time::Instant::now() >= warmup_deadline {
+                warmup_active = false;
+                pending.clear();
+            }
+
             let mut reopen = false;
             loop {
                 #[allow(unsafe_code)]
@@ -675,25 +722,79 @@ fn listen_fifo(
                         };
                         if let Some(generation) = rollback.generation() {
                             if generation != rollback_generation {
+                                let (count, first_height, last_height_in_buffer) =
+                                    rollback_buffer_span(&rollback_buffer);
+                                warn!(
+                                    "Rollback generation advanced for {source:?}: prev_generation={} new_generation={} buffered_count={} first_height={:?} last_height={:?}",
+                                    rollback_generation, generation, count, first_height, last_height_in_buffer
+                                );
                                 rollback_generation = generation;
                                 last_height = None;
-                            }
-                        }
-                        if last_height.is_some_and(|last| height <= last) {
-                            let mut reset = false;
-                            if let Some(generation) = rollback.record_rollback(source) {
-                                if generation != rollback_generation {
-                                    rollback_generation = generation;
-                                    last_height = None;
-                                    reset = true;
+                                if !flush_rollback_buffer(
+                                    source,
+                                    rollback.as_ref(),
+                                    &tx,
+                                    &mut last_height,
+                                    &mut rollback_buffer,
+                                ) {
+                                    return;
                                 }
                             }
-                            if !reset {
-                                warn!(
-                                    "Dropping out-of-order {source:?} batch at height {height} (last {last_height:?})"
-                                );
+                        }
+                        if !rollback_buffer.is_empty() {
+                            if last_height.is_some_and(|last| height <= last) {
+                                if is_checkpoint_probe_height(height) {
+                                    warn!(
+                                        "{source:?} buffered additional checkpoint-boundary rollback candidate height={} last_height={:?} buffered_count_before={}",
+                                        height,
+                                        last_height,
+                                        rollback_buffer.len()
+                                    );
+                                }
+                                rollback_buffer.push_back(StreamLine { source, block_number: height, line });
                                 continue;
                             }
+                            let (count, first_height, last_height_in_buffer) = rollback_buffer_span(&rollback_buffer);
+                            warn!(
+                                "Discarding buffered rollback candidate(s) for {source:?}; stream resumed at height {} without full rollback confirmation count={} first_height={:?} last_height={:?}",
+                                height, count, first_height, last_height_in_buffer
+                            );
+                            rollback_buffer.clear();
+                            rollback.clear_rollback(source);
+                        }
+                        if last_height.is_some_and(|last| height <= last) {
+                            if is_checkpoint_probe_height(height) || rollback_buffer.is_empty() {
+                                warn!(
+                                    "{source:?} buffering rollback candidate height={} last_height={} generation={} buffered_count_before={}",
+                                    height,
+                                    last_height.unwrap_or_default(),
+                                    rollback_generation,
+                                    rollback_buffer.len()
+                                );
+                            }
+                            rollback_buffer.push_back(StreamLine { source, block_number: height, line });
+                            if let Some(generation) = rollback.record_rollback(source) {
+                                if generation != rollback_generation {
+                                    let (count, first_height, last_height_in_buffer) =
+                                        rollback_buffer_span(&rollback_buffer);
+                                    warn!(
+                                        "Rollback generation switched during record for {source:?}: prev_generation={} new_generation={} buffered_count={} first_height={:?} last_height={:?}",
+                                        rollback_generation, generation, count, first_height, last_height_in_buffer
+                                    );
+                                    rollback_generation = generation;
+                                    last_height = None;
+                                    if !flush_rollback_buffer(
+                                        source,
+                                        rollback.as_ref(),
+                                        &tx,
+                                        &mut last_height,
+                                        &mut rollback_buffer,
+                                    ) {
+                                        return;
+                                    }
+                                }
+                            }
+                            continue;
                         }
                         last_height = Some(height);
                         rollback.clear_rollback(source);
@@ -827,9 +928,7 @@ fn run_aggregator(
                                 msg = Some(block);
                                 thread::sleep(Duration::from_millis(5));
                             }
-                            Err(TrySendError::Disconnected(_block)) => {
-                                break;
-                            }
+                            Err(TrySendError::Disconnected(_block)) => break,
                         }
                     }
                 }
