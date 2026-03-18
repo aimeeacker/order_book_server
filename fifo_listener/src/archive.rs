@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
@@ -21,7 +23,7 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::Type;
 use reqwest::blocking::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const ARCHIVE_BASE_DIR: &str = "/home/aimee/hl_runtime/hl/dataset";
@@ -38,14 +40,22 @@ const DIFF_ROW_GROUP_BLOCKS: u64 = 50_000;
 const MIN_HANDOFF_BLOCK_SPAN: u64 = 5_000;
 const MIN_ARCHIVE_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_DISK_USED_BPS: u64 = 9_500;
-const STATUS_WORKER_QUEUE_BLOCKS: usize = 64;
+const STATUS_PROCESS_QUEUE_COMMANDS: usize = 4;
+const STATUS_SPOOL_ROOT: &str = "/home/aimee/hl_runtime/hl/status_spool";
+const STATUS_ARCHIVE_WORKER_SUBPROCESS: &str = r#"
+import _hl_book_native as hl_book
+import sys
+
+hl_book.run_status_archive_worker(sys.argv[1])
+"#;
 static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
 static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
 static ARCHIVE_HANDOFF_CONFIG: OnceLock<Mutex<ArchiveHandoffConfig>> = OnceLock::new();
+static STATUS_SPOOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) const ARCHIVE_QUEUE_BLOCKS: usize = 127;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArchiveMode {
     Lite = 1,
     Full = 2,
@@ -53,7 +63,7 @@ pub enum ArchiveMode {
 
 static ARCHIVE_MODE: AtomicU8 = AtomicU8::new(0);
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveOssConfig {
     access_key_id: String,
     access_key_secret: String,
@@ -86,7 +96,7 @@ impl std::fmt::Debug for ArchiveOssConfig {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveHandoffConfig {
     pub move_to_nas: bool,
     pub nas_output_dir: PathBuf,
@@ -353,7 +363,7 @@ struct FillLite {
     twap_id: Option<u64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct StatusLiteColumns {
     block_number: Vec<i64>,
     block_time: Vec<String>,
@@ -406,7 +416,7 @@ impl StatusLiteColumns {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct StatusFullColumns {
     block_number: Vec<i64>,
     block_time: Vec<String>,
@@ -465,7 +475,7 @@ impl StatusFullColumns {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum StatusBlockBatch {
     Lite(StatusLiteColumns),
     Full(StatusFullColumns),
@@ -1173,93 +1183,244 @@ impl StatusParquetWriter {
     }
 }
 
-enum StatusWorkerMessage {
-    Block { height: u64, rows: StatusBlockBatch },
+#[derive(Debug, Serialize, Deserialize)]
+struct StatusSpoolFile {
+    height: u64,
+    rows: HashMap<String, StatusBlockBatch>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StatusProcessConfig {
+    mode: ArchiveMode,
+    symbols: Vec<String>,
+    archive_base_dir: PathBuf,
+    rotation_blocks: u64,
+    handoff: ArchiveHandoffConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StatusProcessWireCommand {
+    Block { height: u64, spool_path: PathBuf },
     Close,
     Abort,
 }
 
-struct StatusWorkerHandle {
-    coin: String,
-    tx: SyncSender<StatusWorkerMessage>,
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum StatusProcessWireResponse {
+    Ack { height: u64 },
+    Error { message: String },
+}
+
+enum StatusProcessMessage {
+    Block { height: u64, spool_path: PathBuf },
+    Close,
+    Abort,
+}
+
+fn status_spool_root() -> PathBuf {
+    PathBuf::from(STATUS_SPOOL_ROOT)
+}
+
+fn ensure_status_spool_dir() -> parquet::errors::Result<PathBuf> {
+    let dir = status_spool_root();
+    fs::create_dir_all(&dir).map_err(io_to_parquet_error)?;
+    Ok(dir)
+}
+
+fn prepare_status_spool_dir() -> parquet::errors::Result<PathBuf> {
+    let dir = ensure_status_spool_dir()?;
+    let mut removed = 0usize;
+    for entry in fs::read_dir(&dir).map_err(io_to_parquet_error)? {
+        let entry = entry.map_err(io_to_parquet_error)?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        if !name.starts_with("status_") {
+            continue;
+        }
+        fs::remove_file(&path).map_err(io_to_parquet_error)?;
+        removed += 1;
+    }
+    if removed > 0 {
+        warn!("Removed {} stale status spool files under {}", removed, dir.display());
+    }
+    Ok(dir)
+}
+
+fn write_status_spool_file(height: u64, rows: HashMap<String, StatusBlockBatch>) -> parquet::errors::Result<PathBuf> {
+    let dir = ensure_status_spool_dir()?;
+    let seq = STATUS_SPOOL_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    let final_path = dir.join(format!("status_{height}_{}_{}.msgpack", std::process::id(), seq));
+    let tmp_path = final_path.with_extension("msgpack.tmp");
+    let mut file = fs::File::create(&tmp_path).map_err(io_to_parquet_error)?;
+    let spool = StatusSpoolFile { height, rows };
+    rmp_serde::encode::write(&mut file, &spool).map_err(|err| io_to_parquet_error(io_other(err.to_string())))?;
+    file.flush().map_err(io_to_parquet_error)?;
+    drop(file);
+    fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
+    Ok(final_path)
+}
+
+struct StatusProcessHandle {
+    tx: SyncSender<StatusProcessMessage>,
     ack_rx: Receiver<u64>,
     error_rx: Receiver<String>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
-impl StatusWorkerHandle {
-    fn new(
-        coin: String,
-        mode: ArchiveMode,
-        schema: std::sync::Arc<Type>,
-        props: std::sync::Arc<WriterProperties>,
-        handoff_tx: Sender<HandoffMessage>,
-    ) -> Self {
-        let (tx, rx) = sync_channel(STATUS_WORKER_QUEUE_BLOCKS);
+impl StatusProcessHandle {
+    fn new(mode: ArchiveMode, symbols: Vec<String>) -> parquet::errors::Result<Self> {
+        let _spool_dir = prepare_status_spool_dir()?;
+        let config = StatusProcessConfig {
+            mode,
+            symbols,
+            archive_base_dir: current_archive_base_dir(),
+            rotation_blocks: ROTATION_BLOCKS.load(Ordering::SeqCst),
+            handoff: current_archive_handoff_config(),
+        };
+        let config_json =
+            serde_json::to_string(&config).map_err(|err| io_to_parquet_error(io_other(err.to_string())))?;
+        let (tx, rx) = sync_channel(STATUS_PROCESS_QUEUE_COMMANDS);
         let (ack_tx, ack_rx) = channel();
         let (error_tx, error_rx) = channel();
-        let worker_coin = coin.clone();
         let handle = thread::spawn(move || {
-            let mut writer = StatusParquetWriter::new(mode, schema, props, handoff_tx);
+            let python = match std::env::current_exe() {
+                Ok(python) => python,
+                Err(err) => {
+                    let _unused = error_tx.send(format!("status writer current_exe failed: {err}"));
+                    return;
+                }
+            };
+            let mut child = match Command::new(&python)
+                .arg("-c")
+                .arg(STATUS_ARCHIVE_WORKER_SUBPROCESS)
+                .arg(&config_json)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(err) => {
+                    let _unused =
+                        error_tx.send(format!("failed to spawn status archive worker via {}: {err}", python.display()));
+                    return;
+                }
+            };
+            let Some(mut child_stdin) = child.stdin.take() else {
+                let _unused = error_tx.send("status archive worker missing stdin".to_string());
+                let _unused = child.kill();
+                return;
+            };
+            let Some(child_stdout) = child.stdout.take() else {
+                let _unused = error_tx.send("status archive worker missing stdout".to_string());
+                let _unused = child.kill();
+                return;
+            };
+            let mut child_stdout = BufReader::new(child_stdout);
             while let Ok(message) = rx.recv() {
-                let result = match message {
-                    StatusWorkerMessage::Block { height, rows } => writer.advance_block(height).and_then(|_| {
-                        if rows.is_empty() {
-                            ack_tx.send(height).map_err(|err| {
-                                io_to_parquet_error(io_other(format!(
-                                    "status worker ack send failed for {} at {}: {err}",
-                                    worker_coin, height
-                                )))
-                            })
-                        } else {
-                            writer.append_block(&worker_coin, height, rows).and_then(|_| {
-                                ack_tx.send(height).map_err(|err| {
-                                    io_to_parquet_error(io_other(format!(
-                                        "status worker ack send failed for {} at {}: {err}",
-                                        worker_coin, height
-                                    )))
-                                })
-                            })
-                        }
-                    }),
-                    StatusWorkerMessage::Close => {
-                        let result = writer.close_with_flush();
-                        if result.is_err() {
-                            writer.abort();
-                        }
-                        if let Err(err) = result {
-                            let _unused = error_tx.send(err.to_string());
-                        }
-                        break;
+                let command = match &message {
+                    StatusProcessMessage::Block { height, spool_path } => {
+                        StatusProcessWireCommand::Block { height: *height, spool_path: spool_path.clone() }
                     }
-                    StatusWorkerMessage::Abort => {
-                        writer.abort();
+                    StatusProcessMessage::Close => StatusProcessWireCommand::Close,
+                    StatusProcessMessage::Abort => StatusProcessWireCommand::Abort,
+                };
+                let mut line = match serde_json::to_string(&command) {
+                    Ok(line) => line,
+                    Err(err) => {
+                        let _unused = error_tx.send(format!("status writer command serialization failed: {err}"));
+                        let _unused = child.kill();
                         break;
                     }
                 };
-                if let Err(err) = result {
-                    writer.abort();
-                    let _unused = error_tx.send(err.to_string());
+                line.push('\n');
+                if let Err(err) = child_stdin.write_all(line.as_bytes()).and_then(|_| child_stdin.flush()) {
+                    let _unused = error_tx.send(format!("status writer command send failed: {err}"));
+                    let _unused = child.kill();
                     break;
+                }
+                match message {
+                    StatusProcessMessage::Block { height, spool_path } => {
+                        let mut response_line = String::new();
+                        match child_stdout.read_line(&mut response_line) {
+                            Ok(0) => {
+                                let _unused = error_tx.send("status writer exited before ack".to_string());
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                let _unused = error_tx.send(format!("status writer ack read failed: {err}"));
+                                break;
+                            }
+                        }
+                        let response: StatusProcessWireResponse = match serde_json::from_str(response_line.trim()) {
+                            Ok(response) => response,
+                            Err(err) => {
+                                let _unused = error_tx.send(format!(
+                                    "status writer returned invalid response: {} ({err})",
+                                    response_line.trim()
+                                ));
+                                break;
+                            }
+                        };
+                        match response {
+                            StatusProcessWireResponse::Ack { height: ack_height } => {
+                                if ack_height != height {
+                                    let _unused = error_tx.send(format!(
+                                        "status writer ack height mismatch expected={height} actual={ack_height}"
+                                    ));
+                                    break;
+                                }
+                                let _unused = ack_tx.send(height);
+                            }
+                            StatusProcessWireResponse::Error { message } => {
+                                let _unused = error_tx.send(message);
+                                break;
+                            }
+                        }
+                        if let Err(err) = fs::remove_file(&spool_path) {
+                            if err.kind() != std::io::ErrorKind::NotFound {
+                                let _unused = error_tx
+                                    .send(format!("status spool cleanup failed for {}: {err}", spool_path.display()));
+                                break;
+                            }
+                        }
+                    }
+                    StatusProcessMessage::Close => {
+                        let _unused = child.wait();
+                        break;
+                    }
+                    StatusProcessMessage::Abort => {
+                        let _unused = child.kill();
+                        let _unused = child.wait();
+                        break;
+                    }
                 }
             }
         });
-        Self { coin, tx, ack_rx, error_rx, handle: Some(handle) }
+        Ok(Self { tx, ack_rx, error_rx, handle: Some(handle) })
     }
 
     fn check_error(&self) -> parquet::errors::Result<()> {
         match self.error_rx.try_recv() {
-            Ok(err) => Err(io_to_parquet_error(io_other(format!("status worker failed for {}: {err}", self.coin)))),
+            Ok(err) => Err(io_to_parquet_error(io_other(format!("status process failed: {err}")))),
             Err(TryRecvError::Empty) => Ok(()),
             Err(TryRecvError::Disconnected) => Ok(()),
         }
     }
 
-    fn send_block(&self, height: u64, rows: StatusBlockBatch) -> parquet::errors::Result<()> {
+    fn send_block(&self, height: u64, rows: HashMap<String, StatusBlockBatch>) -> parquet::errors::Result<()> {
         self.check_error()?;
-        self.tx.send(StatusWorkerMessage::Block { height, rows }).map_err(|err| {
-            io_to_parquet_error(io_other(format!("status worker send failed for {}: {err}", self.coin)))
-        })?;
+        let spool_path = write_status_spool_file(height, rows)?;
+        if let Err(err) = self.tx.send(StatusProcessMessage::Block { height, spool_path: spool_path.clone() }) {
+            let _unused = fs::remove_file(&spool_path);
+            return Err(io_to_parquet_error(io_other(format!("status process send failed: {err}"))));
+        }
         self.check_error()
     }
 
@@ -1279,33 +1440,111 @@ impl StatusWorkerHandle {
 
     fn close(mut self) -> parquet::errors::Result<()> {
         self.check_error()?;
-        self.tx.send(StatusWorkerMessage::Close).map_err(|err| {
-            io_to_parquet_error(io_other(format!("status worker close send failed for {}: {err}", self.coin)))
-        })?;
+        self.tx
+            .send(StatusProcessMessage::Close)
+            .map_err(|err| io_to_parquet_error(io_other(format!("status process close send failed: {err}"))))?;
         if let Some(handle) = self.handle.take() {
-            handle.join().map_err(|err| {
-                io_to_parquet_error(io_other(format!("status worker join failed for {}: {err:?}", self.coin)))
-            })?;
+            handle
+                .join()
+                .map_err(|err| io_to_parquet_error(io_other(format!("status process join failed: {err:?}"))))?;
         }
         self.check_error()
     }
 
     fn abort(mut self) {
-        let _unused = self.tx.send(StatusWorkerMessage::Abort);
+        let _unused = self.tx.send(StatusProcessMessage::Abort);
         if let Some(handle) = self.handle.take() {
             let _unused = handle.join();
         }
     }
 }
 
+pub fn run_status_archive_worker(config_json: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config: StatusProcessConfig = serde_json::from_str(config_json)?;
+    set_archive_base_dir(Some(config.archive_base_dir.clone()));
+    set_archive_handoff_config(config.handoff.clone());
+    set_rotation_blocks(config.rotation_blocks);
+    let stop = Arc::new(AtomicBool::new(false));
+    let handoff_worker = start_archive_handoff_worker(stop);
+    let handoff_tx = handoff_worker.tx.clone();
+    let zstd_level = ZstdLevel::try_new(3).unwrap_or_default();
+    let props = std::sync::Arc::new(
+        WriterProperties::builder().set_compression(Compression::ZSTD(zstd_level)).set_dictionary_enabled(true).build(),
+    );
+    let schema = status_schema_for_mode(config.mode);
+    let mut writers: HashMap<String, StatusParquetWriter> = config
+        .symbols
+        .iter()
+        .map(|coin| {
+            (coin.clone(), StatusParquetWriter::new(config.mode, schema.clone(), props.clone(), handoff_tx.clone()))
+        })
+        .collect();
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if stdin.read_line(&mut line)? == 0 {
+            break;
+        }
+        let command: StatusProcessWireCommand = serde_json::from_str(line.trim())?;
+        match command {
+            StatusProcessWireCommand::Block { height, spool_path } => {
+                let spool_file = fs::File::open(&spool_path)?;
+                let StatusSpoolFile { height: spool_height, mut rows } =
+                    rmp_serde::decode::from_read(spool_file).map_err(|err| io_other(err.to_string()))?;
+                if spool_height != height {
+                    let response = StatusProcessWireResponse::Error {
+                        message: format!("status spool height mismatch expected={height} actual={spool_height}"),
+                    };
+                    writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+                    stdout.flush()?;
+                    continue;
+                }
+                for coin in &config.symbols {
+                    let writer =
+                        writers.get_mut(coin).ok_or_else(|| io_other(format!("missing status writer for {coin}")))?;
+                    writer.advance_block(height)?;
+                    let batch = rows.remove(coin).unwrap_or_else(|| StatusBlockBatch::new(config.mode));
+                    if !batch.is_empty() {
+                        writer.append_block(coin, height, batch)?;
+                    }
+                }
+                fs::remove_file(&spool_path)?;
+                let response = StatusProcessWireResponse::Ack { height };
+                writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+                stdout.flush()?;
+            }
+            StatusProcessWireCommand::Close => {
+                for writer in writers.values_mut() {
+                    writer.close_with_flush()?;
+                }
+                drain_handoff_tasks(&handoff_tx)?;
+                break;
+            }
+            StatusProcessWireCommand::Abort => {
+                for writer in writers.values_mut() {
+                    writer.abort();
+                }
+                break;
+            }
+        }
+    }
+    drop(handoff_tx);
+    handoff_worker.handle.join().map_err(|err| io_other(format!("status handoff worker join failed: {err:?}")))?;
+    Ok(())
+}
+
 struct CoinWriters {
-    status: StatusWorkerHandle,
     diff: ParquetStreamWriter<DiffOut>,
     fill: ParquetStreamWriter<FillOut>,
 }
 
 struct ArchiveWriters {
     blocks: ParquetStreamWriter<BlockIndexOut>,
+    status: Option<StatusProcessHandle>,
     coins: HashMap<String, CoinWriters>,
     symbols: Vec<String>,
     mode: ArchiveMode,
@@ -1314,8 +1553,69 @@ struct ArchiveWriters {
     last_archived_height: Option<u64>,
 }
 
+fn status_schema_for_mode(mode: ArchiveMode) -> std::sync::Arc<Type> {
+    let schema = match mode {
+        ArchiveMode::Lite => {
+            "message status_schema {\n\
+                REQUIRED INT64 block_number;\n\
+                REQUIRED BINARY block_time (UTF8);\n\
+                REQUIRED BINARY coin (UTF8);\n\
+                REQUIRED BINARY time (UTF8);\n\
+                REQUIRED BINARY user (UTF8);\n\
+                REQUIRED BINARY status (UTF8);\n\
+                REQUIRED INT64 oid;\n\
+                REQUIRED BINARY side (UTF8);\n\
+                REQUIRED INT64 limit_px (DECIMAL(18, 8));\n\
+                REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                REQUIRED INT64 orig_sz (DECIMAL(18, 8));\n\
+                REQUIRED INT64 timestamp;\n\
+                REQUIRED BOOLEAN is_trigger;\n\
+                REQUIRED BINARY tif (UTF8);\n\
+                REQUIRED BINARY trigger_condition (UTF8);\n\
+                REQUIRED INT64 trigger_px (DECIMAL(18, 8));\n\
+                REQUIRED BOOLEAN is_position_tpsl;\n\
+                REQUIRED BOOLEAN reduce_only;\n\
+                REQUIRED BINARY order_type (UTF8);\n\
+                REQUIRED BINARY cloid (UTF8);\n\
+            }"
+        }
+        ArchiveMode::Full => {
+            "message status_schema {\n\
+                REQUIRED INT64 block_number;\n\
+                REQUIRED BINARY block_time (UTF8);\n\
+                REQUIRED BINARY coin (UTF8);\n\
+                REQUIRED BINARY status (UTF8);\n\
+                REQUIRED INT64 oid;\n\
+                REQUIRED BINARY side (UTF8);\n\
+                REQUIRED INT64 limit_px (DECIMAL(18, 8));\n\
+                REQUIRED BOOLEAN is_trigger;\n\
+                REQUIRED BINARY tif (UTF8);\n\
+                REQUIRED BINARY user (UTF8);\n\
+                REQUIRED BINARY hash (UTF8);\n\
+                REQUIRED BINARY order_type (UTF8);\n\
+                REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                REQUIRED INT64 orig_sz (DECIMAL(18, 8));\n\
+                REQUIRED BINARY time (UTF8);\n\
+                REQUIRED BINARY builder (UTF8);\n\
+                REQUIRED INT64 timestamp;\n\
+                REQUIRED BINARY trigger_condition (UTF8);\n\
+                REQUIRED INT64 trigger_px (DECIMAL(18, 8));\n\
+                REQUIRED BOOLEAN is_position_tpsl;\n\
+                REQUIRED BOOLEAN reduce_only;\n\
+                REQUIRED BINARY cloid (UTF8);\n\
+                REQUIRED BINARY raw_event (UTF8);\n\
+            }"
+        }
+    };
+    std::sync::Arc::new(parse_message_type(schema).expect("invalid status schema"))
+}
+
 impl ArchiveWriters {
-    fn new(mode: ArchiveMode, symbols: Vec<String>, handoff_tx: Sender<HandoffMessage>) -> Self {
+    fn new(
+        mode: ArchiveMode,
+        symbols: Vec<String>,
+        handoff_tx: Sender<HandoffMessage>,
+    ) -> parquet::errors::Result<Self> {
         let zstd_level = ZstdLevel::try_new(3).unwrap_or_default();
         let props = std::sync::Arc::new(
             WriterProperties::builder()
@@ -1348,7 +1648,7 @@ impl ArchiveWriters {
             .expect("invalid blocks schema"),
         );
 
-        let (status_schema_str, diff_schema_str, fill_schema_str) = match mode {
+        let (_status_schema_str, diff_schema_str, fill_schema_str) = match mode {
             ArchiveMode::Lite => (
                 "message status_schema {\n\
                     REQUIRED INT64 block_number;\n\
@@ -1457,7 +1757,6 @@ impl ArchiveWriters {
             ),
         };
 
-        let status_schema = std::sync::Arc::new(parse_message_type(status_schema_str).expect("invalid status schema"));
         let diff_schema = std::sync::Arc::new(parse_message_type(diff_schema_str).expect("invalid diff schema"));
         let fill_schema = std::sync::Arc::new(parse_message_type(fill_schema_str).expect("invalid fill schema"));
 
@@ -1466,13 +1765,6 @@ impl ArchiveWriters {
             coins.insert(
                 coin.clone(),
                 CoinWriters {
-                    status: StatusWorkerHandle::new(
-                        coin.clone(),
-                        mode,
-                        status_schema.clone(),
-                        props.clone(),
-                        handoff_tx.clone(),
-                    ),
                     diff: ParquetStreamWriter::new(
                         StreamKind::Diff,
                         diff_schema.clone(),
@@ -1489,15 +1781,16 @@ impl ArchiveWriters {
             );
         }
 
-        Self {
+        Ok(Self {
             blocks: ParquetStreamWriter::new(StreamKind::Blocks, blocks_schema, props.clone(), handoff_tx),
+            status: Some(StatusProcessHandle::new(mode, symbols.clone())?),
             coins,
             symbols,
             mode,
             pending_status_acks: HashMap::new(),
             next_uncommitted_height: None,
             last_archived_height: None,
-        }
+        })
     }
 
     fn coin_mut(&mut self, coin: &str) -> Option<&mut CoinWriters> {
@@ -1517,7 +1810,7 @@ impl ArchiveWriters {
             self.last_archived_height = Some(height);
             return;
         }
-        self.pending_status_acks.insert(height, self.symbols.len());
+        self.pending_status_acks.insert(height, 1);
         if self.next_uncommitted_height.is_none() {
             self.next_uncommitted_height = Some(height);
         }
@@ -1536,18 +1829,19 @@ impl ArchiveWriters {
     }
 
     fn drain_status_progress(&mut self) -> parquet::errors::Result<()> {
-        for writers in self.coins.values() {
-            for height in writers.status.drain_acked_heights()? {
-                let Some(remaining) = self.pending_status_acks.get_mut(&height) else {
-                    warn!("Dropping unexpected status worker ack at height {}", height);
-                    continue;
-                };
-                if *remaining == 0 {
-                    warn!("Dropping duplicate status worker ack at height {}", height);
-                    continue;
-                }
-                *remaining -= 1;
+        let Some(status) = self.status.as_ref() else {
+            return Ok(());
+        };
+        for height in status.drain_acked_heights()? {
+            let Some(remaining) = self.pending_status_acks.get_mut(&height) else {
+                warn!("Dropping unexpected status worker ack at height {}", height);
+                continue;
+            };
+            if *remaining == 0 {
+                warn!("Dropping duplicate status worker ack at height {}", height);
+                continue;
             }
+            *remaining -= 1;
         }
         self.advance_last_archived_height();
         Ok(())
@@ -1555,9 +1849,11 @@ impl ArchiveWriters {
 
     fn close_all(&mut self) -> parquet::errors::Result<()> {
         self.blocks.close_with_flush(self.mode, write_block_rows)?;
+        if let Some(status) = self.status.take() {
+            status.close()?;
+        }
         for (_, writers) in std::mem::take(&mut self.coins) {
             let mut writers = writers;
-            writers.status.close()?;
             writers.diff.close_with_flush(self.mode, write_diff_rows)?;
             writers.fill.close_with_flush(self.mode, write_fill_rows)?;
         }
@@ -1566,9 +1862,11 @@ impl ArchiveWriters {
 
     fn abort_all(&mut self) {
         self.blocks.abort();
+        if let Some(status) = self.status.take() {
+            status.abort();
+        }
         for (_, writers) in std::mem::take(&mut self.coins) {
             let mut writers = writers;
-            writers.status.abort();
             writers.diff.abort();
             writers.fill.abort();
         }
@@ -1934,8 +2232,19 @@ fn restart_archive_after_handoff(
                 height,
                 symbols.join(",")
             );
-            *writers = Some(ArchiveWriters::new(mode, symbols, handoff_tx.clone()));
-            *bootstrap_checkpoint_evaluated = false;
+            match ArchiveWriters::new(mode, symbols, handoff_tx.clone()) {
+                Ok(next) => {
+                    *writers = Some(next);
+                    *bootstrap_checkpoint_evaluated = false;
+                }
+                Err(err) => disable_archive_after_failure(
+                    writers,
+                    current_mode,
+                    current_symbols,
+                    height,
+                    &format!("archive restart failed to create writers: {err}"),
+                ),
+            }
         }
         Err(err) => {
             disable_archive_after_failure(
@@ -2000,9 +2309,20 @@ fn rotate_archive_after_discontinuity(
                 next_height,
                 symbols.join(",")
             );
-            *writers = Some(ArchiveWriters::new(mode, symbols, handoff_tx.clone()));
-            *bootstrap_checkpoint_evaluated = false;
-            *last_input_height = None;
+            match ArchiveWriters::new(mode, symbols, handoff_tx.clone()) {
+                Ok(next) => {
+                    *writers = Some(next);
+                    *bootstrap_checkpoint_evaluated = false;
+                    *last_input_height = None;
+                }
+                Err(err) => disable_archive_after_failure(
+                    writers,
+                    current_mode,
+                    current_symbols,
+                    next_height,
+                    &format!("archive discontinuity rotate create failed: {err}"),
+                ),
+            }
         }
         Err(err) => {
             disable_archive_after_failure(
@@ -3051,7 +3371,20 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     continue;
                 }
             }
-            writers = mode.map(|mode| ArchiveWriters::new(mode, symbols.clone(), handoff_tx.clone()));
+            writers = match mode {
+                Some(mode) => match ArchiveWriters::new(mode, symbols.clone(), handoff_tx.clone()) {
+                    Ok(writers) => Some(writers),
+                    Err(err) => {
+                        error!("Refusing to enable archive: failed to create writers: {err}");
+                        set_archive_mode(None);
+                        current_mode = None;
+                        current_symbols = symbols;
+                        bootstrap_checkpoint_evaluated = false;
+                        continue;
+                    }
+                },
+                None => None,
+            };
             current_mode = mode;
             current_symbols = symbols;
             bootstrap_checkpoint_evaluated = false;
@@ -3494,11 +3827,6 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     fatal_error = Some(format!("fill advance failed for {coin}: {err}"));
                     break;
                 }
-                let status_for_block = status_rows.remove(&coin).unwrap_or_else(|| StatusBlockBatch::new(mode));
-                if let Err(err) = coin_writers.status.send_block(height, status_for_block) {
-                    fatal_error = Some(format!("status write failed for {coin}: {err}"));
-                    break;
-                }
                 if let Some(rows) = diff_rows.remove(&coin).filter(|rows| !rows.is_empty()) {
                     if let Err(err) = coin_writers.diff.append_rows(&coin, mode, height, rows, write_diff_rows) {
                         fatal_error = Some(format!("diff write failed for {coin}: {err}"));
@@ -3516,6 +3844,20 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         if let Some(context) = fatal_error {
             disable_archive_after_failure(&mut writers, &mut current_mode, &mut current_symbols, height, &context);
             continue;
+        }
+        if let Some(writers_ref) = writers.as_mut() {
+            if let Some(status) = writers_ref.status.as_ref() {
+                if let Err(err) = status.send_block(height, status_rows) {
+                    disable_archive_after_failure(
+                        &mut writers,
+                        &mut current_mode,
+                        &mut current_symbols,
+                        height,
+                        &format!("status write failed: {err}"),
+                    );
+                    continue;
+                }
+            }
         }
         if let Some(writers_ref) = writers.as_mut() {
             if let Err(err) = writers_ref.drain_status_progress() {

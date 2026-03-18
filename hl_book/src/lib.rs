@@ -2,6 +2,7 @@
 #![allow(non_local_definitions, unused_qualifications)]
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,8 +13,8 @@ use compute_l4::{
 };
 use fifo_listener::{
     ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, HeightCallback, ListenerHandle, current_archive_base_dir,
-    current_archive_symbols, set_archive_base_dir, set_archive_handoff_config, set_archive_mode, set_archive_symbols,
-    set_rotation_blocks, start_listener,
+    current_archive_symbols, run_status_archive_worker, set_archive_base_dir, set_archive_handoff_config,
+    set_archive_mode, set_archive_symbols, set_rotation_blocks, start_listener,
 };
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use pyo3::prelude::*;
@@ -28,6 +29,21 @@ use pyo3_asyncio as _;
 
 static PY_LOG_INIT: Once = Once::new();
 static PY_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
+const APPEND_CHECKPOINT_SUBPROCESS: &str = r#"
+import json
+import sys
+
+import _hl_book_native as hl_book
+
+meta = hl_book.append_checkpoint_direct(
+    sys.argv[1],
+    output_dir=sys.argv[2] if sys.argv[2] else None,
+    include_users=sys.argv[3] == "1",
+    include_trigger_orders=sys.argv[4] == "1",
+    assets=sys.argv[5:] or None,
+)
+print(json.dumps(meta, separators=(",", ":")))
+"#;
 
 fn parse_archive_mode(mode: Option<&str>) -> PyResult<Option<ArchiveMode>> {
     match mode {
@@ -355,6 +371,107 @@ fn checkpoint_result_to_py(py: Python<'_>, result: compute_l4::CheckpointWriteRe
     Ok(out.into())
 }
 
+fn checkpoint_result_from_json(
+    value: serde_json::Value,
+) -> Result<compute_l4::CheckpointWriteResult, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(compute_l4::CheckpointWriteResult {
+        block_height: value
+            .get("block_height")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| io_error("missing block_height"))?,
+        block_time: value
+            .get("block_time")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| io_error("missing block_time"))?
+            .to_string(),
+        segment_path: PathBuf::from(
+            value
+                .get("segment_path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| io_error("missing segment_path"))?,
+        ),
+        segment_start: value
+            .get("segment_start")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| io_error("missing segment_start"))?,
+        segment_end: value
+            .get("segment_end")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| io_error("missing segment_end"))?,
+        snapshot_index_path: PathBuf::from(
+            value
+                .get("snapshot_index_path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| io_error("missing snapshot_index_path"))?,
+        ),
+        checkpoint_count: value
+            .get("checkpoint_count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| io_error("missing checkpoint_count"))? as usize,
+        asset_count: value
+            .get("asset_count")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| io_error("missing asset_count"))? as usize,
+        codec: value
+            .get("codec")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| io_error("missing codec"))?
+            .to_string(),
+        compression_level: value.get("compression_level").and_then(serde_json::Value::as_i64).map(|level| level as i32),
+        raw_len: value.get("raw_len").and_then(serde_json::Value::as_u64).ok_or_else(|| io_error("missing raw_len"))?,
+        stored_len: value
+            .get("stored_len")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| io_error("missing stored_len"))?,
+    })
+}
+
+fn io_error(message: &str) -> std::io::Error {
+    std::io::Error::other(message.to_string())
+}
+
+fn append_checkpoint_direct(
+    input: PathBuf,
+    output_dir: Option<PathBuf>,
+    include_users: bool,
+    include_trigger_orders: bool,
+    assets: Option<Vec<String>>,
+) -> Result<compute_l4::CheckpointWriteResult, Box<dyn std::error::Error + Send + Sync>> {
+    let options = ComputeOptions { include_users, include_trigger_orders, assets };
+    append_l4_checkpoint(input, output_dir, &options).map_err(|err| err.into())
+}
+
+fn append_checkpoint_isolated(
+    input: PathBuf,
+    output_dir: Option<PathBuf>,
+    include_users: bool,
+    include_trigger_orders: bool,
+    assets: Option<Vec<String>>,
+) -> Result<compute_l4::CheckpointWriteResult, Box<dyn std::error::Error + Send + Sync>> {
+    let python = std::env::current_exe()?;
+    let output = Command::new(&python)
+        .arg("-c")
+        .arg(APPEND_CHECKPOINT_SUBPROCESS)
+        .arg(&input)
+        .arg(output_dir.as_ref().map_or_else(String::new, |path| path.display().to_string()))
+        .arg(if include_users { "1" } else { "0" })
+        .arg(if include_trigger_orders { "1" } else { "0" })
+        .args(assets.clone().unwrap_or_default())
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "append_checkpoint child failed status={} exe={} stderr={stderr}",
+            output.status,
+            python.display()
+        )
+        .into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let meta: serde_json::Value = serde_json::from_str(stdout.trim())?;
+    checkpoint_result_from_json(meta)
+}
+
 #[pyfunction(name = "compute_json")]
 #[pyo3(signature = (input, include_users=false, include_trigger_orders=false, assets=None))]
 fn py_compute_json(
@@ -390,8 +507,23 @@ fn py_append_checkpoint(
     include_trigger_orders: bool,
     assets: Option<Vec<String>>,
 ) -> PyResult<PyObject> {
-    let options = ComputeOptions { include_users, include_trigger_orders, assets };
-    let result = append_l4_checkpoint(input, output_dir, &options).map_err(into_py_err)?;
+    let result = append_checkpoint_isolated(input, output_dir, include_users, include_trigger_orders, assets)
+        .map_err(into_py_err)?;
+    checkpoint_result_to_py(py, result)
+}
+
+#[pyfunction(name = "append_checkpoint_direct")]
+#[pyo3(signature = (input, output_dir=None, include_users=false, include_trigger_orders=false, assets=None))]
+fn py_append_checkpoint_direct(
+    py: Python<'_>,
+    input: PathBuf,
+    output_dir: Option<PathBuf>,
+    include_users: bool,
+    include_trigger_orders: bool,
+    assets: Option<Vec<String>>,
+) -> PyResult<PyObject> {
+    let result = append_checkpoint_direct(input, output_dir, include_users, include_trigger_orders, assets)
+        .map_err(into_py_err)?;
     checkpoint_result_to_py(py, result)
 }
 
@@ -441,14 +573,21 @@ fn py_set_dataset_dir(output_dir: Option<PathBuf>) -> String {
     snapshot_dir.to_string_lossy().into_owned()
 }
 
+#[pyfunction(name = "run_status_archive_worker")]
+fn py_run_status_archive_worker(config_json: &str) -> PyResult<()> {
+    run_status_archive_worker(config_json).map_err(into_py_err)
+}
+
 #[pymodule]
 fn _hl_book_native(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyFifoListener>()?;
     m.add_function(wrap_pyfunction!(py_compute_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_compute_to_file, m)?)?;
     m.add_function(wrap_pyfunction!(py_append_checkpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(py_append_checkpoint_direct, m)?)?;
     m.add_function(wrap_pyfunction!(py_append_checkpoint_from_snapshot_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_get_dataset_dir, m)?)?;
     m.add_function(wrap_pyfunction!(py_set_dataset_dir, m)?)?;
+    m.add_function(wrap_pyfunction!(py_run_status_archive_worker, m)?)?;
     Ok(())
 }

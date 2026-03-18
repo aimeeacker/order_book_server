@@ -1845,6 +1845,7 @@ dependencies = [
  "pyo3",
  "pyo3-asyncio",
  "reqwest",
+ "rmp-serde",
  "serde",
  "serde_json",
 ]
@@ -2221,6 +2222,7 @@ dependencies = [
  "log",
  "pyo3",
  "pyo3-asyncio",
+ "serde_json",
 ]
 
 [[package]]
