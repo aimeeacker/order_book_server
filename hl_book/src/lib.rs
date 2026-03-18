@@ -13,8 +13,8 @@ use compute_l4::{
 };
 use fifo_listener::{
     ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, HeightCallback, ListenerHandle, current_archive_base_dir,
-    current_archive_symbols, run_status_archive_worker, set_archive_base_dir, set_archive_handoff_config,
-    set_archive_mode, set_archive_symbols, set_rotation_blocks, start_listener,
+    current_archive_symbols, set_archive_base_dir, set_archive_handoff_config, set_archive_mode, set_archive_symbols,
+    set_rotation_blocks, start_listener,
 };
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use pyo3::prelude::*;
@@ -29,21 +29,8 @@ use pyo3_asyncio as _;
 
 static PY_LOG_INIT: Once = Once::new();
 static PY_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
-const APPEND_CHECKPOINT_SUBPROCESS: &str = r#"
-import json
-import sys
-
-import _hl_book_native as hl_book
-
-meta = hl_book.append_checkpoint_direct(
-    sys.argv[1],
-    output_dir=sys.argv[2] if sys.argv[2] else None,
-    include_users=sys.argv[3] == "1",
-    include_trigger_orders=sys.argv[4] == "1",
-    assets=sys.argv[5:] or None,
-)
-print(json.dumps(meta, separators=(",", ":")))
-"#;
+const APPEND_CHECKPOINT_WORKER_BIN: &str = "append_checkpoint_worker";
+const APPEND_CHECKPOINT_WORKER_BIN_ENV: &str = "HL_APPEND_CHECKPOINT_WORKER_BIN";
 
 fn parse_archive_mode(mode: Option<&str>) -> PyResult<Option<ArchiveMode>> {
     match mode {
@@ -430,6 +417,28 @@ fn io_error(message: &str) -> std::io::Error {
     std::io::Error::other(message.to_string())
 }
 
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().expect("workspace root").to_path_buf()
+}
+
+fn resolve_append_checkpoint_worker_binary() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if let Ok(path) = std::env::var(APPEND_CHECKPOINT_WORKER_BIN_ENV) {
+        return Ok(PathBuf::from(path));
+    }
+    let workspace_root = workspace_root();
+    for profile in ["release", "debug"] {
+        let candidate = workspace_root.join("target").join(profile).join(APPEND_CHECKPOINT_WORKER_BIN);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "failed to locate native append checkpoint worker binary {}; set {} if needed",
+        APPEND_CHECKPOINT_WORKER_BIN, APPEND_CHECKPOINT_WORKER_BIN_ENV
+    )
+    .into())
+}
+
 fn append_checkpoint_direct(
     input: PathBuf,
     output_dir: Option<PathBuf>,
@@ -448,10 +457,8 @@ fn append_checkpoint_isolated(
     include_trigger_orders: bool,
     assets: Option<Vec<String>>,
 ) -> Result<compute_l4::CheckpointWriteResult, Box<dyn std::error::Error + Send + Sync>> {
-    let python = std::env::current_exe()?;
-    let output = Command::new(&python)
-        .arg("-c")
-        .arg(APPEND_CHECKPOINT_SUBPROCESS)
+    let worker_bin = resolve_append_checkpoint_worker_binary()?;
+    let output = Command::new(&worker_bin)
         .arg(&input)
         .arg(output_dir.as_ref().map_or_else(String::new, |path| path.display().to_string()))
         .arg(if include_users { "1" } else { "0" })
@@ -463,7 +470,7 @@ fn append_checkpoint_isolated(
         return Err(format!(
             "append_checkpoint child failed status={} exe={} stderr={stderr}",
             output.status,
-            python.display()
+            worker_bin.display()
         )
         .into());
     }
@@ -573,11 +580,6 @@ fn py_set_dataset_dir(output_dir: Option<PathBuf>) -> String {
     snapshot_dir.to_string_lossy().into_owned()
 }
 
-#[pyfunction(name = "run_status_archive_worker")]
-fn py_run_status_archive_worker(config_json: &str) -> PyResult<()> {
-    run_status_archive_worker(config_json).map_err(into_py_err)
-}
-
 #[pymodule]
 fn _hl_book_native(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyFifoListener>()?;
@@ -588,6 +590,5 @@ fn _hl_book_native(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_append_checkpoint_from_snapshot_json, m)?)?;
     m.add_function(wrap_pyfunction!(py_get_dataset_dir, m)?)?;
     m.add_function(wrap_pyfunction!(py_set_dataset_dir, m)?)?;
-    m.add_function(wrap_pyfunction!(py_run_status_archive_worker, m)?)?;
     Ok(())
 }

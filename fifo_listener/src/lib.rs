@@ -4,7 +4,6 @@
 mod archive;
 mod listener;
 
-pub use archive::run_status_archive_worker;
 pub use listener::{
     ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, HeightCallback, ListenerHandle, current_archive_base_dir,
     current_archive_symbols, init_cli_logging, run_forever, set_archive_base_dir, set_archive_enabled,

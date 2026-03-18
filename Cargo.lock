@@ -1845,7 +1845,6 @@ dependencies = [
  "pyo3",
  "pyo3-asyncio",
  "reqwest",
- "rmp-serde",
  "serde",
  "serde_json",
 ]
