@@ -16,8 +16,8 @@ use memchr::{memchr, memmem};
 use crate::archive::{ARCHIVE_QUEUE_BLOCKS, ArchiveBlock, is_archive_enabled, run_archive_writer};
 pub use crate::archive::{
     ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, current_archive_base_dir, current_archive_symbols,
-    set_archive_base_dir, set_archive_enabled, set_archive_handoff_config, set_archive_mode, set_archive_symbols,
-    set_rotation_blocks,
+    set_archive_align_output_to_1000_boundary, set_archive_align_start_to_10k_boundary, set_archive_base_dir,
+    set_archive_enabled, set_archive_handoff_config, set_archive_mode, set_archive_symbols, set_rotation_blocks,
 };
 
 const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book/runtime_fifo";

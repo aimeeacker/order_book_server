@@ -6,8 +6,9 @@ mod listener;
 
 pub use listener::{
     ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, HeightCallback, ListenerHandle, current_archive_base_dir,
-    current_archive_symbols, init_cli_logging, run_forever, set_archive_base_dir, set_archive_enabled,
-    set_archive_handoff_config, set_archive_mode, set_archive_symbols, set_rotation_blocks, start_listener,
+    current_archive_symbols, init_cli_logging, run_forever, set_archive_align_output_to_1000_boundary,
+    set_archive_align_start_to_10k_boundary, set_archive_base_dir, set_archive_enabled, set_archive_handoff_config,
+    set_archive_mode, set_archive_symbols, set_rotation_blocks, start_listener,
 };
 
 use compute_l4::set_current_dataset_dir;
@@ -65,6 +66,8 @@ fn configure_archive(
     rotation_blocks: Option<u64>,
     output_dir: Option<PathBuf>,
     symbols: Option<Vec<String>>,
+    align_start_to_10k_boundary: bool,
+    align_output_to_1000_boundary: bool,
     move_to_nas: bool,
     nas_output_dir: Option<PathBuf>,
     upload_to_oss: bool,
@@ -92,6 +95,8 @@ fn configure_archive(
     if let Some(n) = rotation_blocks {
         set_rotation_blocks(n);
     }
+    set_archive_align_start_to_10k_boundary(align_start_to_10k_boundary);
+    set_archive_align_output_to_1000_boundary(align_output_to_1000_boundary);
     set_archive_handoff_config(handoff);
     set_archive_symbols(symbols);
     set_archive_mode(mode);
@@ -244,6 +249,8 @@ impl PyFifoListener {
         rotation_blocks=None,
         output_dir=None,
         symbols=None,
+        align_start_to_10k_boundary=true,
+        align_output_to_1000_boundary=true,
         move_to_nas=true,
         nas_output_dir=None,
         upload_to_oss=false,
@@ -259,6 +266,8 @@ impl PyFifoListener {
         rotation_blocks: Option<u64>,
         output_dir: Option<PathBuf>,
         symbols: Option<Vec<String>>,
+        align_start_to_10k_boundary: bool,
+        align_output_to_1000_boundary: bool,
         move_to_nas: bool,
         nas_output_dir: Option<PathBuf>,
         upload_to_oss: bool,
@@ -273,6 +282,8 @@ impl PyFifoListener {
             rotation_blocks,
             output_dir,
             symbols,
+            align_start_to_10k_boundary,
+            align_output_to_1000_boundary,
             move_to_nas,
             nas_output_dir,
             upload_to_oss,

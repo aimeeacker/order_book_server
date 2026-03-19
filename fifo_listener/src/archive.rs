@@ -33,17 +33,21 @@ const TEMP_FILE_SUFFIX: &str = ".tmp";
 const LITE_PRICE_SCALE: u32 = 8;
 const LITE_SIZE_SCALE: u32 = 8;
 const CHECKPOINT_BLOCKS: u64 = 10_000;
+const ARCHIVE_OUTPUT_ALIGN_BLOCKS: u64 = 1_000;
 const STATUS_ROW_GROUP_BLOCKS_DEFAULT: u64 = 10_000;
 const STATUS_ROW_GROUP_BLOCKS_BTC: u64 = 1_000;
 const STATUS_ROW_GROUP_BLOCKS_ETH: u64 = 2_000;
 const STATUS_ROW_GROUP_BLOCKS_SOL_HYPE: u64 = 5_000;
 const DIFF_ROW_GROUP_BLOCKS: u64 = 50_000;
+const DIFF_DELAYED_FLUSH_LOOKAHEAD_BLOCKS: u64 = 2_000;
 const BLOCKS_FILL_ROTATION_BLOCKS: u64 = 1_000_000;
 const MIN_HANDOFF_BLOCK_SPAN: u64 = 5_000;
 const MIN_ARCHIVE_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_DISK_USED_BPS: u64 = 9_500;
 const STATUS_WORKER_QUEUE_BLOCKS: usize = 16;
 static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
+static ARCHIVE_ALIGN_START_TO_10K_BOUNDARY: AtomicBool = AtomicBool::new(true);
+static ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY: AtomicBool = AtomicBool::new(true);
 static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
 static ARCHIVE_HANDOFF_CONFIG: OnceLock<Mutex<ArchiveHandoffConfig>> = OnceLock::new();
@@ -240,6 +244,22 @@ pub fn set_archive_enabled(enabled: bool) {
     }
 }
 
+pub fn set_archive_align_start_to_10k_boundary(enabled: bool) {
+    ARCHIVE_ALIGN_START_TO_10K_BOUNDARY.store(enabled, Ordering::SeqCst);
+}
+
+pub fn set_archive_align_output_to_1000_boundary(enabled: bool) {
+    ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY.store(enabled, Ordering::SeqCst);
+}
+
+pub(crate) fn current_archive_align_start_to_10k_boundary() -> bool {
+    ARCHIVE_ALIGN_START_TO_10K_BOUNDARY.load(Ordering::SeqCst)
+}
+
+pub(crate) fn current_archive_align_output_to_1000_boundary() -> bool {
+    ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY.load(Ordering::SeqCst)
+}
+
 pub(crate) fn get_archive_mode() -> Option<ArchiveMode> {
     match ARCHIVE_MODE.load(Ordering::SeqCst) {
         1 => Some(ArchiveMode::Lite),
@@ -406,6 +426,29 @@ impl StatusLiteColumns {
         self.order_type.extend(other.order_type);
         self.cloid.extend(other.cloid);
     }
+
+    fn trim_to_block(&mut self, max_block: u64) {
+        let keep = self.block_number.partition_point(|block| *block <= max_block as i64);
+        self.block_number.truncate(keep);
+        self.block_time.truncate(keep);
+        self.time.truncate(keep);
+        self.user.truncate(keep);
+        self.status.truncate(keep);
+        self.oid.truncate(keep);
+        self.side.truncate(keep);
+        self.limit_px.truncate(keep);
+        self.sz.truncate(keep);
+        self.orig_sz.truncate(keep);
+        self.timestamp.truncate(keep);
+        self.is_trigger.truncate(keep);
+        self.tif.truncate(keep);
+        self.trigger_condition.truncate(keep);
+        self.trigger_px.truncate(keep);
+        self.is_position_tpsl.truncate(keep);
+        self.reduce_only.truncate(keep);
+        self.order_type.truncate(keep);
+        self.cloid.truncate(keep);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -463,6 +506,32 @@ impl StatusFullColumns {
         self.cloid.extend(other.cloid);
         self.raw_event.extend(other.raw_event);
     }
+
+    fn trim_to_block(&mut self, max_block: u64) {
+        let keep = self.block_number.partition_point(|block| *block <= max_block as i64);
+        self.block_number.truncate(keep);
+        self.block_time.truncate(keep);
+        self.status.truncate(keep);
+        self.oid.truncate(keep);
+        self.side.truncate(keep);
+        self.limit_px.truncate(keep);
+        self.is_trigger.truncate(keep);
+        self.tif.truncate(keep);
+        self.user.truncate(keep);
+        self.hash.truncate(keep);
+        self.order_type.truncate(keep);
+        self.sz.truncate(keep);
+        self.orig_sz.truncate(keep);
+        self.time.truncate(keep);
+        self.builder.truncate(keep);
+        self.timestamp.truncate(keep);
+        self.trigger_condition.truncate(keep);
+        self.trigger_px.truncate(keep);
+        self.is_position_tpsl.truncate(keep);
+        self.reduce_only.truncate(keep);
+        self.cloid.truncate(keep);
+        self.raw_event.truncate(keep);
+    }
 }
 
 #[derive(Debug)]
@@ -485,6 +554,13 @@ impl StatusBlockBatch {
             Self::Full(columns) => columns.is_empty(),
         }
     }
+
+    fn trim_to_block(&mut self, max_block: u64) {
+        match self {
+            Self::Lite(columns) => columns.trim_to_block(max_block),
+            Self::Full(columns) => columns.trim_to_block(max_block),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -501,6 +577,12 @@ struct DiffOut {
     px: i64,
     orig_sz: i64,
     raw_event: String,
+}
+
+impl HasBlockNumber for DiffOut {
+    fn block_number(&self) -> u64 {
+        self.block_number
+    }
 }
 
 #[derive(Debug)]
@@ -527,6 +609,12 @@ struct FillOut {
     raw_event: String,
 }
 
+impl HasBlockNumber for FillOut {
+    fn block_number(&self) -> u64 {
+        self.block_number
+    }
+}
+
 #[derive(Debug)]
 struct BlockIndexOut {
     block_number: u64,
@@ -545,6 +633,12 @@ struct BlockIndexOut {
     eth_fill_n: i32,
     archive_mode: String,
     tracked_symbols: String,
+}
+
+impl HasBlockNumber for BlockIndexOut {
+    fn block_number(&self) -> u64 {
+        self.block_number
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -581,6 +675,13 @@ impl StreamKind {
         match self {
             Self::Blocks | Self::Fill => BLOCKS_FILL_ROTATION_BLOCKS,
             Self::Status | Self::Diff => ROTATION_BLOCKS.load(Ordering::SeqCst),
+        }
+    }
+
+    fn delayed_flush_lookahead_blocks(self) -> Option<u64> {
+        match self {
+            Self::Diff => Some(DIFF_DELAYED_FLUSH_LOOKAHEAD_BLOCKS),
+            Self::Blocks | Self::Status | Self::Fill => None,
         }
     }
 }
@@ -620,6 +721,11 @@ fn archive_relative_dir(stream: StreamKind, mode: ArchiveMode, coin: &str) -> Pa
         StreamKind::Fill => archive_coin_dir(mode, coin),
         StreamKind::Diff | StreamKind::Status => archive_coin_dir(mode, coin).join(stream.name()),
     }
+}
+
+fn aligned_archive_output_end(block: u64) -> Option<u64> {
+    let aligned = block.saturating_sub(block % ARCHIVE_OUTPUT_ALIGN_BLOCKS);
+    (aligned > 0).then_some(aligned)
 }
 
 struct ArchiveDiskStatus {
@@ -672,6 +778,23 @@ impl<R> PendingRowGroup<R> {
     }
 }
 
+trait HasBlockNumber {
+    fn block_number(&self) -> u64;
+}
+
+impl<R: HasBlockNumber> PendingRowGroup<R> {
+    fn trim_to_block(&mut self, max_block: u64) {
+        self.rows.retain(|row| row.block_number() <= max_block);
+        if self.rows.is_empty() {
+            self.start_block = None;
+            self.end_block = None;
+        } else {
+            self.start_block = self.rows.first().map(HasBlockNumber::block_number);
+            self.end_block = self.rows.last().map(HasBlockNumber::block_number);
+        }
+    }
+}
+
 struct ParquetStreamWriter<R> {
     stream: StreamKind,
     schema: std::sync::Arc<Type>,
@@ -683,7 +806,7 @@ struct ParquetStreamWriter<R> {
     delayed: PendingRowGroup<R>,
 }
 
-impl<R> ParquetStreamWriter<R> {
+impl<R: HasBlockNumber> ParquetStreamWriter<R> {
     fn new(
         stream: StreamKind,
         schema: std::sync::Arc<Type>,
@@ -854,6 +977,27 @@ impl<R> ParquetStreamWriter<R> {
         }
     }
 
+    fn maybe_flush_delayed_after_lookahead<F>(
+        &mut self,
+        mode: ArchiveMode,
+        block: u64,
+        write_rows: F,
+    ) -> parquet::errors::Result<()>
+    where
+        F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+    {
+        let Some(lookahead) = self.stream.delayed_flush_lookahead_blocks() else {
+            return Ok(());
+        };
+        let Some(active_start) = self.active.start_block else {
+            return Ok(());
+        };
+        if !self.delayed.is_empty() && block.saturating_sub(active_start) + 1 > lookahead {
+            self.flush_delayed_buffer(mode, write_rows)?;
+        }
+        Ok(())
+    }
+
     fn advance_delayed_windows<F>(
         &mut self,
         mode: ArchiveMode,
@@ -900,6 +1044,7 @@ impl<R> ParquetStreamWriter<R> {
         }
         if self.stream.uses_delayed_flush() {
             self.advance_delayed_windows(mode, block, write_rows)?;
+            self.maybe_flush_delayed_after_lookahead(mode, block, write_rows)?;
         } else if self
             .stream
             .row_group_block_limit()
@@ -931,6 +1076,7 @@ impl<R> ParquetStreamWriter<R> {
         }
         if self.stream.uses_delayed_flush() {
             self.ensure_active_window(block);
+            self.maybe_flush_delayed_after_lookahead(mode, block, write_rows)?;
         } else if self.active.start_block.is_none() {
             self.active.start_block = Some(block);
         }
@@ -966,7 +1112,33 @@ impl<R> ParquetStreamWriter<R> {
     fn close_with_flush<F>(&mut self, mode: ArchiveMode, write_rows: F) -> parquet::errors::Result<()>
     where
         F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+        R: HasBlockNumber,
     {
+        if current_archive_align_output_to_1000_boundary() {
+            if let Some(file) = self.file.as_mut() {
+                match aligned_archive_output_end(file.last_block) {
+                    Some(aligned_end) if aligned_end >= file.name_start_block => {
+                        self.active.trim_to_block(aligned_end);
+                        self.delayed.trim_to_block(aligned_end);
+                        file.name_end_block = aligned_end;
+                    }
+                    _ => {
+                        self.active.clear();
+                        self.delayed.clear();
+                        self.pending_start_block = None;
+                        if let Some(file) = self.file.take() {
+                            drop(file.writer);
+                            if let Err(err) = fs::remove_file(&file.tmp_path) {
+                                if err.kind() != std::io::ErrorKind::NotFound {
+                                    warn!("Failed to remove incomplete parquet {}: {err}", file.tmp_path.display());
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
         if self.stream.uses_delayed_flush() {
             if !self.delayed.is_empty() {
                 if !self.active.is_empty() && self.should_merge_tail() {
@@ -1154,6 +1326,31 @@ impl StatusParquetWriter {
     }
 
     fn close_with_flush(&mut self) -> parquet::errors::Result<()> {
+        if current_archive_align_output_to_1000_boundary() {
+            if let Some(file) = self.file.as_mut() {
+                match aligned_archive_output_end(file.last_block) {
+                    Some(aligned_end) if aligned_end >= file.name_start_block => {
+                        self.active.trim_to_block(aligned_end);
+                        file.name_end_block = aligned_end;
+                    }
+                    _ => {
+                        self.active = StatusBlockBatch::new(self.mode);
+                        self.active_start_block = None;
+                        self.active_end_block = None;
+                        self.pending_start_block = None;
+                        if let Some(file) = self.file.take() {
+                            drop(file.writer);
+                            if let Err(err) = fs::remove_file(&file.tmp_path) {
+                                if err.kind() != std::io::ErrorKind::NotFound {
+                                    warn!("Failed to remove incomplete parquet {}: {err}", file.tmp_path.display());
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
         self.flush_active()?;
         if let Some(file) = self.file.take() {
             let tmp_path = file.tmp_path.clone();
@@ -3035,6 +3232,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
     let mut current_mode: Option<ArchiveMode> = None;
     let mut current_symbols = current_archive_symbols();
     let mut bootstrap_checkpoint_evaluated = false;
+    let mut start_alignment_wait_logged = false;
     let mut last_input_height: Option<u64> = None;
     let mut replay_skip_log = ReplaySkipLogState::default();
 
@@ -3064,6 +3262,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             current_mode = mode;
             current_symbols = symbols;
             bootstrap_checkpoint_evaluated = false;
+            start_alignment_wait_logged = false;
             last_input_height = None;
             replay_skip_log = ReplaySkipLogState::default();
         }
@@ -3160,6 +3359,20 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             continue;
         }
 
+        if !bootstrap_checkpoint_evaluated
+            && current_archive_align_start_to_10k_boundary()
+            && !is_checkpoint_start(height)
+        {
+            if !start_alignment_wait_logged {
+                info!(
+                    "Archive waiting for next 10k boundary start; skipping blocks until ..00001, first_seen={}",
+                    height
+                );
+                start_alignment_wait_logged = true;
+            }
+            continue;
+        }
+
         if writers.as_ref().and_then(ArchiveWriters::last_archived_height).is_some_and(|last_archived_height| {
             if height <= last_archived_height {
                 replay_skip_log.record_skip(height, last_archived_height);
@@ -3196,7 +3409,10 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
 
         if !bootstrap_checkpoint_evaluated {
             bootstrap_checkpoint_evaluated = true;
-            if !is_checkpoint_start(height) {
+            start_alignment_wait_logged = false;
+            if current_archive_align_start_to_10k_boundary() {
+                info!("Archive aligned start at checkpoint boundary block {}", height);
+            } else if !is_checkpoint_start(height) {
                 info!(
                     "Archive enabled mid-window at block {}; starting parquet immediately and bootstrapping snapshot checkpoint in background",
                     height
