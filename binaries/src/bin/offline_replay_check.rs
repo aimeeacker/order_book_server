@@ -10,6 +10,8 @@ use clap::Parser;
 use parquet::data_type::Decimal;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
+use rayon::prelude::*;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 
 const SCALE: i64 = 100_000_000;
@@ -34,20 +36,12 @@ struct Args {
 
     #[arg(long)]
     end_height: u64,
+
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
 }
 
-#[derive(Debug, Deserialize)]
-struct DatasetIndex {
-    segments: Vec<DatasetSegmentSummary>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DatasetSegmentSummary {
-    segment_path: String,
-    entries: Vec<SegmentIndexEntry>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 struct SegmentIndexEntry {
     block_height: u64,
     offset: u64,
@@ -167,6 +161,21 @@ struct OrderTrace {
     last_height: u64,
     last_action: &'static str,
     order_type: String,
+}
+
+#[derive(Debug)]
+struct ValidationSummary {
+    coin: String,
+    start_height: u64,
+    end_height: u64,
+    block_rows: u64,
+    min_block: u64,
+    max_block: u64,
+    expected_rows: u64,
+    final_bids: usize,
+    final_asks: usize,
+    status_zero_blocks: Option<usize>,
+    diff_zero_blocks: Option<usize>,
 }
 
 #[derive(Default)]
@@ -343,26 +352,102 @@ fn main() -> AppResult<()> {
     validate_args(&args)?;
 
     let coin = args.coin.trim().to_ascii_uppercase();
-    let event_start = args.start_height + 1;
-    let event_end = args.end_height;
+    let windows: Vec<(u64, u64)> =
+        (args.start_height..args.end_height).step_by(10_000).map(|start| (start, start + 10_000)).collect();
+    let jobs = args.jobs.max(1);
 
-    let start_snapshot = extract_coin_snapshot(load_checkpoint(&args.snapshot_index, args.start_height)?, &coin)?;
-    let expected_end_snapshot = extract_coin_snapshot(load_checkpoint(&args.snapshot_index, args.end_height)?, &coin)?;
+    let summaries = if windows.len() == 1 || jobs == 1 {
+        let mut out = Vec::with_capacity(windows.len());
+        for (start_height, end_height) in windows {
+            out.push(validate_window(&args.snapshot_index, &args.parquet_root, &coin, start_height, end_height)?);
+        }
+        out
+    } else {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(jobs).build()?;
+        let snapshot_index = args.snapshot_index.clone();
+        let parquet_root = args.parquet_root.clone();
+        pool.install(|| {
+            windows
+                .par_iter()
+                .map(|(start_height, end_height)| {
+                    validate_window(&snapshot_index, &parquet_root, &coin, *start_height, *end_height)
+                })
+                .collect::<AppResult<Vec<_>>>()
+        })?
+    };
 
-    let status_dir = args.parquet_root.join(&coin).join("status");
-    let diff_dir = args.parquet_root.join(&coin).join("diff");
-    let blocks_dir = args.parquet_root.join("blocks");
+    for summary in summaries {
+        if let (Some(status_zero_blocks), Some(diff_zero_blocks)) =
+            (summary.status_zero_blocks, summary.diff_zero_blocks)
+        {
+            println!(
+                "block index stats coin={} start={} end={} status_zero_blocks={} diff_zero_blocks={}",
+                summary.coin, summary.start_height, summary.end_height, status_zero_blocks, diff_zero_blocks
+            );
+        }
+        println!(
+            "block index count check OK coin={} start={} end={}",
+            summary.coin, summary.start_height, summary.end_height
+        );
+        println!(
+            "offline replay check OK coin={} start={} end={} block_rows={} min_block={} max_block={} expected_rows={} final_bids={} final_asks={}",
+            summary.coin,
+            summary.start_height,
+            summary.end_height,
+            summary.block_rows,
+            summary.min_block,
+            summary.max_block,
+            summary.expected_rows,
+            summary.final_bids,
+            summary.final_asks
+        );
+    }
+    Ok(())
+}
 
-    let status_files = select_archive_files(&status_dir, Some((&coin, "status")), event_start, event_end)?;
-    let diff_files = select_archive_files(&diff_dir, Some((&coin, "diff")), event_start, event_end)?;
-    let block_files = select_archive_files(&blocks_dir, None, event_start, event_end)?;
+fn validate_args(args: &Args) -> AppResult<()> {
+    if args.start_height == 0 || args.end_height == 0 {
+        return err("checkpoint heights must be positive");
+    }
+    if args.start_height >= args.end_height {
+        return err("start_height must be less than end_height");
+    }
+    if args.start_height % 10_000 != 0 || args.end_height % 10_000 != 0 {
+        return err("checkpoint heights must be multiples of 10000");
+    }
+    if args.jobs == 0 {
+        return err("jobs must be at least 1");
+    }
+    Ok(())
+}
+
+fn validate_window(
+    snapshot_index: &Path,
+    parquet_root: &Path,
+    coin: &str,
+    start_height: u64,
+    end_height: u64,
+) -> AppResult<ValidationSummary> {
+    let event_start = start_height + 1;
+    let event_end = end_height;
+
+    let start_snapshot = extract_coin_snapshot(load_checkpoint(snapshot_index, start_height)?, coin)?;
+    let expected_end_snapshot = extract_coin_snapshot(load_checkpoint(snapshot_index, end_height)?, coin)?;
+
+    let status_dir = parquet_root.join(coin).join("status");
+    let diff_dir = parquet_root.join(coin).join("diff");
+    let blocks_dir = parquet_root;
+
+    let status_files = select_archive_files(&status_dir, Some((coin, "status")), event_start, event_end)?;
+    let diff_files = select_archive_files(&diff_dir, Some((coin, "diff")), event_start, event_end)?;
+    let block_files = select_archive_files(blocks_dir, None, event_start, event_end)?;
 
     let status_rows = read_status_rows(&status_files, event_start, event_end)?;
     let diff_rows = read_diff_rows(&diff_files, event_start, event_end)?;
-    let block_stats = read_block_stats(&block_files, event_start, event_end, &coin)?;
-    verify_block_counts(&coin, &status_rows, &diff_rows, &block_stats)?;
+    let block_stats = read_block_stats(&block_files, event_start, event_end, coin)?;
+    verify_block_counts(coin, &status_rows, &diff_rows, &block_stats)?;
 
-    let mut traces = seed_initial_traces(&start_snapshot, args.start_height);
+    let mut traces = seed_initial_traces(&start_snapshot, start_height);
     let mut book = build_initial_book(start_snapshot);
     let mut status_stream = RowStream::new(status_rows);
     let mut diff_stream = RowStream::new(diff_rows);
@@ -431,33 +516,27 @@ fn main() -> AppResult<()> {
 
     let actual_end_snapshot = book.snapshot();
     compare_snapshots(actual_end_snapshot.clone(), expected_end_snapshot, &traces, &block_stats)?;
-
-    println!(
-        "offline replay check OK coin={} start={} end={} block_rows={} min_block={} max_block={} expected_rows={} final_bids={} final_asks={}",
-        coin,
-        args.start_height,
-        args.end_height,
-        block_stats.rows,
-        block_stats.min_block,
-        block_stats.max_block,
-        block_stats.expected_rows,
-        actual_end_snapshot[0].len(),
-        actual_end_snapshot[1].len()
-    );
-    Ok(())
-}
-
-fn validate_args(args: &Args) -> AppResult<()> {
-    if args.start_height == 0 || args.end_height == 0 {
-        return err("checkpoint heights must be positive");
-    }
-    if args.start_height >= args.end_height {
-        return err("start_height must be less than end_height");
-    }
-    if args.start_height % 10_000 != 0 || args.end_height % 10_000 != 0 {
-        return err("checkpoint heights must be multiples of 10000");
-    }
-    Ok(())
+    Ok(ValidationSummary {
+        coin: coin.to_string(),
+        start_height,
+        end_height,
+        block_rows: block_stats.rows,
+        min_block: block_stats.min_block,
+        max_block: block_stats.max_block,
+        expected_rows: block_stats.expected_rows,
+        final_bids: actual_end_snapshot[0].len(),
+        final_asks: actual_end_snapshot[1].len(),
+        status_zero_blocks: if block_stats.status_counts.is_empty() {
+            None
+        } else {
+            Some(block_stats.status_counts.values().filter(|count| **count == 0).count())
+        },
+        diff_zero_blocks: if block_stats.diff_counts.is_empty() {
+            None
+        } else {
+            Some(block_stats.diff_counts.values().filter(|count| **count == 0).count())
+        },
+    })
 }
 
 fn extract_coin_snapshot(record: CheckpointRecord, coin: &str) -> AppResult<[Vec<Order>; 2]> {
@@ -555,23 +634,26 @@ fn convert_trigger(order: &mut Order, ts: u64) {
 }
 
 fn load_checkpoint(snapshot_index: &Path, height: u64) -> AppResult<CheckpointRecord> {
-    let index: DatasetIndex = serde_json::from_slice(&fs::read(snapshot_index)?)?;
-    let mut found: Option<(PathBuf, SegmentIndexEntry)> = None;
-    for segment in index.segments {
-        if let Some(entry) = segment.entries.into_iter().find(|entry| entry.block_height == height) {
-            let raw_segment_path = PathBuf::from(segment.segment_path);
-            let segment_path = if raw_segment_path.is_absolute() {
-                raw_segment_path
-            } else {
-                snapshot_index.parent().unwrap_or_else(|| Path::new(".")).join(raw_segment_path)
-            };
-            found = Some((segment_path, entry));
-            break;
-        }
-    }
+    let conn = Connection::open_with_flags(snapshot_index, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt =
+        conn.prepare("select segment_path, block_height, offset, len from checkpoint_entries where block_height = ?1")?;
+    let found: Option<(String, u64, u64, u64)> = stmt
+        .query_row([height], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?, row.get::<_, u64>(3)?))
+        })
+        .optional()?;
+    let found: Option<(PathBuf, SegmentIndexEntry)> = found.map(|(segment_path, block_height, offset, len)| {
+        (PathBuf::from(segment_path), SegmentIndexEntry { block_height, offset, len })
+    });
     let Some((segment_path, entry)) = found else {
         return err(format!("checkpoint {} missing in {}", height, snapshot_index.display()));
     };
+    if entry.block_height != height {
+        return err(format!(
+            "sqlite manifest mismatch: requested checkpoint {} but manifest returned {}",
+            height, entry.block_height
+        ));
+    }
     let mut file = File::open(&segment_path)?;
     let mut magic = [0_u8; 8];
     file.read_exact(&mut magic)?;
