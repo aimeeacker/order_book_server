@@ -29,7 +29,7 @@ use pyo3_asyncio as _;
 
 static PY_LOG_INIT: Once = Once::new();
 static PY_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
-const APPEND_CHECKPOINT_WORKER_BIN: &str = "append_checkpoint_worker";
+const APPEND_CHECKPOINT_WORKER_BIN: &str = "snapshot_checkpoint";
 const APPEND_CHECKPOINT_WORKER_BIN_ENV: &str = "HL_APPEND_CHECKPOINT_WORKER_BIN";
 
 fn parse_archive_mode(mode: Option<&str>) -> PyResult<Option<ArchiveMode>> {
@@ -425,6 +425,18 @@ fn resolve_append_checkpoint_worker_binary() -> Result<PathBuf, Box<dyn std::err
     if let Ok(path) = std::env::var(APPEND_CHECKPOINT_WORKER_BIN_ENV) {
         return Ok(PathBuf::from(path));
     }
+    if let Ok(cwd) = std::env::current_dir() {
+        for candidate in [
+            cwd.join(APPEND_CHECKPOINT_WORKER_BIN),
+            cwd.join("bin").join(APPEND_CHECKPOINT_WORKER_BIN),
+            cwd.join("target").join("release").join(APPEND_CHECKPOINT_WORKER_BIN),
+            cwd.join("target").join("debug").join(APPEND_CHECKPOINT_WORKER_BIN),
+        ] {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
     let workspace_root = workspace_root();
     for profile in ["release", "debug"] {
         let candidate = workspace_root.join("target").join(profile).join(APPEND_CHECKPOINT_WORKER_BIN);
@@ -433,7 +445,7 @@ fn resolve_append_checkpoint_worker_binary() -> Result<PathBuf, Box<dyn std::err
         }
     }
     Err(format!(
-        "failed to locate native append checkpoint worker binary {}; set {} if needed",
+        "failed to locate native append checkpoint worker binary {}; searched {} env, current working directory, and workspace target dirs",
         APPEND_CHECKPOINT_WORKER_BIN, APPEND_CHECKPOINT_WORKER_BIN_ENV
     )
     .into())

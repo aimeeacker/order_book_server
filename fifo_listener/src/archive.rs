@@ -33,8 +33,12 @@ const TEMP_FILE_SUFFIX: &str = ".tmp";
 const LITE_PRICE_SCALE: u32 = 8;
 const LITE_SIZE_SCALE: u32 = 8;
 const CHECKPOINT_BLOCKS: u64 = 10_000;
-const STATUS_ROW_GROUP_BLOCKS: u64 = 1_000;
+const STATUS_ROW_GROUP_BLOCKS_DEFAULT: u64 = 10_000;
+const STATUS_ROW_GROUP_BLOCKS_BTC: u64 = 1_000;
+const STATUS_ROW_GROUP_BLOCKS_ETH: u64 = 2_000;
+const STATUS_ROW_GROUP_BLOCKS_SOL_HYPE: u64 = 5_000;
 const DIFF_ROW_GROUP_BLOCKS: u64 = 50_000;
+const BLOCKS_FILL_ROTATION_BLOCKS: u64 = 1_000_000;
 const MIN_HANDOFF_BLOCK_SPAN: u64 = 5_000;
 const MIN_ARCHIVE_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_DISK_USED_BPS: u64 = 9_500;
@@ -563,7 +567,7 @@ impl StreamKind {
 
     fn row_group_block_limit(self) -> Option<u64> {
         match self {
-            Self::Status => Some(STATUS_ROW_GROUP_BLOCKS),
+            Self::Status => Some(STATUS_ROW_GROUP_BLOCKS_DEFAULT),
             Self::Diff => Some(DIFF_ROW_GROUP_BLOCKS),
             Self::Blocks | Self::Fill => None,
         }
@@ -571,6 +575,13 @@ impl StreamKind {
 
     fn uses_delayed_flush(self) -> bool {
         matches!(self, Self::Diff)
+    }
+
+    fn rotation_block_limit(self) -> u64 {
+        match self {
+            Self::Blocks | Self::Fill => BLOCKS_FILL_ROTATION_BLOCKS,
+            Self::Status | Self::Diff => ROTATION_BLOCKS.load(Ordering::SeqCst),
+        }
     }
 }
 
@@ -581,9 +592,34 @@ struct ParquetFile {
     name_end_block: u64,
     last_block: u64,
     tmp_path: PathBuf,
-    final_dir: PathBuf,
+    local_final_path: PathBuf,
+    relative_dir: PathBuf,
     final_filename_prefix: String,
     final_filename_suffix: String,
+}
+
+fn status_row_group_blocks_for_coin(coin: &str) -> u64 {
+    match coin {
+        "BTC" => STATUS_ROW_GROUP_BLOCKS_BTC,
+        "ETH" => STATUS_ROW_GROUP_BLOCKS_ETH,
+        "SOL" => STATUS_ROW_GROUP_BLOCKS_SOL_HYPE,
+        _ => STATUS_ROW_GROUP_BLOCKS_DEFAULT,
+    }
+}
+
+fn archive_coin_dir(mode: ArchiveMode, coin: &str) -> PathBuf {
+    match mode {
+        ArchiveMode::Lite => PathBuf::from(coin),
+        ArchiveMode::Full => PathBuf::from(format!("{coin}_full")),
+    }
+}
+
+fn archive_relative_dir(stream: StreamKind, mode: ArchiveMode, coin: &str) -> PathBuf {
+    match stream {
+        StreamKind::Blocks => PathBuf::new(),
+        StreamKind::Fill => archive_coin_dir(mode, coin),
+        StreamKind::Diff | StreamKind::Status => archive_coin_dir(mode, coin).join(stream.name()),
+    }
 }
 
 struct ArchiveDiskStatus {
@@ -668,7 +704,7 @@ impl<R> ParquetStreamWriter<R> {
 
     fn ensure_open(&mut self, coin: &str, mode: ArchiveMode, block: u64) -> parquet::errors::Result<()> {
         if self.file.is_none() {
-            let (window_start, end) = rotation_bounds(block);
+            let (window_start, end) = rotation_bounds_for(self.stream, block);
             let name_start = self.pending_start_block.unwrap_or(block);
             self.open_file(coin, mode, name_start, block, window_start, end)?;
         }
@@ -685,25 +721,17 @@ impl<R> ParquetStreamWriter<R> {
         end: u64,
     ) -> parquet::errors::Result<()> {
         let base_dir = current_archive_base_dir();
-        let (dir, filename_prefix, filename_suffix) = match self.stream {
-            StreamKind::Blocks => (base_dir.join(self.stream.name()), "blocks".to_string(), ".parquet".to_string()),
-            _ => {
-                let coin_dir = match mode {
-                    ArchiveMode::Lite => coin.to_string(),
-                    ArchiveMode::Full => format!("{coin}_full"),
-                };
-                (
-                    base_dir.join(coin_dir).join(self.stream.name()),
-                    format!("{}_{}", coin, self.stream.name()),
-                    ".parquet".to_string(),
-                )
-            }
+        let relative_dir = archive_relative_dir(self.stream, mode, coin);
+        let filename_prefix = match self.stream {
+            StreamKind::Blocks => "blocks".to_string(),
+            StreamKind::Fill | StreamKind::Diff | StreamKind::Status => format!("{}_{}", coin, self.stream.name()),
         };
-        fs::create_dir_all(&dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-        let final_path = dir.join(format!("{filename_prefix}_{name_start}_{end}{filename_suffix}"));
-        let tmp_path = final_path.with_file_name(format!(
+        let filename_suffix = ".parquet".to_string();
+        fs::create_dir_all(&base_dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+        let local_final_path = base_dir.join(format!("{filename_prefix}_{name_start}_{end}{filename_suffix}"));
+        let tmp_path = local_final_path.with_file_name(format!(
             "{}{}",
-            final_path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet"),
+            local_final_path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet"),
             TEMP_FILE_SUFFIX
         ));
         if tmp_path.exists() {
@@ -718,7 +746,8 @@ impl<R> ParquetStreamWriter<R> {
             name_end_block: actual_start,
             last_block: actual_start,
             tmp_path,
-            final_dir: dir,
+            local_final_path,
+            relative_dir,
             final_filename_prefix: filename_prefix,
             final_filename_suffix: filename_suffix,
         });
@@ -729,14 +758,11 @@ impl<R> ParquetStreamWriter<R> {
     fn close(&mut self) -> parquet::errors::Result<()> {
         if let Some(file) = self.file.take() {
             let tmp_path = file.tmp_path.clone();
-            let final_path = file.final_dir.join(format!(
+            let final_path = file.local_final_path.clone();
+            let relative_path = file.relative_dir.join(format!(
                 "{}_{}_{}{}",
                 file.final_filename_prefix, file.name_start_block, file.name_end_block, file.final_filename_suffix
             ));
-            let relative_path = final_path
-                .strip_prefix(current_archive_base_dir())
-                .map(PathBuf::from)
-                .map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
             file.writer.close()?;
             fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
             let span_blocks = file.name_end_block.saturating_sub(file.name_start_block) + 1;
@@ -854,10 +880,12 @@ impl<R> ParquetStreamWriter<R> {
         F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
     {
         let current_start = self.file.as_ref().map(|current| current.window_start_block);
-        let next_start = rotation_bounds(block).0;
+        let next_start = rotation_bounds_for(self.stream, block).0;
         if self.file.is_none() {
             match self.pending_start_block {
-                Some(start) if rotation_bounds(start).0 != next_start => self.pending_start_block = Some(block),
+                Some(start) if rotation_bounds_for(self.stream, start).0 != next_start => {
+                    self.pending_start_block = Some(block)
+                }
                 Some(_) => {}
                 None => self.pending_start_block = Some(block),
             }
@@ -1000,7 +1028,7 @@ impl StatusParquetWriter {
 
     fn ensure_open(&mut self, coin: &str, block: u64) -> parquet::errors::Result<()> {
         if self.file.is_none() {
-            let (window_start, end) = rotation_bounds(block);
+            let (window_start, end) = rotation_bounds_for(StreamKind::Status, block);
             let name_start = self.pending_start_block.unwrap_or(block);
             self.open_file(coin, name_start, block, window_start, end)?;
         }
@@ -1016,18 +1044,14 @@ impl StatusParquetWriter {
         end: u64,
     ) -> parquet::errors::Result<()> {
         let base_dir = current_archive_base_dir();
-        let coin_dir = match self.mode {
-            ArchiveMode::Lite => coin.to_string(),
-            ArchiveMode::Full => format!("{coin}_full"),
-        };
-        let dir = base_dir.join(coin_dir).join(StreamKind::Status.name());
+        let relative_dir = archive_relative_dir(StreamKind::Status, self.mode, coin);
         let filename_prefix = format!("{}_{}", coin, StreamKind::Status.name());
         let filename_suffix = ".parquet".to_string();
-        fs::create_dir_all(&dir).map_err(io_to_parquet_error)?;
-        let final_path = dir.join(format!("{filename_prefix}_{name_start}_{end}{filename_suffix}"));
-        let tmp_path = final_path.with_file_name(format!(
+        fs::create_dir_all(&base_dir).map_err(io_to_parquet_error)?;
+        let local_final_path = base_dir.join(format!("{filename_prefix}_{name_start}_{end}{filename_suffix}"));
+        let tmp_path = local_final_path.with_file_name(format!(
             "{}{}",
-            final_path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet"),
+            local_final_path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet"),
             TEMP_FILE_SUFFIX
         ));
         if tmp_path.exists() {
@@ -1042,7 +1066,8 @@ impl StatusParquetWriter {
             name_end_block: actual_start,
             last_block: actual_start,
             tmp_path,
-            final_dir: dir,
+            local_final_path,
+            relative_dir,
             final_filename_prefix: filename_prefix,
             final_filename_suffix: filename_suffix,
         });
@@ -1070,10 +1095,12 @@ impl StatusParquetWriter {
 
     fn advance_block(&mut self, block: u64) -> parquet::errors::Result<()> {
         let current_start = self.file.as_ref().map(|current| current.window_start_block);
-        let next_start = rotation_bounds(block).0;
+        let next_start = rotation_bounds_for(StreamKind::Status, block).0;
         if self.file.is_none() {
             match self.pending_start_block {
-                Some(start) if rotation_bounds(start).0 != next_start => self.pending_start_block = Some(block),
+                Some(start) if rotation_bounds_for(StreamKind::Status, start).0 != next_start => {
+                    self.pending_start_block = Some(block)
+                }
                 Some(_) => {}
                 None => self.pending_start_block = Some(block),
             }
@@ -1087,13 +1114,13 @@ impl StatusParquetWriter {
             file.name_end_block = block;
         }
         if self.active_end_block.is_none() {
-            let (start, end) = aligned_row_group_bounds(block, STATUS_ROW_GROUP_BLOCKS);
+            let (start, end) = aligned_row_group_bounds(block, status_row_group_blocks_for_coin(&self.coin));
             self.active_start_block = Some(start);
             self.active_end_block = Some(end);
         }
         while self.active_end_block.is_some_and(|end| block > end) {
             self.flush_active()?;
-            let (start, end) = aligned_row_group_bounds(block, STATUS_ROW_GROUP_BLOCKS);
+            let (start, end) = aligned_row_group_bounds(block, status_row_group_blocks_for_coin(&self.coin));
             self.active_start_block = Some(start);
             self.active_end_block = Some(end);
         }
@@ -1110,7 +1137,7 @@ impl StatusParquetWriter {
             file.name_end_block = block;
         }
         if self.active_end_block.is_none() {
-            let (start, end) = aligned_row_group_bounds(block, STATUS_ROW_GROUP_BLOCKS);
+            let (start, end) = aligned_row_group_bounds(block, status_row_group_blocks_for_coin(&self.coin));
             self.active_start_block = Some(start);
             self.active_end_block = Some(end);
         }
@@ -1130,14 +1157,11 @@ impl StatusParquetWriter {
         self.flush_active()?;
         if let Some(file) = self.file.take() {
             let tmp_path = file.tmp_path.clone();
-            let final_path = file.final_dir.join(format!(
+            let final_path = file.local_final_path.clone();
+            let relative_path = file.relative_dir.join(format!(
                 "{}_{}_{}{}",
                 file.final_filename_prefix, file.name_start_block, file.name_end_block, file.final_filename_suffix
             ));
-            let relative_path = final_path
-                .strip_prefix(current_archive_base_dir())
-                .map(PathBuf::from)
-                .map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
             file.writer.close()?;
             fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
             let span_blocks = file.name_end_block.saturating_sub(file.name_start_block) + 1;
@@ -1574,8 +1598,8 @@ impl ArchiveWriters {
     }
 }
 
-fn rotation_bounds(block: u64) -> (u64, u64) {
-    let rotation = ROTATION_BLOCKS.load(Ordering::SeqCst);
+fn rotation_bounds_for(stream: StreamKind, block: u64) -> (u64, u64) {
+    let rotation = stream.rotation_block_limit();
     let start = ((block.saturating_sub(1)) / rotation) * rotation + 1;
     let end = start + rotation - 1;
     (start, end)
@@ -1759,16 +1783,17 @@ fn fetch_snapshot_to_path(output_path: &Path) -> Result<(), Box<dyn std::error::
 }
 
 fn write_mid_window_checkpoint(
-    dataset_dir: PathBuf,
+    output_dir: PathBuf,
     trigger_height: u64,
     block_time: String,
     symbols: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let snapshot_path = snapshot_bootstrap_path(&dataset_dir, trigger_height);
+    let snapshot_dir = current_archive_base_dir();
+    let snapshot_path = snapshot_bootstrap_path(&snapshot_dir, trigger_height);
     fetch_snapshot_to_path(&snapshot_path)?;
     let options = ComputeOptions { include_users: true, include_trigger_orders: false, assets: Some(symbols.clone()) };
     let result =
-        append_l4_checkpoint_from_snapshot_json(&snapshot_path, Some(dataset_dir.clone()), &options, block_time)?;
+        append_l4_checkpoint_from_snapshot_json(&snapshot_path, Some(output_dir.clone()), &options, block_time)?;
     info!(
         "Archive bootstrap checkpoint written from snapshot json trigger_height={} checkpoint_height={} segment={}",
         trigger_height,
@@ -1782,14 +1807,13 @@ fn write_mid_window_checkpoint(
 }
 
 fn spawn_mid_window_checkpoint_fetch(trigger_height: u64, block_time: String, symbols: Vec<String>) {
-    let dataset_dir = current_archive_base_dir();
+    let output_dir = current_archive_handoff_config().nas_output_dir;
     thread::spawn(move || {
-        if let Err(err) = write_mid_window_checkpoint(dataset_dir.clone(), trigger_height, block_time, symbols.clone())
-        {
+        if let Err(err) = write_mid_window_checkpoint(output_dir.clone(), trigger_height, block_time, symbols.clone()) {
             warn!(
-                "Archive bootstrap checkpoint fetch failed trigger_height={} dataset_dir={} symbols={}: {err}",
+                "Archive bootstrap checkpoint fetch failed trigger_height={} output_dir={} symbols={}: {err}",
                 trigger_height,
-                dataset_dir.display(),
+                output_dir.display(),
                 symbols.join(",")
             );
         }
