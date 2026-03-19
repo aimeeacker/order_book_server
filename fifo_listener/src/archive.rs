@@ -41,6 +41,8 @@ const STATUS_ROW_GROUP_BLOCKS_SOL_HYPE: u64 = 5_000;
 const DIFF_ROW_GROUP_BLOCKS: u64 = 50_000;
 const DIFF_DELAYED_FLUSH_LOOKAHEAD_BLOCKS: u64 = 2_000;
 const BLOCKS_FILL_ROTATION_BLOCKS: u64 = 1_000_000;
+const BLOCKS_FILL_ROW_GROUP_BLOCKS: u64 = 250_000;
+const BLOCKS_FILL_DELAYED_FLUSH_LOOKAHEAD_BLOCKS: u64 = 2_000;
 const MIN_HANDOFF_BLOCK_SPAN: u64 = 5_000;
 const MIN_ARCHIVE_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_DISK_USED_BPS: u64 = 9_500;
@@ -663,12 +665,12 @@ impl StreamKind {
         match self {
             Self::Status => Some(STATUS_ROW_GROUP_BLOCKS_DEFAULT),
             Self::Diff => Some(DIFF_ROW_GROUP_BLOCKS),
-            Self::Blocks | Self::Fill => None,
+            Self::Blocks | Self::Fill => Some(BLOCKS_FILL_ROW_GROUP_BLOCKS),
         }
     }
 
     fn uses_delayed_flush(self) -> bool {
-        matches!(self, Self::Diff)
+        matches!(self, Self::Diff | Self::Blocks | Self::Fill)
     }
 
     fn rotation_block_limit(self) -> u64 {
@@ -681,7 +683,8 @@ impl StreamKind {
     fn delayed_flush_lookahead_blocks(self) -> Option<u64> {
         match self {
             Self::Diff => Some(DIFF_DELAYED_FLUSH_LOOKAHEAD_BLOCKS),
-            Self::Blocks | Self::Status | Self::Fill => None,
+            Self::Blocks | Self::Fill => Some(BLOCKS_FILL_DELAYED_FLUSH_LOOKAHEAD_BLOCKS),
+            Self::Status => None,
         }
     }
 }
