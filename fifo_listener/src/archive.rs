@@ -38,7 +38,7 @@ const DIFF_ROW_GROUP_BLOCKS: u64 = 50_000;
 const MIN_HANDOFF_BLOCK_SPAN: u64 = 5_000;
 const MIN_ARCHIVE_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_DISK_USED_BPS: u64 = 9_500;
-const STATUS_WORKER_QUEUE_BLOCKS: usize = 64;
+const STATUS_WORKER_QUEUE_BLOCKS: usize = 16;
 static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
 static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
@@ -356,25 +356,24 @@ struct FillLite {
 #[derive(Debug, Default)]
 struct StatusLiteColumns {
     block_number: Vec<i64>,
-    block_time: Vec<String>,
-    coin: Vec<String>,
-    time: Vec<String>,
-    user: Vec<String>,
-    status: Vec<String>,
+    block_time: Vec<ByteArray>,
+    time: Vec<ByteArray>,
+    user: Vec<ByteArray>,
+    status: Vec<ByteArray>,
     oid: Vec<i64>,
-    side: Vec<String>,
+    side: Vec<ByteArray>,
     limit_px: Vec<i64>,
     sz: Vec<i64>,
     orig_sz: Vec<i64>,
     timestamp: Vec<i64>,
     is_trigger: Vec<bool>,
-    tif: Vec<String>,
-    trigger_condition: Vec<String>,
+    tif: Vec<ByteArray>,
+    trigger_condition: Vec<ByteArray>,
     trigger_px: Vec<i64>,
     is_position_tpsl: Vec<bool>,
     reduce_only: Vec<bool>,
-    order_type: Vec<String>,
-    cloid: Vec<String>,
+    order_type: Vec<ByteArray>,
+    cloid: Vec<ByteArray>,
 }
 
 impl StatusLiteColumns {
@@ -385,7 +384,6 @@ impl StatusLiteColumns {
     fn append(&mut self, other: StatusLiteColumns) {
         self.block_number.extend(other.block_number);
         self.block_time.extend(other.block_time);
-        self.coin.extend(other.coin);
         self.time.extend(other.time);
         self.user.extend(other.user);
         self.status.extend(other.status);
@@ -409,28 +407,27 @@ impl StatusLiteColumns {
 #[derive(Debug, Default)]
 struct StatusFullColumns {
     block_number: Vec<i64>,
-    block_time: Vec<String>,
-    coin: Vec<String>,
-    status: Vec<String>,
+    block_time: Vec<ByteArray>,
+    status: Vec<ByteArray>,
     oid: Vec<i64>,
-    side: Vec<String>,
+    side: Vec<ByteArray>,
     limit_px: Vec<i64>,
     is_trigger: Vec<bool>,
-    tif: Vec<String>,
-    user: Vec<String>,
-    hash: Vec<String>,
-    order_type: Vec<String>,
+    tif: Vec<ByteArray>,
+    user: Vec<ByteArray>,
+    hash: Vec<ByteArray>,
+    order_type: Vec<ByteArray>,
     sz: Vec<i64>,
     orig_sz: Vec<i64>,
-    time: Vec<String>,
-    builder: Vec<String>,
+    time: Vec<ByteArray>,
+    builder: Vec<ByteArray>,
     timestamp: Vec<i64>,
-    trigger_condition: Vec<String>,
+    trigger_condition: Vec<ByteArray>,
     trigger_px: Vec<i64>,
     is_position_tpsl: Vec<bool>,
     reduce_only: Vec<bool>,
-    cloid: Vec<String>,
-    raw_event: Vec<String>,
+    cloid: Vec<ByteArray>,
+    raw_event: Vec<ByteArray>,
 }
 
 impl StatusFullColumns {
@@ -441,7 +438,6 @@ impl StatusFullColumns {
     fn append(&mut self, other: StatusFullColumns) {
         self.block_number.extend(other.block_number);
         self.block_time.extend(other.block_time);
-        self.coin.extend(other.coin);
         self.status.extend(other.status);
         self.oid.extend(other.oid);
         self.side.extend(other.side);
@@ -968,6 +964,7 @@ impl<R> ParquetStreamWriter<R> {
 }
 
 struct StatusParquetWriter {
+    coin: String,
     mode: ArchiveMode,
     schema: std::sync::Arc<Type>,
     props: std::sync::Arc<WriterProperties>,
@@ -981,12 +978,14 @@ struct StatusParquetWriter {
 
 impl StatusParquetWriter {
     fn new(
+        coin: String,
         mode: ArchiveMode,
         schema: std::sync::Arc<Type>,
         props: std::sync::Arc<WriterProperties>,
         handoff_tx: Sender<HandoffMessage>,
     ) -> Self {
         Self {
+            coin,
             mode,
             schema,
             props,
@@ -1060,8 +1059,8 @@ impl StatusParquetWriter {
         let batch = std::mem::replace(&mut self.active, StatusBlockBatch::new(self.mode));
         let file = self.file.as_mut().ok_or_else(|| io_to_parquet_error(io_other("status writer missing file")))?;
         match batch {
-            StatusBlockBatch::Lite(columns) => write_status_lite_columns(&mut file.writer, columns)?,
-            StatusBlockBatch::Full(columns) => write_status_full_columns(&mut file.writer, columns)?,
+            StatusBlockBatch::Lite(columns) => write_status_lite_columns(&mut file.writer, &self.coin, columns)?,
+            StatusBlockBatch::Full(columns) => write_status_full_columns(&mut file.writer, &self.coin, columns)?,
         }
         trim_allocator();
         self.active_start_block = None;
@@ -1200,7 +1199,7 @@ impl StatusWorkerHandle {
         let (error_tx, error_rx) = channel();
         let worker_coin = coin.clone();
         let handle = thread::spawn(move || {
-            let mut writer = StatusParquetWriter::new(mode, schema, props, handoff_tx);
+            let mut writer = StatusParquetWriter::new(worker_coin.clone(), mode, schema, props, handoff_tx);
             while let Ok(message) = rx.recv() {
                 let result = match message {
                     StatusWorkerMessage::Block { height, rows } => writer.advance_block(height).and_then(|_| {
@@ -2176,12 +2175,17 @@ fn flatten_to_string(v: &serde_json::Value) -> String {
     }
 }
 
-fn strings_into_byte_arrays(values: Vec<String>) -> Vec<ByteArray> {
-    values.into_iter().map(|value| ByteArray::from(value.into_bytes())).collect()
+fn byte_array_from_string(value: String) -> ByteArray {
+    ByteArray::from(value.into_bytes())
+}
+
+fn byte_array_from_str(value: &str) -> ByteArray {
+    ByteArray::from(value.as_bytes().to_vec())
 }
 
 fn write_status_lite_columns(
     file: &mut SerializedFileWriter<std::fs::File>,
+    coin: &str,
     rows: StatusLiteColumns,
 ) -> parquet::errors::Result<()> {
     if rows.is_empty() {
@@ -2190,7 +2194,6 @@ fn write_status_lite_columns(
     let StatusLiteColumns {
         block_number,
         block_time,
-        coin,
         time,
         user,
         status,
@@ -2210,16 +2213,7 @@ fn write_status_lite_columns(
         cloid,
     } = rows;
     let mut row_group = file.next_row_group()?;
-    let block_times = strings_into_byte_arrays(block_time);
-    let coins = strings_into_byte_arrays(coin);
-    let times = strings_into_byte_arrays(time);
-    let users = strings_into_byte_arrays(user);
-    let statuses = strings_into_byte_arrays(status);
-    let sides = strings_into_byte_arrays(side);
-    let tifs = strings_into_byte_arrays(tif);
-    let trigger_conditions = strings_into_byte_arrays(trigger_condition);
-    let order_types = strings_into_byte_arrays(order_type);
-    let cloids = strings_into_byte_arrays(cloid);
+    let coins = vec![byte_array_from_str(coin); block_number.len()];
 
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
@@ -2229,7 +2223,7 @@ fn write_status_lite_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_times, None, None)?;
+            typed.write_batch(&block_time, None, None)?;
         }
         col.close()?;
     }
@@ -2241,19 +2235,19 @@ fn write_status_lite_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&times, None, None)?;
+            typed.write_batch(&time, None, None)?;
         }
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&users, None, None)?;
+            typed.write_batch(&user, None, None)?;
         }
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&statuses, None, None)?;
+            typed.write_batch(&status, None, None)?;
         }
         col.close()?;
     }
@@ -2265,7 +2259,7 @@ fn write_status_lite_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&sides, None, None)?;
+            typed.write_batch(&side, None, None)?;
         }
         col.close()?;
     }
@@ -2301,13 +2295,13 @@ fn write_status_lite_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&tifs, None, None)?;
+            typed.write_batch(&tif, None, None)?;
         }
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&trigger_conditions, None, None)?;
+            typed.write_batch(&trigger_condition, None, None)?;
         }
         col.close()?;
     }
@@ -2331,13 +2325,13 @@ fn write_status_lite_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&order_types, None, None)?;
+            typed.write_batch(&order_type, None, None)?;
         }
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&cloids, None, None)?;
+            typed.write_batch(&cloid, None, None)?;
         }
         col.close()?;
     }
@@ -2349,6 +2343,7 @@ fn write_status_lite_columns(
 
 fn write_status_full_columns(
     file: &mut SerializedFileWriter<std::fs::File>,
+    coin: &str,
     rows: StatusFullColumns,
 ) -> parquet::errors::Result<()> {
     if rows.is_empty() {
@@ -2357,7 +2352,6 @@ fn write_status_full_columns(
     let StatusFullColumns {
         block_number,
         block_time,
-        coin,
         status,
         oid,
         side,
@@ -2380,19 +2374,7 @@ fn write_status_full_columns(
         raw_event,
     } = rows;
     let mut row_group = file.next_row_group()?;
-    let block_times = strings_into_byte_arrays(block_time);
-    let coins = strings_into_byte_arrays(coin);
-    let statuses = strings_into_byte_arrays(status);
-    let sides = strings_into_byte_arrays(side);
-    let tifs = strings_into_byte_arrays(tif);
-    let users = strings_into_byte_arrays(user);
-    let hashes = strings_into_byte_arrays(hash);
-    let order_types = strings_into_byte_arrays(order_type);
-    let times = strings_into_byte_arrays(time);
-    let builders = strings_into_byte_arrays(builder);
-    let trigger_conditions = strings_into_byte_arrays(trigger_condition);
-    let cloids = strings_into_byte_arrays(cloid);
-    let raw_events = strings_into_byte_arrays(raw_event);
+    let coins = vec![byte_array_from_str(coin); block_number.len()];
 
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
@@ -2402,7 +2384,7 @@ fn write_status_full_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_times, None, None)?;
+            typed.write_batch(&block_time, None, None)?;
         }
         col.close()?;
     }
@@ -2414,7 +2396,7 @@ fn write_status_full_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&statuses, None, None)?;
+            typed.write_batch(&status, None, None)?;
         }
         col.close()?;
     }
@@ -2426,7 +2408,7 @@ fn write_status_full_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&sides, None, None)?;
+            typed.write_batch(&side, None, None)?;
         }
         col.close()?;
     }
@@ -2444,25 +2426,25 @@ fn write_status_full_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&tifs, None, None)?;
+            typed.write_batch(&tif, None, None)?;
         }
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&users, None, None)?;
+            typed.write_batch(&user, None, None)?;
         }
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&hashes, None, None)?;
+            typed.write_batch(&hash, None, None)?;
         }
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&order_types, None, None)?;
+            typed.write_batch(&order_type, None, None)?;
         }
         col.close()?;
     }
@@ -2480,13 +2462,13 @@ fn write_status_full_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&times, None, None)?;
+            typed.write_batch(&time, None, None)?;
         }
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&builders, None, None)?;
+            typed.write_batch(&builder, None, None)?;
         }
         col.close()?;
     }
@@ -2498,7 +2480,7 @@ fn write_status_full_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&trigger_conditions, None, None)?;
+            typed.write_batch(&trigger_condition, None, None)?;
         }
         col.close()?;
     }
@@ -2522,13 +2504,13 @@ fn write_status_full_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&cloids, None, None)?;
+            typed.write_batch(&cloid, None, None)?;
         }
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&raw_events, None, None)?;
+            typed.write_batch(&raw_event, None, None)?;
         }
         col.close()?;
     }
@@ -2680,6 +2662,7 @@ fn write_diff_rows(
     }
 
     row_group.close()?;
+    trim_allocator();
     Ok(())
 }
 
@@ -2887,6 +2870,7 @@ fn write_fill_rows(
     }
 
     row_group.close()?;
+    trim_allocator();
     Ok(())
 }
 
@@ -3016,6 +3000,7 @@ fn write_block_rows(
     }
 
     row_group.close()?;
+    trim_allocator();
     Ok(())
 }
 
@@ -3210,6 +3195,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         let mut status_rows: HashMap<String, StatusBlockBatch> = HashMap::new();
         let mut btc_status_n = 0;
         let mut eth_status_n = 0;
+        let block_time_bytes = byte_array_from_str(&block_time);
         for (idx, status) in order_batch.events.into_iter().enumerate() {
             let OrderLite {
                 coin,
@@ -3255,55 +3241,53 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             match entry {
                 StatusBlockBatch::Lite(columns) => {
                     columns.block_number.push(height as i64);
-                    columns.block_time.push(block_time.clone());
-                    columns.coin.push(coin);
-                    columns.time.push(status.time);
-                    columns.user.push(status.user.unwrap_or_default());
-                    columns.status.push(status.status);
+                    columns.block_time.push(block_time_bytes.clone());
+                    columns.time.push(byte_array_from_string(status.time));
+                    columns.user.push(byte_array_from_string(status.user.unwrap_or_default()));
+                    columns.status.push(byte_array_from_string(status.status));
                     columns.oid.push(oid as i64);
-                    columns.side.push(side);
+                    columns.side.push(byte_array_from_string(side));
                     columns.limit_px.push(s_px);
                     columns.sz.push(s_sz);
                     columns.orig_sz.push(s_orig);
                     columns.timestamp.push(timestamp as i64);
                     columns.is_trigger.push(is_trigger);
-                    columns.tif.push(tif.unwrap_or_default());
-                    columns.trigger_condition.push(trigger_condition);
+                    columns.tif.push(byte_array_from_string(tif.unwrap_or_default()));
+                    columns.trigger_condition.push(byte_array_from_string(trigger_condition));
                     columns.trigger_px.push(s_trig);
                     columns.is_position_tpsl.push(is_position_tpsl);
                     columns.reduce_only.push(reduce_only);
-                    columns.order_type.push(order_type);
-                    columns.cloid.push(flatten_to_string(&cloid));
+                    columns.order_type.push(byte_array_from_string(order_type));
+                    columns.cloid.push(byte_array_from_string(flatten_to_string(&cloid)));
                 }
                 StatusBlockBatch::Full(columns) => {
                     columns.block_number.push(height as i64);
-                    columns.block_time.push(block_time.clone());
-                    columns.coin.push(coin);
-                    columns.status.push(status.status);
+                    columns.block_time.push(block_time_bytes.clone());
+                    columns.status.push(byte_array_from_string(status.status));
                     columns.oid.push(oid as i64);
-                    columns.side.push(side);
+                    columns.side.push(byte_array_from_string(side));
                     columns.limit_px.push(s_px);
                     columns.is_trigger.push(is_trigger);
-                    columns.tif.push(tif.unwrap_or_default());
-                    columns.user.push(status.user.unwrap_or_default());
-                    columns.hash.push(flatten_to_string(&status.hash));
-                    columns.order_type.push(order_type);
+                    columns.tif.push(byte_array_from_string(tif.unwrap_or_default()));
+                    columns.user.push(byte_array_from_string(status.user.unwrap_or_default()));
+                    columns.hash.push(byte_array_from_string(flatten_to_string(&status.hash)));
+                    columns.order_type.push(byte_array_from_string(order_type));
                     columns.sz.push(s_sz);
                     columns.orig_sz.push(s_orig);
-                    columns.time.push(status.time);
-                    columns.builder.push(flatten_to_string(&status.builder));
+                    columns.time.push(byte_array_from_string(status.time));
+                    columns.builder.push(byte_array_from_string(flatten_to_string(&status.builder)));
                     columns.timestamp.push(timestamp as i64);
-                    columns.trigger_condition.push(trigger_condition);
+                    columns.trigger_condition.push(byte_array_from_string(trigger_condition));
                     columns.trigger_px.push(s_trig);
                     columns.is_position_tpsl.push(is_position_tpsl);
                     columns.reduce_only.push(reduce_only);
-                    columns.cloid.push(flatten_to_string(&cloid));
-                    columns.raw_event.push(
+                    columns.cloid.push(byte_array_from_string(flatten_to_string(&cloid)));
+                    columns.raw_event.push(byte_array_from_string(
                         order_batch_raw
                             .as_ref()
                             .and_then(|batch| batch.events.get(idx))
                             .map_or_else(String::new, serde_json::Value::to_string),
-                    );
+                    ));
                 }
             }
         }
@@ -3530,6 +3514,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             }
         }
         last_input_height = Some(height);
+
         if height % CHECKPOINT_BLOCKS == 0 {
             match ensure_archive_disk_headroom(&current_archive_base_dir()) {
                 Ok(()) => {}

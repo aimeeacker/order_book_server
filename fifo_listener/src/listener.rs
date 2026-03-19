@@ -24,6 +24,7 @@ const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book/runtime_fifo";
 const ORDER_PIPE_CAPACITY: i32 = 16 * 1024 * 1024;
 const DIFFS_FILLS_PIPE_CAPACITY: i32 = 8 * 1024 * 1024;
 const MAX_PENDING_HEIGHTS: usize = 200;
+const MAX_ROLLBACK_BUFFER_SIZE: usize = 500;
 const UDS_PATH: &str = "/home/aimee/hl_runtime/hl_book/fifo_listener.sock";
 const SOCKET_BUFFER: i32 = 16 * 1024 * 1024;
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -771,6 +772,18 @@ fn listen_fifo(
                                     rollback_generation,
                                     rollback_buffer.len()
                                 );
+                            }
+                            // Prevent unbounded rollback buffer growth
+                            if rollback_buffer.len() >= MAX_ROLLBACK_BUFFER_SIZE {
+                                let (count, first_height, last_height_in_buffer) =
+                                    rollback_buffer_span(&rollback_buffer);
+                                warn!(
+                                    "Rollback buffer overflow for {source:?}; discarding oldest entries count={} first_height={:?} last_height={:?}",
+                                    count, first_height, last_height_in_buffer
+                                );
+                                while rollback_buffer.len() >= MAX_ROLLBACK_BUFFER_SIZE {
+                                    rollback_buffer.pop_front();
+                                }
                             }
                             rollback_buffer.push_back(StreamLine { source, block_number: height, line });
                             if let Some(generation) = rollback.record_rollback(source) {
