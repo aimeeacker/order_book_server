@@ -33,6 +33,8 @@ const DEFAULT_ARCHIVE_SYMBOLS: &[&str] = &["BTC", "ETH"];
 const DEFAULT_OSS_PREFIX: &str = "hyper_data";
 const INFO_SNAPSHOT_URL: &str = "http://localhost:3001/info";
 const TEMP_FILE_SUFFIX: &str = ".tmp";
+const FINAL_PARQUET_FILE_SUFFIX: &str = ".parquet";
+const LOCAL_RECOVERY_FILE_SUFFIX: &str = ".parquet.0";
 const LITE_PRICE_SCALE: u32 = 8;
 const LITE_SIZE_SCALE: u32 = 8;
 const CHECKPOINT_BLOCKS: u64 = 10_000;
@@ -1183,10 +1185,13 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
             StreamKind::Blocks => "blocks".to_string(),
             StreamKind::Fill | StreamKind::Diff | StreamKind::Status => format!("{}_{}", coin, self.stream.name()),
         };
-        let filename_suffix = ".parquet".to_string();
+        let filename_suffix = FINAL_PARQUET_FILE_SUFFIX.to_string();
         fs::create_dir_all(&base_dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
         let mut effective_name_start = name_start;
-        let mut local_final_path = base_dir.join(format!("{filename_prefix}_{name_start}_{end}{filename_suffix}"));
+        let mut local_final_path = base_dir.join(format!(
+            "{filename_prefix}_{name_start}_{end}{}",
+            if self.supports_local_recovery() { LOCAL_RECOVERY_FILE_SUFFIX } else { FINAL_PARQUET_FILE_SUFFIX }
+        ));
         let recovery = self.load_local_recovery(&base_dir, coin, mode, end, &filename_prefix, &filename_suffix)?;
         if let Some(existing) = recovery.as_ref() {
             if actual_start > existing.last_block.saturating_add(1) {
@@ -2346,7 +2351,14 @@ struct LocalRecoveryFile<R> {
 }
 
 fn parse_local_archive_filename_bounds(path: &Path, filename_prefix: &str) -> Option<(u64, u64)> {
-    let stem = path.file_stem()?.to_str()?;
+    let file_name = path.file_name()?.to_str()?;
+    let stem = if let Some(stem) = file_name.strip_suffix(LOCAL_RECOVERY_FILE_SUFFIX) {
+        stem
+    } else if let Some(stem) = file_name.strip_suffix(FINAL_PARQUET_FILE_SUFFIX) {
+        stem
+    } else {
+        return None;
+    };
     let prefix = format!("{filename_prefix}_");
     let remainder = stem.strip_prefix(&prefix)?;
     let (start, end) = remainder.rsplit_once('_')?;
@@ -2367,7 +2379,11 @@ fn find_local_recovery_path(
         if !entry.file_type().map_err(io_to_parquet_error)?.is_file() {
             continue;
         }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(LOCAL_RECOVERY_FILE_SUFFIX))
+        {
             continue;
         }
         let Some((name_start_block, name_end_block)) = parse_local_archive_filename_bounds(&path, filename_prefix)
@@ -4518,6 +4534,8 @@ mod tests {
     fn parse_local_archive_filename_bounds_works() {
         let path = Path::new("/tmp/BTC_fill_928200001_929000000.parquet");
         assert_eq!(parse_local_archive_filename_bounds(path, "BTC_fill"), Some((928200001, 929000000)));
+        let recovery = Path::new("/tmp/BTC_fill_928200001_929000000.parquet.0");
+        assert_eq!(parse_local_archive_filename_bounds(recovery, "BTC_fill"), Some((928200001, 929000000)));
     }
 
     #[test]
@@ -4602,7 +4620,7 @@ mod tests {
             .expect("append 1003");
         recovered.close_with_flush(ArchiveMode::Lite, write_block_rows).expect("close recovered writer");
 
-        let final_path = base_dir.join("blocks_1001_1000000.parquet");
+        let final_path = base_dir.join("blocks_1001_1000000.parquet.0");
         let rows = read_local_blocks_rows(&final_path).expect("read recovered blocks parquet");
         let heights: Vec<u64> = rows.iter().map(|row| row.block_number).collect();
         assert_eq!(heights, vec![1001, 1002, 1003]);
