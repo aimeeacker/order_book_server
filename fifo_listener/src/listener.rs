@@ -5,7 +5,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::Duration;
@@ -13,12 +13,14 @@ use std::time::Duration;
 use log::{info, warn};
 use memchr::{memchr, memmem};
 
-use crate::archive::{ARCHIVE_QUEUE_BLOCKS, ArchiveBlock, is_archive_enabled, run_archive_writer};
+use crate::archive::{ArchiveBlock, dispatch_archive_block, has_archive_sessions, stop_all_archive_sessions};
 pub use crate::archive::{
-    ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, current_archive_base_dir, current_archive_symbols,
+    ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, ArchiveSessionId, ArchiveSessionOptions,
+    current_archive_base_dir, current_archive_symbols, current_rotation_blocks_value,
     set_archive_align_output_to_1000_boundary, set_archive_align_start_to_10k_boundary, set_archive_base_dir,
     set_archive_enabled, set_archive_handoff_config, set_archive_mode, set_archive_recover_blocks_fill_on_stop,
-    set_archive_symbols, set_rotation_blocks,
+    set_archive_symbols, set_rotation_blocks, start_archive_session,
+    stop_all_archive_sessions as stop_all_archive_sessions_api, stop_archive_session,
 };
 
 const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book/runtime_fifo";
@@ -93,6 +95,7 @@ pub struct ListenerHandle {
 impl ListenerHandle {
     pub fn stop(self) {
         self.stop.store(true, Ordering::SeqCst);
+        stop_all_archive_sessions(false);
         signal_eventfd(self.stop_eventfd);
         for thread in self.threads {
             let _unused = thread.join();
@@ -846,12 +849,7 @@ fn listen_fifo(
     }
 }
 
-fn run_aggregator(
-    rx: Receiver<StreamLine>,
-    stop: Arc<AtomicBool>,
-    callback: Option<HeightCallback>,
-    archive_tx: Option<SyncSender<ArchiveBlock>>,
-) {
+fn run_aggregator(rx: Receiver<StreamLine>, stop: Arc<AtomicBool>, callback: Option<HeightCallback>) {
     let mut queues = StreamQueues::new();
     let uds_path = PathBuf::from(UDS_PATH);
     let mut uds = match bind_uds_with_retry(uds_path) {
@@ -925,27 +923,11 @@ fn run_aggregator(
                 }
             }
 
-            if let Some(tx) = archive_tx.as_ref() {
-                if is_archive_enabled() {
-                    let mut msg: Option<ArchiveBlock> =
-                        Some(ArchiveBlock::new(height, fills_line, diffs_line, order_line));
-                    while let Some(block) = msg.take() {
-                        let shutdown = stop.load(Ordering::SeqCst);
-                        let send_res: Result<(), TrySendError<ArchiveBlock>> = if shutdown {
-                            tx.send(block).map_err(|err| TrySendError::Disconnected(err.0))
-                        } else {
-                            tx.try_send(block)
-                        };
-                        match send_res {
-                            Ok(()) => break,
-                            Err(TrySendError::Full(block)) => {
-                                msg = Some(block);
-                                thread::sleep(Duration::from_millis(5));
-                            }
-                            Err(TrySendError::Disconnected(_block)) => break,
-                        }
-                    }
-                }
+            if has_archive_sessions() {
+                dispatch_archive_block(
+                    ArchiveBlock::new(height, fills_line, diffs_line, order_line),
+                    stop.load(Ordering::SeqCst),
+                );
             }
 
             if height % 2000 == 0 {
@@ -979,7 +961,6 @@ pub fn run_forever() {
     info!("fifo_listener starting");
 
     let (tx, rx) = sync_channel(512);
-    let (archive_tx, archive_rx) = sync_channel(ARCHIVE_QUEUE_BLOCKS);
     let stop = Arc::new(AtomicBool::new(false));
     let rollback = Arc::new(RollbackTracker::new());
     let stop_eventfd = match create_eventfd() {
@@ -1002,12 +983,10 @@ pub fn run_forever() {
         }));
     }
 
-    let archive_stop = stop.clone();
-    threads.push(thread::spawn(move || run_archive_writer(archive_rx, archive_stop)));
-
-    run_aggregator(rx, stop.clone(), None, Some(archive_tx));
+    run_aggregator(rx, stop.clone(), None);
 
     stop.store(true, Ordering::SeqCst);
+    stop_all_archive_sessions(false);
     signal_eventfd(stop_eventfd);
     for thread in threads {
         let _unused = thread.join();
@@ -1020,7 +999,6 @@ pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<Liste
     info!("fifo_listener starting");
 
     let (tx, rx) = sync_channel(512);
-    let (archive_tx, archive_rx) = sync_channel(ARCHIVE_QUEUE_BLOCKS);
     let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     let rollback = Arc::new(RollbackTracker::new());
@@ -1038,9 +1016,7 @@ pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<Liste
     }
 
     let agg_stop = stop.clone();
-    let archive_stop = stop.clone();
-    threads.push(thread::spawn(move || run_archive_writer(archive_rx, archive_stop)));
-    threads.push(thread::spawn(move || run_aggregator(rx, agg_stop, callback, Some(archive_tx))));
+    threads.push(thread::spawn(move || run_aggregator(rx, agg_stop, callback)));
 
     Ok(ListenerHandle { stop, stop_eventfd, threads })
 }

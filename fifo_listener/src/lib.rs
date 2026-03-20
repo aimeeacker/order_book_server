@@ -5,11 +5,12 @@ mod archive;
 mod listener;
 
 pub use listener::{
-    ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, HeightCallback, ListenerHandle, current_archive_base_dir,
-    current_archive_symbols, init_cli_logging, run_forever, set_archive_align_output_to_1000_boundary,
-    set_archive_align_start_to_10k_boundary, set_archive_base_dir, set_archive_enabled, set_archive_handoff_config,
-    set_archive_mode, set_archive_recover_blocks_fill_on_stop, set_archive_symbols, set_rotation_blocks,
-    start_listener,
+    ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, ArchiveSessionId, ArchiveSessionOptions, HeightCallback,
+    ListenerHandle, current_archive_base_dir, current_archive_symbols, current_rotation_blocks_value, init_cli_logging,
+    run_forever, set_archive_align_output_to_1000_boundary, set_archive_align_start_to_10k_boundary,
+    set_archive_base_dir, set_archive_enabled, set_archive_handoff_config, set_archive_mode,
+    set_archive_recover_blocks_fill_on_stop, set_archive_symbols, set_rotation_blocks, start_archive_session,
+    start_listener, stop_all_archive_sessions_api, stop_archive_session,
 };
 
 use compute_l4::set_current_dataset_dir;
@@ -62,7 +63,7 @@ fn build_archive_handoff_config(
     Ok(ArchiveHandoffConfig::new(move_to_nas, nas_output_dir, upload_to_oss, oss))
 }
 
-fn configure_archive(
+fn build_archive_session_options(
     mode: Option<&str>,
     rotation_blocks: Option<u64>,
     output_dir: Option<PathBuf>,
@@ -77,7 +78,7 @@ fn configure_archive(
     oss_endpoint: Option<String>,
     oss_bucket: Option<String>,
     oss_prefix: Option<String>,
-) -> PyResult<()> {
+) -> PyResult<ArchiveSessionOptions> {
     let mode = parse_archive_mode(mode)?;
     let handoff = build_archive_handoff_config(
         move_to_nas,
@@ -89,20 +90,45 @@ fn configure_archive(
         oss_bucket,
         oss_prefix,
     )?;
-    if let Some(output_dir) = output_dir {
+    if let Some(output_dir) = output_dir.as_ref() {
         set_current_dataset_dir(Some(output_dir.clone()));
-        set_archive_base_dir(Some(output_dir));
+        set_archive_base_dir(Some(output_dir.clone()));
     }
     if let Some(n) = rotation_blocks {
         set_rotation_blocks(n);
     }
-    set_archive_align_start_to_10k_boundary(align_start_to_10k_boundary);
-    set_archive_align_output_to_1000_boundary(align_output_to_1000_boundary);
-    set_archive_recover_blocks_fill_on_stop(false);
-    set_archive_handoff_config(handoff);
-    set_archive_symbols(symbols);
-    set_archive_mode(mode);
-    Ok(())
+    let output_dir = output_dir.unwrap_or_else(current_archive_base_dir);
+    let symbols = symbols.unwrap_or_else(current_archive_symbols);
+    Ok(ArchiveSessionOptions {
+        mode: mode.unwrap_or(ArchiveMode::Lite),
+        rotation_blocks: rotation_blocks.unwrap_or_else(crate::archive::current_rotation_blocks_value),
+        output_dir,
+        symbols,
+        align_start_to_10k_boundary,
+        align_output_to_1000_boundary,
+        handoff,
+    })
+}
+
+#[pyclass(unsendable, name = "ArchiveHandle")]
+struct PyArchiveHandle {
+    session_id: ArchiveSessionId,
+}
+
+#[pymethods]
+impl PyArchiveHandle {
+    #[pyo3(signature = (recover_blocks_fill_locally=false))]
+    fn stop_archive(&self, recover_blocks_fill_locally: bool) -> PyResult<()> {
+        if stop_archive_session(self.session_id, recover_blocks_fill_locally) {
+            Ok(())
+        } else {
+            Err(pyo3::exceptions::PyRuntimeError::new_err("archive session already stopped"))
+        }
+    }
+
+    fn session_id(&self) -> u64 {
+        self.session_id
+    }
 }
 
 struct PyLogger {
@@ -278,8 +304,8 @@ impl PyFifoListener {
         oss_endpoint: Option<String>,
         oss_bucket: Option<String>,
         oss_prefix: Option<String>,
-    ) -> PyResult<()> {
-        configure_archive(
+    ) -> PyResult<PyArchiveHandle> {
+        let options = build_archive_session_options(
             mode,
             rotation_blocks,
             output_dir,
@@ -294,13 +320,14 @@ impl PyFifoListener {
             oss_endpoint,
             oss_bucket,
             oss_prefix,
-        )
+        )?;
+        let session_id = start_archive_session(options);
+        Ok(PyArchiveHandle { session_id })
     }
 
     #[pyo3(signature = (recover_blocks_fill_locally=false))]
     fn stop_archive(&self, recover_blocks_fill_locally: bool) -> PyResult<()> {
-        set_archive_recover_blocks_fill_on_stop(recover_blocks_fill_locally);
-        set_archive_mode(None);
+        stop_all_archive_sessions_api(recover_blocks_fill_locally);
         Ok(())
     }
 
@@ -344,5 +371,6 @@ impl Drop for PyFifoListener {
 #[pymodule]
 fn fifo_listener(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyFifoListener>()?;
+    m.add_class::<PyArchiveHandle>()?;
     Ok(())
 }

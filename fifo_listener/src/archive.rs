@@ -1,10 +1,11 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, channel, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, TrySendError, channel, sync_channel};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,12 +59,76 @@ static ARCHIVE_RECOVER_BLOCKS_FILL_ON_STOP: AtomicBool = AtomicBool::new(false);
 static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
 static ARCHIVE_HANDOFF_CONFIG: OnceLock<Mutex<ArchiveHandoffConfig>> = OnceLock::new();
+static ARCHIVE_SESSION_REGISTRY: OnceLock<Mutex<ArchiveSessionRegistry>> = OnceLock::new();
 pub(crate) const ARCHIVE_QUEUE_BLOCKS: usize = 127;
+
+thread_local! {
+    static ARCHIVE_THREAD_CONTEXT: RefCell<Option<ArchiveThreadContext>> = const { RefCell::new(None) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveMode {
     Lite = 1,
     Full = 2,
+}
+
+pub type ArchiveSessionId = u64;
+
+#[derive(Clone, Debug)]
+pub struct ArchiveSessionOptions {
+    pub mode: ArchiveMode,
+    pub rotation_blocks: u64,
+    pub output_dir: PathBuf,
+    pub symbols: Vec<String>,
+    pub align_start_to_10k_boundary: bool,
+    pub align_output_to_1000_boundary: bool,
+    pub handoff: ArchiveHandoffConfig,
+}
+
+#[derive(Clone, Debug)]
+struct ArchiveThreadContext {
+    mode: ArchiveMode,
+    enabled: Arc<AtomicBool>,
+    rotation_blocks: u64,
+    base_dir: PathBuf,
+    symbols: Vec<String>,
+    handoff: ArchiveHandoffConfig,
+    align_start_to_10k_boundary: bool,
+    align_output_to_1000_boundary: bool,
+    recover_blocks_fill_on_stop: Arc<AtomicBool>,
+}
+
+impl ArchiveThreadContext {
+    fn from_options(
+        options: &ArchiveSessionOptions,
+        enabled: Arc<AtomicBool>,
+        recover_blocks_fill_on_stop: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            mode: options.mode,
+            enabled,
+            rotation_blocks: options.rotation_blocks,
+            base_dir: options.output_dir.clone(),
+            symbols: options.symbols.clone(),
+            handoff: options.handoff.clone(),
+            align_start_to_10k_boundary: options.align_start_to_10k_boundary,
+            align_output_to_1000_boundary: options.align_output_to_1000_boundary,
+            recover_blocks_fill_on_stop,
+        }
+    }
+}
+
+struct ArchiveSessionHandle {
+    tx: SyncSender<ArchiveBlock>,
+    enabled: Arc<AtomicBool>,
+    recover_blocks_fill_on_stop: Arc<AtomicBool>,
+    join_handle: thread::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct ArchiveSessionRegistry {
+    next_id: ArchiveSessionId,
+    sessions: HashMap<ArchiveSessionId, ArchiveSessionHandle>,
 }
 
 static ARCHIVE_MODE: AtomicU8 = AtomicU8::new(0);
@@ -148,6 +213,15 @@ pub fn set_rotation_blocks(n: u64) {
     }
 }
 
+fn current_rotation_blocks() -> u64 {
+    archive_thread_context(|ctx| ctx.map(|ctx| ctx.rotation_blocks))
+        .unwrap_or_else(|| ROTATION_BLOCKS.load(Ordering::SeqCst))
+}
+
+pub fn current_rotation_blocks_value() -> u64 {
+    current_rotation_blocks()
+}
+
 fn archive_base_dir_override() -> &'static Mutex<Option<PathBuf>> {
     ARCHIVE_BASE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None))
 }
@@ -158,6 +232,31 @@ fn archive_symbols_override() -> &'static Mutex<Option<Vec<String>>> {
 
 fn archive_handoff_config() -> &'static Mutex<ArchiveHandoffConfig> {
     ARCHIVE_HANDOFF_CONFIG.get_or_init(|| Mutex::new(ArchiveHandoffConfig::default()))
+}
+
+fn archive_session_registry() -> &'static Mutex<ArchiveSessionRegistry> {
+    ARCHIVE_SESSION_REGISTRY.get_or_init(|| Mutex::new(ArchiveSessionRegistry { next_id: 1, ..Default::default() }))
+}
+
+fn archive_thread_context<T>(f: impl FnOnce(Option<&ArchiveThreadContext>) -> T) -> T {
+    ARCHIVE_THREAD_CONTEXT.with(|ctx| {
+        let borrow = ctx.borrow();
+        f(borrow.as_ref())
+    })
+}
+
+fn set_archive_thread_context(context: Option<ArchiveThreadContext>) {
+    ARCHIVE_THREAD_CONTEXT.with(|ctx| {
+        *ctx.borrow_mut() = context;
+    });
+}
+
+fn update_archive_thread_context(f: impl FnOnce(&mut ArchiveThreadContext)) {
+    ARCHIVE_THREAD_CONTEXT.with(|ctx| {
+        if let Some(current) = ctx.borrow_mut().as_mut() {
+            f(current);
+        }
+    });
 }
 
 fn redact_secret(value: &str) -> String {
@@ -193,11 +292,13 @@ fn default_archive_finalize_dir() -> PathBuf {
 }
 
 pub fn current_archive_base_dir() -> PathBuf {
-    archive_base_dir_override()
-        .lock()
-        .expect("archive base dir mutex")
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(ARCHIVE_BASE_DIR))
+    archive_thread_context(|ctx| ctx.map(|ctx| ctx.base_dir.clone())).unwrap_or_else(|| {
+        archive_base_dir_override()
+            .lock()
+            .expect("archive base dir mutex")
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(ARCHIVE_BASE_DIR))
+    })
 }
 
 pub fn set_archive_base_dir(path: Option<PathBuf>) -> PathBuf {
@@ -207,12 +308,14 @@ pub fn set_archive_base_dir(path: Option<PathBuf>) -> PathBuf {
 }
 
 pub fn current_archive_symbols() -> Vec<String> {
-    archive_symbols_override()
-        .lock()
-        .expect("archive symbols mutex")
-        .clone()
-        .map(|symbols| normalize_archive_symbols(Some(symbols)))
-        .unwrap_or_else(|| normalize_archive_symbols(None))
+    archive_thread_context(|ctx| ctx.map(|ctx| ctx.symbols.clone())).unwrap_or_else(|| {
+        archive_symbols_override()
+            .lock()
+            .expect("archive symbols mutex")
+            .clone()
+            .map(|symbols| normalize_archive_symbols(Some(symbols)))
+            .unwrap_or_else(|| normalize_archive_symbols(None))
+    })
 }
 
 pub fn set_archive_symbols(symbols: Option<Vec<String>>) -> Vec<String> {
@@ -223,7 +326,8 @@ pub fn set_archive_symbols(symbols: Option<Vec<String>>) -> Vec<String> {
 }
 
 pub(crate) fn current_archive_handoff_config() -> ArchiveHandoffConfig {
-    archive_handoff_config().lock().expect("archive handoff config mutex").clone()
+    archive_thread_context(|ctx| ctx.map(|ctx| ctx.handoff.clone()))
+        .unwrap_or_else(|| archive_handoff_config().lock().expect("archive handoff config mutex").clone())
 }
 
 pub fn set_archive_handoff_config(config: ArchiveHandoffConfig) -> ArchiveHandoffConfig {
@@ -264,30 +368,139 @@ pub fn set_archive_recover_blocks_fill_on_stop(enabled: bool) {
 }
 
 pub(crate) fn current_archive_align_start_to_10k_boundary() -> bool {
-    ARCHIVE_ALIGN_START_TO_10K_BOUNDARY.load(Ordering::SeqCst)
+    archive_thread_context(|ctx| ctx.map(|ctx| ctx.align_start_to_10k_boundary))
+        .unwrap_or_else(|| ARCHIVE_ALIGN_START_TO_10K_BOUNDARY.load(Ordering::SeqCst))
 }
 
 pub(crate) fn current_archive_align_output_to_1000_boundary() -> bool {
-    ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY.load(Ordering::SeqCst)
+    archive_thread_context(|ctx| ctx.map(|ctx| ctx.align_output_to_1000_boundary))
+        .unwrap_or_else(|| ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY.load(Ordering::SeqCst))
 }
 
 pub(crate) fn current_archive_recover_blocks_fill_on_stop() -> bool {
-    ARCHIVE_RECOVER_BLOCKS_FILL_ON_STOP.load(Ordering::SeqCst)
+    archive_thread_context(|ctx| ctx.map(|ctx| ctx.recover_blocks_fill_on_stop.load(Ordering::SeqCst)))
+        .unwrap_or_else(|| ARCHIVE_RECOVER_BLOCKS_FILL_ON_STOP.load(Ordering::SeqCst))
 }
 
 pub(crate) fn get_archive_mode() -> Option<ArchiveMode> {
-    match ARCHIVE_MODE.load(Ordering::SeqCst) {
-        1 => Some(ArchiveMode::Lite),
-        2 => Some(ArchiveMode::Full),
-        _ => None,
+    if let Some(mode) =
+        archive_thread_context(|ctx| ctx.and_then(|ctx| ctx.enabled.load(Ordering::SeqCst).then_some(ctx.mode)))
+    {
+        Some(mode)
+    } else {
+        match ARCHIVE_MODE.load(Ordering::SeqCst) {
+            1 => Some(ArchiveMode::Lite),
+            2 => Some(ArchiveMode::Full),
+            _ => None,
+        }
     }
 }
 
-pub(crate) fn is_archive_enabled() -> bool {
-    ARCHIVE_MODE.load(Ordering::SeqCst) != 0
+pub fn start_archive_session(options: ArchiveSessionOptions) -> ArchiveSessionId {
+    let mut registry = archive_session_registry().lock().expect("archive session registry");
+    let session_id = registry.next_id;
+    registry.next_id = registry.next_id.saturating_add(1);
+    let (tx, rx) = sync_channel(ARCHIVE_QUEUE_BLOCKS);
+    let enabled = Arc::new(AtomicBool::new(true));
+    let recover_blocks_fill_on_stop = Arc::new(AtomicBool::new(false));
+    let thread_context =
+        ArchiveThreadContext::from_options(&options, enabled.clone(), recover_blocks_fill_on_stop.clone());
+    let stop = enabled.clone();
+    let join_handle = thread::spawn(move || {
+        set_archive_thread_context(Some(thread_context));
+        run_archive_writer(rx, stop);
+        set_archive_thread_context(None);
+    });
+    registry
+        .sessions
+        .insert(session_id, ArchiveSessionHandle { tx, enabled, recover_blocks_fill_on_stop, join_handle });
+    session_id
 }
 
-#[derive(Debug)]
+pub fn stop_archive_session(session_id: ArchiveSessionId, recover_blocks_fill_locally: bool) -> bool {
+    let handle = {
+        let mut registry = archive_session_registry().lock().expect("archive session registry");
+        registry.sessions.remove(&session_id)
+    };
+    let Some(handle) = handle else {
+        return false;
+    };
+    handle.recover_blocks_fill_on_stop.store(recover_blocks_fill_locally, Ordering::SeqCst);
+    handle.enabled.store(false, Ordering::SeqCst);
+    drop(handle.tx);
+    if let Err(err) = handle.join_handle.join() {
+        warn!("Archive session {session_id} panicked while stopping: {err:?}");
+    }
+    true
+}
+
+pub fn stop_all_archive_sessions(recover_blocks_fill_locally: bool) {
+    let handles: Vec<(ArchiveSessionId, ArchiveSessionHandle)> = {
+        let mut registry = archive_session_registry().lock().expect("archive session registry");
+        registry.sessions.drain().collect()
+    };
+    for (session_id, handle) in handles {
+        handle.recover_blocks_fill_on_stop.store(recover_blocks_fill_locally, Ordering::SeqCst);
+        handle.enabled.store(false, Ordering::SeqCst);
+        drop(handle.tx);
+        if let Err(err) = handle.join_handle.join() {
+            warn!("Archive session {session_id} panicked while stopping: {err:?}");
+        }
+    }
+}
+
+pub(crate) fn has_archive_sessions() -> bool {
+    !archive_session_registry().lock().expect("archive session registry").sessions.is_empty()
+}
+
+pub(crate) fn dispatch_archive_block(block: ArchiveBlock, shutdown: bool) {
+    let session_txs: Vec<(ArchiveSessionId, SyncSender<ArchiveBlock>)> = {
+        let registry = archive_session_registry().lock().expect("archive session registry");
+        registry.sessions.iter().map(|(id, handle)| (*id, handle.tx.clone())).collect()
+    };
+    if session_txs.is_empty() {
+        return;
+    }
+
+    let mut stale_sessions = Vec::new();
+    for (session_id, tx) in session_txs {
+        let mut message = Some(block.clone());
+        while let Some(msg) = message.take() {
+            let send_res =
+                if shutdown { tx.send(msg).map_err(|err| TrySendError::Disconnected(err.0)) } else { tx.try_send(msg) };
+            match send_res {
+                Ok(()) => break,
+                Err(TrySendError::Full(msg)) => {
+                    message = Some(msg);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(TrySendError::Disconnected(_msg)) => {
+                    stale_sessions.push(session_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    if !stale_sessions.is_empty() {
+        let mut handles = Vec::new();
+        {
+            let mut registry = archive_session_registry().lock().expect("archive session registry");
+            for session_id in stale_sessions {
+                if let Some(handle) = registry.sessions.remove(&session_id) {
+                    handles.push((session_id, handle));
+                }
+            }
+        }
+        for (session_id, handle) in handles {
+            if let Err(err) = handle.join_handle.join() {
+                warn!("Archive session {session_id} panicked after disconnect: {err:?}");
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct ArchiveBlock {
     pub(crate) block_number: u64,
     pub(crate) fills_line: Vec<u8>,
@@ -689,7 +902,7 @@ impl StreamKind {
     fn rotation_block_limit(self) -> u64 {
         match self {
             Self::Blocks | Self::Fill => BLOCKS_FILL_ROTATION_BLOCKS,
-            Self::Status | Self::Diff => ROTATION_BLOCKS.load(Ordering::SeqCst),
+            Self::Status | Self::Diff => current_rotation_blocks(),
         }
     }
 
@@ -2593,7 +2806,11 @@ fn disable_archive_after_failure(
     }
     *current_mode = None;
     *current_symbols = current_archive_symbols();
-    set_archive_mode(None);
+    if archive_thread_context(|ctx| ctx.is_none()) {
+        set_archive_mode(None);
+    } else {
+        update_archive_thread_context(|ctx| ctx.enabled.store(false, Ordering::SeqCst));
+    }
 }
 
 fn restart_archive_after_handoff(
