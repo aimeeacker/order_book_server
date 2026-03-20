@@ -83,11 +83,67 @@ The WebSocket server comes with compression built-in. The compression ratio can 
 ### Archive Parquet layout
 
 - Archive writes are stream-specific and do not share a single row-group policy.
-- `status` parquet uses `5000` blocks per row group.
+- `status` parquet uses coin-specific row-group sizes:
+  - `BTC`: `1000` blocks
+  - `ETH`: `2000` blocks
+  - `SOL` / `HYPE`: `5000` blocks
+  - fallback default: `10000` blocks
 - `diff` parquet uses `50000` blocks per row group.
-- `fill` parquet uses a single row group per file.
-- `blocks` parquet uses a single row group per file.
+- `fill` parquet uses `250000` blocks per row group.
+- `blocks` parquet uses `250000` blocks per row group.
+- `status` and `diff` rotate on the configured `rotation_blocks`.
+- `blocks` and `fill` rotate on fixed `1000000`-block windows.
 - Finalized files smaller than `5000` blocks of actual span are discarded instead of being handed off to NAS/OSS.
+
+### Archive session behavior
+
+- Archive runs as session-based workers. `start_archive(...)` returns an `ArchiveHandle`, and each handle controls one
+  archive session.
+- Each session has its own:
+  - archive mode
+  - tracked symbols
+  - output directory
+  - alignment flags
+  - handoff configuration
+- `archive_height` is a span, not an absolute height:
+  - if archive really starts at `929620001`
+  - and `archive_height=10000`
+  - the session auto-stops at `929630000`
+- `stop_height` is an absolute stop height.
+- `archive_height` and `stop_height` cannot be provided together.
+- If a configured absolute `stop_height` is already below the current observed height, the archive session is ignored
+  instead of starting and crashing.
+
+### Archive recovery and handoff
+
+- Only `blocks` and `fill` support local recovery.
+- Local recovery files use the `.parquet.0` suffix.
+- On restart, startup preflight checks local `blocks` / `fill` recovery files before actual archive writing starts.
+- Continuity for `fill` uses logical archive height, not only the last fill event row. This avoids false discontinuities
+  when the final logical block has no fill rows.
+- `align_start_to_10k_boundary=true` means archive can wait until the next `...00001` checkpoint boundary before it
+  begins writing.
+- `align_output_to_1000_boundary=true` means finalized file end heights are snapped to the most recent `1000` boundary.
+- On `SIGINT` / `SIGTERM`, archive close is optimized for bounded shutdown time:
+  - upstream FIFO ingestion is cut first
+  - close runs in parallel across streams / coins
+  - handoff is concurrent
+- `blocks` / `fill` signal-stop handling can keep local recovery state instead of handing off immediately, depending on
+  the stop path and finalized span.
+
+### Archive handoff configuration
+
+- Handoff behavior is controlled by the session's `start_archive(...)` arguments:
+  - `move_to_nas`
+  - `nas_output_dir`
+  - `upload_to_oss`
+  - `oss_access_key_id`
+  - `oss_access_key_secret`
+  - `oss_endpoint`
+  - `oss_bucket`
+  - `oss_prefix`
+- If `nas_output_dir` is omitted, the default NAS target is `/mnt`.
+- If tests or operations require another target such as `/mnt/test`, pass it explicitly to `start_archive(...)`.
 
 ## Caveats
 

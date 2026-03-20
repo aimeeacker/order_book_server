@@ -17,6 +17,58 @@ This repository hosts a Rust workspace for a local WebSocket server that mirrors
 - `server` consumes merged UDS payloads, updates L4 state, validates snapshots, and derives L4Lite/L2 projections.
 - `websocket_server` broadcasts per-subscription updates and snapshot responses.
 
+## Archive Model
+
+- Archive runs as session-based workers, not a single global writer. `start_archive(...)` returns an `ArchiveHandle`;
+  `ArchiveHandle.stop_archive(...)` stops one session, while `listener.stop_archive(...)` stops all sessions.
+- A session can have its own `mode`, `symbols`, `output_dir`, alignment flags, handoff config, and optional auto-stop
+  settings.
+- `archive_height` is a span, not an absolute height:
+  - actual archive start height = first block that really starts writing after alignment/recovery
+  - effective stop height = `actual_start + archive_height - 1`
+- `stop_height` is an absolute stop height.
+- `archive_height` and `stop_height` are mutually exclusive.
+- If `stop_height` is already below the first seen block height, the session is ignored and exits without starting
+  archive writers.
+
+## Archive Stop Semantics
+
+- Normal Python-driven `stop_archive()` uses normal close/handoff semantics.
+- `SIGINT`/`SIGTERM` are treated differently from explicit stop:
+  - upstream FIFO/aggregator input is cut first
+  - archive close runs on the signal-stop path
+  - `blocks/fill` may be kept locally for recovery when `recover_blocks_fill_locally=true`
+- Signal-stop close is intentionally more aggressive and parallelized to reduce shutdown time.
+- Signal-stop now closes in parallel across:
+  - `blocks`
+  - `diff`
+  - one task per coin for `status + fill`
+- Handoff is concurrent as well, with up to `15` in-flight file transfers.
+
+## Archive Recovery And Handoff
+
+- Only `blocks` and `fill` support local recovery.
+- Local recovery files use suffix `.parquet.0`.
+- On restart, startup preflight scans local `blocks/fill` recovery files before actual archive writing begins.
+- Continuity for `fill` is based on logical archive height, not only the last fill event row height:
+  - a file can still be resumable even if the logical end block has no fill rows
+- For `blocks/fill`, if continuity is broken, old local recovery files are staged to `.handoff` and sent to NAS/OSS
+  using the session handoff config.
+- Small-file discard rule applies before local recovery retention:
+  - finalized archive span `< 5000` blocks => drop locally, do not hand off, do not retain for recovery
+
+## Archive Handoff Configuration
+
+- Handoff destination is session-scoped and should come from `start_archive(...)` parameters:
+  - `move_to_nas`
+  - `nas_output_dir`
+  - `upload_to_oss`
+  - `oss_*`
+- If `nas_output_dir` is omitted, the default NAS finalize root is `/mnt`.
+- Do not assume `/mnt` is always correct; if tests or ops require another path such as `/mnt/test`, pass it explicitly
+  into `start_archive(...)`.
+- Stop-time handoff must use the session handoff config, not a global fallback.
+
 ## Build, Test, and Development Commands
 
 - `cargo build --workspace`: build all crates.
@@ -62,10 +114,21 @@ This repository hosts a Rust workspace for a local WebSocket server that mirrors
 - Keep snapshot validation and replay paths deterministic; avoid introducing order-dependent hash behavior.
 - When enabling archive writes, monitor disk growth and rotation behavior under restarts.
 - Treat archive row-group policy as stream-specific:
-  - `status`: `5000` blocks per row group
+  - `status`: coin-specific row groups
+    - `BTC`: `1000`
+    - `ETH`: `2000`
+    - `SOL/HYPE`: `5000`
+    - default fallback: `10000`
   - `diff`: `50000` blocks per row group
-  - `fill`: single row group per file
-  - `blocks`: single row group per file
+  - `fill`: `250000` blocks per row group
+  - `blocks`: `250000` blocks per row group
+- Treat archive file rotation as stream-specific:
+  - `status`/`diff`: use `rotation_blocks`
+  - `blocks`/`fill`: fixed `1000000`-block windows
+- Respect archive alignment flags:
+  - `align_start_to_10k_boundary=true` means archive can wait until the next `...00001` boundary before starting
+  - `align_output_to_1000_boundary=true` means finalized filenames/end heights are snapped to the most recent `1000`
+    boundary
 - Keep the small-file discard rule aligned with ops expectations: finalized archive files spanning fewer than `5000`
   blocks are dropped instead of handed off to NAS/OSS.
 - Treat `l4Anal` payload shape as protocol: `window_sum_bid/window_sum_ask` are positional arrays with 8 values in order:
