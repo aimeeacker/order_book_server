@@ -75,6 +75,7 @@ fn build_archive_session_options(
     rotation_blocks: Option<u64>,
     output_dir: Option<PathBuf>,
     symbols: Option<Vec<String>>,
+    archive_height: Option<u64>,
     stop_height: Option<u64>,
     align_start_to_10k_boundary: bool,
     align_output_to_1000_boundary: bool,
@@ -87,6 +88,9 @@ fn build_archive_session_options(
     oss_bucket: Option<String>,
     oss_prefix: Option<String>,
 ) -> PyResult<ArchiveSessionOptions> {
+    if archive_height.is_some() && stop_height.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err("archive_height and stop_height cannot both be provided"));
+    }
     let mode = parse_archive_mode(mode)?;
     let handoff = build_archive_handoff_config(
         move_to_nas,
@@ -112,6 +116,7 @@ fn build_archive_session_options(
         rotation_blocks: rotation_blocks.unwrap_or_else(current_rotation_blocks_value),
         output_dir,
         symbols,
+        archive_height,
         stop_height,
         align_start_to_10k_boundary,
         align_output_to_1000_boundary,
@@ -295,6 +300,7 @@ impl PyFifoListener {
         rotation_blocks=None,
         output_dir=None,
         symbols=None,
+        archive_height=None,
         stop_height=None,
         align_start_to_10k_boundary=true,
         align_output_to_1000_boundary=true,
@@ -313,6 +319,7 @@ impl PyFifoListener {
         rotation_blocks: Option<u64>,
         output_dir: Option<PathBuf>,
         symbols: Option<Vec<String>>,
+        archive_height: Option<u64>,
         stop_height: Option<u64>,
         align_start_to_10k_boundary: bool,
         align_output_to_1000_boundary: bool,
@@ -330,6 +337,7 @@ impl PyFifoListener {
             rotation_blocks,
             output_dir,
             symbols,
+            archive_height,
             stop_height,
             align_start_to_10k_boundary,
             align_output_to_1000_boundary,

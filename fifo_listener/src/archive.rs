@@ -83,6 +83,7 @@ pub struct ArchiveSessionOptions {
     pub rotation_blocks: u64,
     pub output_dir: PathBuf,
     pub symbols: Vec<String>,
+    pub archive_height: Option<u64>,
     pub stop_height: Option<u64>,
     pub align_start_to_10k_boundary: bool,
     pub align_output_to_1000_boundary: bool,
@@ -98,6 +99,7 @@ struct ArchiveThreadContext {
     rotation_blocks: u64,
     base_dir: PathBuf,
     symbols: Vec<String>,
+    archive_height: Option<u64>,
     stop_height: Option<u64>,
     handoff: ArchiveHandoffConfig,
     align_start_to_10k_boundary: bool,
@@ -121,6 +123,7 @@ impl ArchiveThreadContext {
             rotation_blocks: options.rotation_blocks,
             base_dir: options.output_dir.clone(),
             symbols: options.symbols.clone(),
+            archive_height: options.archive_height,
             stop_height: options.stop_height,
             handoff: options.handoff.clone(),
             align_start_to_10k_boundary: options.align_start_to_10k_boundary,
@@ -411,6 +414,10 @@ pub(crate) fn current_archive_recover_blocks_fill_on_stop() -> bool {
 
 pub(crate) fn current_archive_stop_height() -> Option<u64> {
     archive_thread_context(|ctx| ctx.and_then(|ctx| ctx.stop_height))
+}
+
+pub(crate) fn current_archive_height_span() -> Option<u64> {
+    archive_thread_context(|ctx| ctx.and_then(|ctx| ctx.archive_height))
 }
 
 pub(crate) fn current_archive_stop_requested() -> bool {
@@ -1193,6 +1200,7 @@ struct ParquetStreamWriter<R> {
     schema: std::sync::Arc<Type>,
     props: std::sync::Arc<WriterProperties>,
     handoff_tx: Sender<HandoffMessage>,
+    handoff_config: ArchiveHandoffConfig,
     recover_blocks_fill_on_stop: bool,
     file: Option<ParquetFile>,
     pending_start_block: Option<u64>,
@@ -1206,12 +1214,14 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
         schema: std::sync::Arc<Type>,
         props: std::sync::Arc<WriterProperties>,
         handoff_tx: Sender<HandoffMessage>,
+        handoff_config: ArchiveHandoffConfig,
     ) -> Self {
         Self {
             stream,
             schema,
             props,
             handoff_tx,
+            handoff_config,
             recover_blocks_fill_on_stop: false,
             file: None,
             pending_start_block: None,
@@ -1302,7 +1312,8 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
         ));
         let recovery = self.load_local_recovery(&base_dir, coin, mode, end, &filename_prefix, &filename_suffix)?;
         if let Some(existing) = recovery.as_ref() {
-            if actual_start > existing.last_block.saturating_add(1) {
+            let resume_end_block = local_recovery_resume_end(self.stream, actual_start, end, existing.last_block);
+            if actual_start > resume_end_block.saturating_add(1) {
                 let staged_path = stage_local_file_for_handoff(&existing.path)?;
                 let logical_end_block = actual_start.saturating_sub(1).min(end);
                 let relative_path = self.local_recovery_relative_path(
@@ -1313,7 +1324,7 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
                     &filename_prefix,
                     &filename_suffix,
                 );
-                enqueue_handoff_task(&self.handoff_tx, staged_path, relative_path)?;
+                enqueue_handoff_task(&self.handoff_tx, &self.handoff_config, staged_path, relative_path)?;
             } else {
                 effective_name_start = existing.name_start_block;
                 local_final_path = existing.path.clone();
@@ -1332,13 +1343,14 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
         let mut recovered_last_block = actual_start;
         let mut replay_skip_until_block = 0;
         if let Some(existing) = recovery {
-            if actual_start <= existing.last_block.saturating_add(1) {
+            let resume_end_block = local_recovery_resume_end(self.stream, actual_start, end, existing.last_block);
+            if actual_start <= resume_end_block.saturating_add(1) {
                 let resume = split_recovered_rows_for_resume(self.stream, actual_start, existing.rows);
                 rewrite_rows_into_writer(&mut writer, mode, self.stream, resume.committed_rows, R::write_rows)?;
                 self.delayed.replace_rows(resume.delayed_rows);
                 self.active.replace_rows(resume.active_rows);
-                recovered_last_block = existing.last_block;
-                replay_skip_until_block = existing.last_block;
+                recovered_last_block = resume_end_block;
+                replay_skip_until_block = resume_end_block;
                 // Delete the old recovery file now that its contents have been loaded into memory.
                 if let Err(err) = fs::remove_file(&existing.path) {
                     warn!("Failed to remove old recovery file {} after loading: {err}", existing.path.display());
@@ -1388,7 +1400,7 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
             } else if self.keep_local_on_close() && file.name_end_block < file.window_end_block {
                 info!("Archive finalized locally without handoff for {} span={}", log_label, span_blocks);
             } else {
-                enqueue_handoff_task(&self.handoff_tx, final_path, relative_path)?;
+                enqueue_handoff_task(&self.handoff_tx, &self.handoff_config, final_path, relative_path)?;
             }
         }
         self.pending_start_block = None;
@@ -1675,6 +1687,7 @@ struct StatusParquetWriter {
     schema: std::sync::Arc<Type>,
     props: std::sync::Arc<WriterProperties>,
     handoff_tx: Sender<HandoffMessage>,
+    handoff_config: ArchiveHandoffConfig,
     file: Option<ParquetFile>,
     pending_start_block: Option<u64>,
     active_start_block: Option<u64>,
@@ -1689,6 +1702,7 @@ impl StatusParquetWriter {
         schema: std::sync::Arc<Type>,
         props: std::sync::Arc<WriterProperties>,
         handoff_tx: Sender<HandoffMessage>,
+        handoff_config: ArchiveHandoffConfig,
     ) -> Self {
         Self {
             coin,
@@ -1696,6 +1710,7 @@ impl StatusParquetWriter {
             schema,
             props,
             handoff_tx,
+            handoff_config,
             file: None,
             pending_start_block: None,
             active_start_block: None,
@@ -1875,7 +1890,7 @@ impl StatusParquetWriter {
                 info!("Archive finalized but dropping short parquet {} span={}", log_label, span_blocks);
                 fs::remove_file(&final_path).map_err(io_to_parquet_error)?;
             } else {
-                enqueue_handoff_task(&self.handoff_tx, final_path, relative_path)?;
+                enqueue_handoff_task(&self.handoff_tx, &self.handoff_config, final_path, relative_path)?;
             }
         }
         self.pending_start_block = None;
@@ -1923,6 +1938,7 @@ impl DiffWorkerHandle {
         schema: std::sync::Arc<Type>,
         props: std::sync::Arc<WriterProperties>,
         handoff_tx: Sender<HandoffMessage>,
+        handoff_config: ArchiveHandoffConfig,
     ) -> Self {
         let (tx, rx) = sync_channel(DIFF_WORKER_QUEUE_BLOCKS);
         let (error_tx, error_rx) = channel();
@@ -1932,7 +1948,13 @@ impl DiffWorkerHandle {
                 .map(|coin| {
                     (
                         coin.clone(),
-                        ParquetStreamWriter::new(StreamKind::Diff, schema.clone(), props.clone(), handoff_tx.clone()),
+                        ParquetStreamWriter::new(
+                            StreamKind::Diff,
+                            schema.clone(),
+                            props.clone(),
+                            handoff_tx.clone(),
+                            handoff_config.clone(),
+                        ),
                     )
                 })
                 .collect();
@@ -2051,13 +2073,15 @@ impl StatusWorkerHandle {
         schema: std::sync::Arc<Type>,
         props: std::sync::Arc<WriterProperties>,
         handoff_tx: Sender<HandoffMessage>,
+        handoff_config: ArchiveHandoffConfig,
     ) -> Self {
         let (tx, rx) = sync_channel(STATUS_WORKER_QUEUE_BLOCKS);
         let (ack_tx, ack_rx) = channel();
         let (error_tx, error_rx) = channel();
         let worker_coin = coin.clone();
         let handle = thread::spawn(move || {
-            let mut writer = StatusParquetWriter::new(worker_coin.clone(), mode, schema, props, handoff_tx);
+            let mut writer =
+                StatusParquetWriter::new(worker_coin.clone(), mode, schema, props, handoff_tx, handoff_config);
             while let Ok(message) = rx.recv() {
                 let result = match message {
                     StatusWorkerMessage::Block { height, rows } => writer.advance_block(height).and_then(|_| {
@@ -2194,6 +2218,7 @@ struct ArchiveWriters {
 
 impl ArchiveWriters {
     fn new(mode: ArchiveMode, symbols: Vec<String>, handoff_tx: Sender<HandoffMessage>) -> Self {
+        let handoff_config = current_archive_handoff_config();
         let zstd_level = ZstdLevel::try_new(3).unwrap_or_default();
         let props = std::sync::Arc::new(
             WriterProperties::builder()
@@ -2340,7 +2365,14 @@ impl ArchiveWriters {
         let fill_schema = std::sync::Arc::new(parse_message_type(fill_schema_str).expect("invalid fill schema"));
 
         let mut coins = HashMap::new();
-        let diff = DiffWorkerHandle::new(mode, symbols.clone(), diff_schema.clone(), props.clone(), handoff_tx.clone());
+        let diff = DiffWorkerHandle::new(
+            mode,
+            symbols.clone(),
+            diff_schema.clone(),
+            props.clone(),
+            handoff_tx.clone(),
+            handoff_config.clone(),
+        );
         for coin in &symbols {
             coins.insert(
                 coin.clone(),
@@ -2351,19 +2383,27 @@ impl ArchiveWriters {
                         status_schema.clone(),
                         props.clone(),
                         handoff_tx.clone(),
+                        handoff_config.clone(),
                     ),
                     fill: ParquetStreamWriter::new(
                         StreamKind::Fill,
                         fill_schema.clone(),
                         props.clone(),
                         handoff_tx.clone(),
+                        handoff_config.clone(),
                     ),
                 },
             );
         }
 
         Self {
-            blocks: ParquetStreamWriter::new(StreamKind::Blocks, blocks_schema, props.clone(), handoff_tx),
+            blocks: ParquetStreamWriter::new(
+                StreamKind::Blocks,
+                blocks_schema,
+                props.clone(),
+                handoff_tx,
+                handoff_config,
+            ),
             diff,
             coins,
             symbols,
@@ -2690,6 +2730,15 @@ fn local_recovery_logical_end(stream: StreamKind, observed_height: u64, window_e
     }
 }
 
+fn local_recovery_resume_end(
+    stream: StreamKind,
+    observed_height: u64,
+    window_end_block: u64,
+    last_row_block: u64,
+) -> u64 {
+    last_row_block.max(local_recovery_logical_end(stream, observed_height, window_end_block))
+}
+
 fn preflight_local_recovery_discontinuity<R: RecoverableArchiveRow>(
     stream: StreamKind,
     coin: &str,
@@ -2713,7 +2762,8 @@ fn preflight_local_recovery_discontinuity<R: RecoverableArchiveRow>(
         fs::remove_file(&path).map_err(io_to_parquet_error)?;
         return Ok(());
     }
-    if observed_height <= last_block.saturating_add(1) {
+    let resume_end_block = local_recovery_resume_end(stream, observed_height, window_end_block, last_block);
+    if observed_height <= resume_end_block.saturating_add(1) {
         return Ok(());
     }
 
@@ -2727,7 +2777,8 @@ fn preflight_local_recovery_discontinuity<R: RecoverableArchiveRow>(
     let staged_path = stage_local_file_for_handoff(&path)?;
     let relative_path = archive_relative_dir(stream, mode, coin)
         .join(format!("{}_{}_{}{}", filename_prefix, name_start_block, logical_end_block, FINAL_PARQUET_FILE_SUFFIX));
-    enqueue_handoff_task(handoff_tx, staged_path, relative_path)
+    let handoff_config = current_archive_handoff_config();
+    enqueue_handoff_task(handoff_tx, &handoff_config, staged_path, relative_path)
 }
 
 fn preflight_startup_local_recovery(
@@ -3030,11 +3081,11 @@ fn start_archive_handoff_worker(stop: Arc<AtomicBool>) -> ArchiveHandoffWorker {
 
 fn enqueue_handoff_task(
     handoff_tx: &Sender<HandoffMessage>,
+    config: &ArchiveHandoffConfig,
     path: PathBuf,
     relative_path: PathBuf,
 ) -> parquet::errors::Result<()> {
-    let config = current_archive_handoff_config();
-    let task = HandoffTask { path, relative_path, config };
+    let task = HandoffTask { path, relative_path, config: config.clone() };
     let task_path = task.path.display().to_string();
     handoff_tx.send(HandoffMessage::File(task)).map_err(|err| {
         io_to_parquet_error(io_other(format!("failed to enqueue archive handoff for {task_path}: {err}")))
@@ -4336,6 +4387,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
     let mut writers: Option<ArchiveWriters> = None;
     let mut current_mode: Option<ArchiveMode> = None;
     let mut current_symbols = current_archive_symbols();
+    let mut effective_stop_height = current_archive_stop_height();
     let mut bootstrap_checkpoint_evaluated = false;
     let mut startup_recovery_prepared = false;
     let mut start_alignment_wait_logged = false;
@@ -4371,6 +4423,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             writers = mode.map(|mode| ArchiveWriters::new(mode, symbols.clone(), handoff_tx.clone()));
             current_mode = mode;
             current_symbols = symbols;
+            effective_stop_height = current_archive_stop_height();
             bootstrap_checkpoint_evaluated = false;
             startup_recovery_prepared = false;
             start_alignment_wait_logged = false;
@@ -4548,6 +4601,11 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         }
 
         if !bootstrap_checkpoint_evaluated {
+            if effective_stop_height.is_none() {
+                if let Some(archive_height) = current_archive_height_span() {
+                    effective_stop_height = Some(height.saturating_add(archive_height).saturating_sub(1));
+                }
+            }
             bootstrap_checkpoint_evaluated = true;
             start_alignment_wait_logged = false;
             if current_archive_align_start_to_10k_boundary() {
@@ -4906,7 +4964,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         set_archive_phase(Some(height), "block_complete");
         last_input_height = Some(height);
 
-        if current_archive_stop_height().is_some_and(|stop_height| height >= stop_height) {
+        if effective_stop_height.is_some_and(|stop_height| height >= stop_height) {
             info!("Archive auto-stopping after reaching configured stop height {}", height);
             archive_thread_context(|ctx| {
                 if let Some(ctx) = ctx {
