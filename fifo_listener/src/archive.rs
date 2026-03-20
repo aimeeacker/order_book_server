@@ -1053,6 +1053,21 @@ fn archive_coin_dir(mode: ArchiveMode, coin: &str) -> PathBuf {
     }
 }
 
+fn archive_mode_filename_suffix(mode: ArchiveMode) -> &'static str {
+    match mode {
+        ArchiveMode::Lite => "",
+        ArchiveMode::Full => "_FULL",
+    }
+}
+
+fn archive_filename_prefix(stream: StreamKind, mode: ArchiveMode, coin: &str) -> String {
+    let suffix = archive_mode_filename_suffix(mode);
+    match stream {
+        StreamKind::Blocks => format!("blocks{suffix}"),
+        StreamKind::Fill | StreamKind::Diff | StreamKind::Status => format!("{}_{}{}", coin, stream.name(), suffix),
+    }
+}
+
 fn archive_relative_dir(stream: StreamKind, mode: ArchiveMode, coin: &str) -> PathBuf {
     match stream {
         StreamKind::Blocks => PathBuf::new(),
@@ -1302,7 +1317,7 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
     ) -> parquet::errors::Result<()> {
         let base_dir = current_archive_base_dir();
         let relative_dir = archive_relative_dir(self.stream, mode, coin);
-        let filename_prefix = local_recovery_filename_prefix(self.stream, coin);
+        let filename_prefix = local_recovery_filename_prefix(self.stream, mode, coin);
         let filename_suffix = FINAL_PARQUET_FILE_SUFFIX.to_string();
         fs::create_dir_all(&base_dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
         let mut effective_name_start = name_start;
@@ -1738,7 +1753,7 @@ impl StatusParquetWriter {
     ) -> parquet::errors::Result<()> {
         let base_dir = current_archive_base_dir();
         let relative_dir = archive_relative_dir(StreamKind::Status, self.mode, coin);
-        let filename_prefix = format!("{}_{}", coin, StreamKind::Status.name());
+        let filename_prefix = archive_filename_prefix(StreamKind::Status, self.mode, coin);
         let filename_suffix = ".parquet".to_string();
         fs::create_dir_all(&base_dir).map_err(io_to_parquet_error)?;
         let local_final_path = base_dir.join(format!("{filename_prefix}_{name_start}_{end}{filename_suffix}"));
@@ -2711,11 +2726,8 @@ fn find_local_recovery_path(
     Ok(None)
 }
 
-fn local_recovery_filename_prefix(stream: StreamKind, coin: &str) -> String {
-    match stream {
-        StreamKind::Blocks => "blocks".to_string(),
-        StreamKind::Fill | StreamKind::Diff | StreamKind::Status => format!("{}_{}", coin, stream.name()),
-    }
+fn local_recovery_filename_prefix(stream: StreamKind, mode: ArchiveMode, coin: &str) -> String {
+    archive_filename_prefix(stream, mode, coin)
 }
 
 fn local_recovery_logical_end(stream: StreamKind, observed_height: u64, window_end_block: u64) -> u64 {
@@ -2750,7 +2762,7 @@ fn preflight_local_recovery_discontinuity<R: RecoverableArchiveRow>(
         return Ok(());
     }
     let (_, window_end_block) = rotation_bounds_for(stream, observed_height);
-    let filename_prefix = local_recovery_filename_prefix(stream, coin);
+    let filename_prefix = local_recovery_filename_prefix(stream, mode, coin);
     let Some((path, name_start_block)) =
         find_local_recovery_path(&current_archive_base_dir(), &filename_prefix, window_end_block)?
     else {
