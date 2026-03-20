@@ -264,7 +264,7 @@ impl PyFifoListener {
         symbols=None,
         align_start_to_10k_boundary=true,
         align_output_to_1000_boundary=true,
-        enable_blocks_fill_local_recovery=false,
+        enable_blocks_fill_local_recovery=true,
         move_to_nas=true,
         nas_output_dir=None,
         upload_to_oss=false,
