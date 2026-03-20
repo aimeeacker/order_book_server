@@ -17,7 +17,9 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::writer::SerializedFileWriter;
+use parquet::record::RowAccessor;
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::Type;
 use reqwest::blocking::Client;
@@ -52,6 +54,7 @@ const DIFF_WORKER_QUEUE_BLOCKS: usize = 16;
 static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
 static ARCHIVE_ALIGN_START_TO_10K_BOUNDARY: AtomicBool = AtomicBool::new(true);
 static ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY: AtomicBool = AtomicBool::new(true);
+static ARCHIVE_ENABLE_BLOCKS_FILL_LOCAL_RECOVERY: AtomicBool = AtomicBool::new(false);
 static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
 static ARCHIVE_HANDOFF_CONFIG: OnceLock<Mutex<ArchiveHandoffConfig>> = OnceLock::new();
@@ -256,12 +259,20 @@ pub fn set_archive_align_output_to_1000_boundary(enabled: bool) {
     ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY.store(enabled, Ordering::SeqCst);
 }
 
+pub fn set_archive_enable_blocks_fill_local_recovery(enabled: bool) {
+    ARCHIVE_ENABLE_BLOCKS_FILL_LOCAL_RECOVERY.store(enabled, Ordering::SeqCst);
+}
+
 pub(crate) fn current_archive_align_start_to_10k_boundary() -> bool {
     ARCHIVE_ALIGN_START_TO_10K_BOUNDARY.load(Ordering::SeqCst)
 }
 
 pub(crate) fn current_archive_align_output_to_1000_boundary() -> bool {
     ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY.load(Ordering::SeqCst)
+}
+
+pub(crate) fn current_archive_enable_blocks_fill_local_recovery() -> bool {
+    ARCHIVE_ENABLE_BLOCKS_FILL_LOCAL_RECOVERY.load(Ordering::SeqCst)
 }
 
 pub(crate) fn get_archive_mode() -> Option<ArchiveMode> {
@@ -689,11 +700,17 @@ impl StreamKind {
             Self::Status => None,
         }
     }
+
+    fn supports_local_recovery(self) -> bool {
+        matches!(self, Self::Blocks | Self::Fill)
+    }
 }
 
 struct ParquetFile {
     writer: SerializedFileWriter<std::fs::File>,
     window_start_block: u64,
+    window_end_block: u64,
+    replay_skip_until_block: u64,
     name_start_block: u64,
     name_end_block: u64,
     last_block: u64,
@@ -787,6 +804,57 @@ trait HasBlockNumber {
     fn block_number(&self) -> u64;
 }
 
+trait RecoverableArchiveRow: HasBlockNumber + Sized {
+    fn read_local_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Result<Vec<Self>>;
+    fn write_rows(
+        file: &mut SerializedFileWriter<std::fs::File>,
+        mode: ArchiveMode,
+        rows: &[Self],
+    ) -> parquet::errors::Result<()>;
+}
+
+impl RecoverableArchiveRow for DiffOut {
+    fn read_local_rows(_path: &Path, _mode: ArchiveMode) -> parquet::errors::Result<Vec<Self>> {
+        Err(io_to_parquet_error(io_other("diff rows do not support local parquet recovery")))
+    }
+
+    fn write_rows(
+        file: &mut SerializedFileWriter<std::fs::File>,
+        mode: ArchiveMode,
+        rows: &[Self],
+    ) -> parquet::errors::Result<()> {
+        write_diff_rows(file, mode, rows)
+    }
+}
+
+impl RecoverableArchiveRow for FillOut {
+    fn read_local_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Result<Vec<Self>> {
+        read_local_fill_rows(path, mode)
+    }
+
+    fn write_rows(
+        file: &mut SerializedFileWriter<std::fs::File>,
+        mode: ArchiveMode,
+        rows: &[Self],
+    ) -> parquet::errors::Result<()> {
+        write_fill_rows(file, mode, rows)
+    }
+}
+
+impl RecoverableArchiveRow for BlockIndexOut {
+    fn read_local_rows(path: &Path, _mode: ArchiveMode) -> parquet::errors::Result<Vec<Self>> {
+        read_local_blocks_rows(path)
+    }
+
+    fn write_rows(
+        file: &mut SerializedFileWriter<std::fs::File>,
+        mode: ArchiveMode,
+        rows: &[Self],
+    ) -> parquet::errors::Result<()> {
+        write_block_rows(file, mode, rows)
+    }
+}
+
 impl<R: HasBlockNumber> PendingRowGroup<R> {
     fn trim_to_block(&mut self, max_block: u64) {
         self.rows.retain(|row| row.block_number() <= max_block);
@@ -811,7 +879,7 @@ struct ParquetStreamWriter<R> {
     delayed: PendingRowGroup<R>,
 }
 
-impl<R: HasBlockNumber> ParquetStreamWriter<R> {
+impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
     fn new(
         stream: StreamKind,
         schema: std::sync::Arc<Type>,
@@ -839,6 +907,50 @@ impl<R: HasBlockNumber> ParquetStreamWriter<R> {
         Ok(())
     }
 
+    fn supports_local_recovery(&self) -> bool {
+        self.stream.supports_local_recovery() && current_archive_enable_blocks_fill_local_recovery()
+    }
+
+    fn local_recovery_relative_path(
+        &self,
+        coin: &str,
+        mode: ArchiveMode,
+        name_start_block: u64,
+        last_block: u64,
+        filename_prefix: &str,
+        filename_suffix: &str,
+    ) -> PathBuf {
+        archive_relative_dir(self.stream, mode, coin)
+            .join(format!("{}_{}_{}{}", filename_prefix, name_start_block, last_block, filename_suffix))
+    }
+
+    fn load_local_recovery(
+        &self,
+        base_dir: &Path,
+        coin: &str,
+        mode: ArchiveMode,
+        window_end_block: u64,
+        filename_prefix: &str,
+        filename_suffix: &str,
+    ) -> parquet::errors::Result<Option<LocalRecoveryFile<R>>> {
+        if !self.supports_local_recovery() {
+            return Ok(None);
+        }
+        let Some((path, name_start_block)) = find_local_recovery_path(base_dir, filename_prefix, window_end_block)?
+        else {
+            return Ok(None);
+        };
+        let rows = R::read_local_rows(&path, mode)?;
+        let last_block = rows.last().map(HasBlockNumber::block_number).unwrap_or(0);
+        if last_block == 0 {
+            fs::remove_file(&path).map_err(io_to_parquet_error)?;
+            return Ok(None);
+        }
+        let _unused = filename_suffix;
+        let _unused = coin;
+        Ok(Some(LocalRecoveryFile { path, name_start_block, rows, last_block }))
+    }
+
     fn open_file(
         &mut self,
         coin: &str,
@@ -856,7 +968,26 @@ impl<R: HasBlockNumber> ParquetStreamWriter<R> {
         };
         let filename_suffix = ".parquet".to_string();
         fs::create_dir_all(&base_dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-        let local_final_path = base_dir.join(format!("{filename_prefix}_{name_start}_{end}{filename_suffix}"));
+        let mut effective_name_start = name_start;
+        let mut local_final_path = base_dir.join(format!("{filename_prefix}_{name_start}_{end}{filename_suffix}"));
+        let recovery = self.load_local_recovery(&base_dir, coin, mode, end, &filename_prefix, &filename_suffix)?;
+        if let Some(existing) = recovery.as_ref() {
+            if actual_start > existing.last_block.saturating_add(1) {
+                let staged_path = stage_local_file_for_handoff(&existing.path)?;
+                let relative_path = self.local_recovery_relative_path(
+                    coin,
+                    mode,
+                    existing.name_start_block,
+                    existing.last_block,
+                    &filename_prefix,
+                    &filename_suffix,
+                );
+                enqueue_handoff_task(&self.handoff_tx, staged_path, relative_path)?;
+            } else {
+                effective_name_start = existing.name_start_block;
+                local_final_path = existing.path.clone();
+            }
+        }
         let tmp_path = local_final_path.with_file_name(format!(
             "{}{}",
             local_final_path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet"),
@@ -866,13 +997,31 @@ impl<R: HasBlockNumber> ParquetStreamWriter<R> {
             fs::remove_file(&tmp_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
         }
         let file = fs::File::create(&tmp_path).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
-        let writer = SerializedFileWriter::new(file, self.schema.clone(), self.props.clone())?;
+        let mut writer = SerializedFileWriter::new(file, self.schema.clone(), self.props.clone())?;
+        let mut recovered_last_block = actual_start;
+        let mut replay_skip_until_block = 0;
+        if let Some(existing) = recovery {
+            if actual_start <= existing.last_block.saturating_add(1) {
+                rewrite_rows_into_writer(&mut writer, mode, self.stream, existing.rows, R::write_rows)?;
+                recovered_last_block = existing.last_block;
+                replay_skip_until_block = existing.last_block;
+                info!(
+                    "Recovered local {} parquet for {} window_end={} last_block={} and resumed writer",
+                    self.stream.name(),
+                    coin,
+                    end,
+                    recovered_last_block
+                );
+            }
+        }
         self.file = Some(ParquetFile {
             writer,
             window_start_block: window_start,
-            name_start_block: name_start,
-            name_end_block: actual_start,
-            last_block: actual_start,
+            window_end_block: end,
+            replay_skip_until_block,
+            name_start_block: effective_name_start,
+            name_end_block: recovered_last_block,
+            last_block: recovered_last_block,
             tmp_path,
             local_final_path,
             relative_dir,
@@ -894,7 +1043,14 @@ impl<R: HasBlockNumber> ParquetStreamWriter<R> {
             file.writer.close()?;
             fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
             let span_blocks = file.name_end_block.saturating_sub(file.name_start_block) + 1;
-            if span_blocks < MIN_HANDOFF_BLOCK_SPAN {
+            if self.supports_local_recovery() && file.name_end_block < file.window_end_block {
+                info!(
+                    "Archive finalized locally without handoff for {} span={} path={}",
+                    self.stream.name(),
+                    span_blocks,
+                    final_path.display()
+                );
+            } else if span_blocks < MIN_HANDOFF_BLOCK_SPAN {
                 info!(
                     "Archive finalized but dropping short parquet span={} path={}",
                     span_blocks,
@@ -1031,6 +1187,11 @@ impl<R: HasBlockNumber> ParquetStreamWriter<R> {
         F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
     {
         let mut flushed = false;
+        if self.file.as_ref().is_some_and(|file| {
+            self.supports_local_recovery() && file.replay_skip_until_block > 0 && block <= file.replay_skip_until_block
+        }) {
+            return Ok(false);
+        }
         let current_start = self.file.as_ref().map(|current| current.window_start_block);
         let next_start = rotation_bounds_for(self.stream, block).0;
         if self.file.is_none() {
@@ -1079,6 +1240,11 @@ impl<R: HasBlockNumber> ParquetStreamWriter<R> {
             return Ok(false);
         }
         self.ensure_open(coin, mode, block)?;
+        if self.file.as_ref().is_some_and(|file| {
+            self.supports_local_recovery() && file.replay_skip_until_block > 0 && block <= file.replay_skip_until_block
+        }) {
+            return Ok(false);
+        }
         let mut flushed = false;
         if let Some(file) = self.file.as_mut() {
             file.last_block = block;
@@ -1244,6 +1410,8 @@ impl StatusParquetWriter {
         self.file = Some(ParquetFile {
             writer,
             window_start_block: window_start,
+            window_end_block: end,
+            replay_skip_until_block: 0,
             name_start_block: name_start,
             name_end_block: actual_start,
             last_block: actual_start,
@@ -1451,12 +1619,13 @@ impl DiffWorkerHandle {
                                     continue;
                                 };
                                 let rows = rows_by_coin.remove(coin).unwrap_or_default();
-                                let flushed =
-                                    writer.advance_block(mode, height, write_diff_rows).and_then(|advance_flushed| {
+                                let flushed = writer.advance_block(mode, height, write_diff_rows).and_then(
+                                    |advance_flushed| {
                                         writer
                                             .append_rows(coin, mode, height, rows, write_diff_rows)
                                             .map(|append_flushed| advance_flushed || append_flushed)
-                                    })?;
+                                    },
+                                )?;
                                 if flushed && idx + 1 < symbols.len() {
                                     thread::sleep(DIFF_STAGGER_DELAY);
                                 }
@@ -1949,6 +2118,196 @@ where
 
 fn io_other<M: Into<String>>(msg: M) -> std::io::Error {
     std::io::Error::other(msg.into())
+}
+
+#[derive(Debug)]
+struct LocalRecoveryFile<R> {
+    path: PathBuf,
+    name_start_block: u64,
+    rows: Vec<R>,
+    last_block: u64,
+}
+
+fn parse_local_archive_filename_bounds(path: &Path, filename_prefix: &str) -> Option<(u64, u64)> {
+    let stem = path.file_stem()?.to_str()?;
+    let prefix = format!("{filename_prefix}_");
+    let remainder = stem.strip_prefix(&prefix)?;
+    let (start, end) = remainder.rsplit_once('_')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
+}
+
+fn find_local_recovery_path(
+    base_dir: &Path,
+    filename_prefix: &str,
+    window_end_block: u64,
+) -> parquet::errors::Result<Option<(PathBuf, u64)>> {
+    let Ok(entries) = fs::read_dir(base_dir) else {
+        return Ok(None);
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_to_parquet_error)?;
+        let path = entry.path();
+        if !entry.file_type().map_err(io_to_parquet_error)?.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("parquet") {
+            continue;
+        }
+        let Some((name_start_block, name_end_block)) = parse_local_archive_filename_bounds(&path, filename_prefix)
+        else {
+            continue;
+        };
+        if name_end_block == window_end_block {
+            return Ok(Some((path, name_start_block)));
+        }
+    }
+    Ok(None)
+}
+
+fn rewrite_rows_into_writer<R, F>(
+    writer: &mut SerializedFileWriter<std::fs::File>,
+    mode: ArchiveMode,
+    stream: StreamKind,
+    rows: Vec<R>,
+    write_rows: F,
+) -> parquet::errors::Result<()>
+where
+    R: HasBlockNumber,
+    F: Copy + Fn(&mut SerializedFileWriter<std::fs::File>, ArchiveMode, &[R]) -> parquet::errors::Result<()>,
+{
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let Some(span) = stream.row_group_block_limit() else {
+        return write_rows(writer, mode, &rows);
+    };
+    let mut batch = Vec::new();
+    let mut current_end = None;
+    for row in rows {
+        let block = row.block_number();
+        let (_, next_end) = aligned_row_group_bounds(block, span);
+        if current_end.is_some_and(|end| block > end) && !batch.is_empty() {
+            write_rows(writer, mode, &batch)?;
+            batch.clear();
+        }
+        current_end = Some(next_end);
+        batch.push(row);
+    }
+    if !batch.is_empty() {
+        write_rows(writer, mode, &batch)?;
+    }
+    Ok(())
+}
+
+fn stage_local_file_for_handoff(path: &Path) -> parquet::errors::Result<PathBuf> {
+    let staged = path.with_file_name(format!(
+        "{}.handoff",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or("archive.parquet")
+    ));
+    if staged.exists() {
+        fs::remove_file(&staged).map_err(io_to_parquet_error)?;
+    }
+    fs::rename(path, &staged).map_err(io_to_parquet_error)?;
+    Ok(staged)
+}
+
+fn read_local_blocks_rows(path: &Path) -> parquet::errors::Result<Vec<BlockIndexOut>> {
+    let reader = SerializedFileReader::try_from(path).map_err(io_to_parquet_error)?;
+    let iter = reader.get_row_iter(None).map_err(io_to_parquet_error)?;
+    let mut rows = Vec::new();
+    for row in iter {
+        let row = row.map_err(io_to_parquet_error)?;
+        rows.push(BlockIndexOut {
+            block_number: row.get_long(0).map_err(io_to_parquet_error)? as u64,
+            block_time: row.get_string(1).map_err(io_to_parquet_error)?.clone(),
+            order_batch_ok: row.get_bool(2).map_err(io_to_parquet_error)?,
+            diff_batch_ok: row.get_bool(3).map_err(io_to_parquet_error)?,
+            fill_batch_ok: row.get_bool(4).map_err(io_to_parquet_error)?,
+            order_n: row.get_int(5).map_err(io_to_parquet_error)?,
+            diff_n: row.get_int(6).map_err(io_to_parquet_error)?,
+            fill_n: row.get_int(7).map_err(io_to_parquet_error)?,
+            btc_status_n: row.get_int(8).map_err(io_to_parquet_error)?,
+            btc_diff_n: row.get_int(9).map_err(io_to_parquet_error)?,
+            btc_fill_n: row.get_int(10).map_err(io_to_parquet_error)?,
+            eth_status_n: row.get_int(11).map_err(io_to_parquet_error)?,
+            eth_diff_n: row.get_int(12).map_err(io_to_parquet_error)?,
+            eth_fill_n: row.get_int(13).map_err(io_to_parquet_error)?,
+            archive_mode: row.get_string(14).map_err(io_to_parquet_error)?.clone(),
+            tracked_symbols: row.get_string(15).map_err(io_to_parquet_error)?.clone(),
+        });
+    }
+    Ok(rows)
+}
+
+fn read_local_fill_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Result<Vec<FillOut>> {
+    let reader = SerializedFileReader::try_from(path).map_err(io_to_parquet_error)?;
+    let iter = reader.get_row_iter(None).map_err(io_to_parquet_error)?;
+    let mut rows = Vec::new();
+    for row in iter {
+        let row = row.map_err(io_to_parquet_error)?;
+        let mut out = FillOut {
+            block_number: row.get_long(0).map_err(io_to_parquet_error)? as u64,
+            block_time: row.get_string(1).map_err(io_to_parquet_error)?.clone(),
+            coin: row.get_string(2).map_err(io_to_parquet_error)?.clone(),
+            side: row.get_string(3).map_err(io_to_parquet_error)?.clone(),
+            px: decimal_to_i64(row.get_decimal(4).map_err(io_to_parquet_error)?)?,
+            sz: decimal_to_i64(row.get_decimal(5).map_err(io_to_parquet_error)?)?,
+            crossed: row.get_bool(6).map_err(io_to_parquet_error)?,
+            address: String::new(),
+            closed_pnl: 0,
+            fee: 0,
+            hash: String::new(),
+            oid: 0,
+            tid: 0,
+            time: 0,
+            start_position: 0,
+            dir: String::new(),
+            fee_token: String::new(),
+            twap_id: 0,
+            raw_event: String::new(),
+        };
+        match mode {
+            ArchiveMode::Lite => {
+                out.oid = row.get_long(7).map_err(io_to_parquet_error)? as u64;
+                out.time = row.get_long(8).map_err(io_to_parquet_error)?;
+            }
+            ArchiveMode::Full => {
+                out.address = row.get_string(7).map_err(io_to_parquet_error)?.clone();
+                out.closed_pnl = decimal_to_i64(row.get_decimal(8).map_err(io_to_parquet_error)?)?;
+                out.fee = decimal_to_i64(row.get_decimal(9).map_err(io_to_parquet_error)?)?;
+                out.hash = row.get_string(10).map_err(io_to_parquet_error)?.clone();
+                out.oid = row.get_long(11).map_err(io_to_parquet_error)? as u64;
+                out.tid = row.get_long(12).map_err(io_to_parquet_error)? as u64;
+                out.time = row.get_long(13).map_err(io_to_parquet_error)?;
+                out.start_position = decimal_to_i64(row.get_decimal(14).map_err(io_to_parquet_error)?)?;
+                out.dir = row.get_string(15).map_err(io_to_parquet_error)?.clone();
+                out.fee_token = row.get_string(16).map_err(io_to_parquet_error)?.clone();
+                out.twap_id = row.get_long(17).map_err(io_to_parquet_error)?;
+                out.raw_event = row.get_string(18).map_err(io_to_parquet_error)?.clone();
+            }
+        }
+        rows.push(out);
+    }
+    Ok(rows)
+}
+
+fn decimal_to_i64(value: &parquet::data_type::Decimal) -> parquet::errors::Result<i64> {
+    let data = value.data();
+    match data.len() {
+        8 => {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(data);
+            Ok(i64::from_be_bytes(bytes))
+        }
+        4 => {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(data);
+            Ok(i32::from_be_bytes(bytes) as i64)
+        }
+        len => Err(io_to_parquet_error(io_other(format!(
+            "unsupported decimal width {len} while decoding recovered parquet rows"
+        )))),
+    }
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -3912,5 +4271,207 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
     drop(handoff_worker_tx);
     if let Err(err) = handle.join() {
         warn!("Archive handoff worker panicked: {err:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock before epoch").as_nanos();
+        let dir = std::env::temp_dir().join(format!("fifo_listener_{label}_{nanos}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn parse_local_archive_filename_bounds_works() {
+        let path = Path::new("/tmp/BTC_fill_928200001_929000000.parquet");
+        assert_eq!(parse_local_archive_filename_bounds(path, "BTC_fill"), Some((928200001, 929000000)));
+    }
+
+    #[test]
+    fn blocks_local_recovery_resumes_without_duplicates() {
+        let _guard = test_lock();
+        let base_dir = unique_temp_dir("blocks_recovery");
+        let previous_base_dir = current_archive_base_dir();
+        let previous_align = current_archive_align_output_to_1000_boundary();
+        let previous_recovery = current_archive_enable_blocks_fill_local_recovery();
+        let previous_handoff = current_archive_handoff_config();
+        set_archive_base_dir(Some(base_dir.clone()));
+        set_archive_align_output_to_1000_boundary(false);
+        set_archive_enable_blocks_fill_local_recovery(true);
+        set_archive_handoff_config(ArchiveHandoffConfig::new(false, Some(base_dir.clone()), false, None));
+
+        let schema = std::sync::Arc::new(
+            parse_message_type(
+                "message blocks_schema {\n\
+                    REQUIRED INT64 block_number;\n\
+                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED BOOLEAN order_batch_ok;\n\
+                    REQUIRED BOOLEAN diff_batch_ok;\n\
+                    REQUIRED BOOLEAN fill_batch_ok;\n\
+                    REQUIRED INT32 order_n;\n\
+                    REQUIRED INT32 diff_n;\n\
+                    REQUIRED INT32 fill_n;\n\
+                    REQUIRED INT32 btc_status_n;\n\
+                    REQUIRED INT32 btc_diff_n;\n\
+                    REQUIRED INT32 btc_fill_n;\n\
+                    REQUIRED INT32 eth_status_n;\n\
+                    REQUIRED INT32 eth_diff_n;\n\
+                    REQUIRED INT32 eth_fill_n;\n\
+                    REQUIRED BINARY archive_mode (UTF8);\n\
+                    REQUIRED BINARY tracked_symbols (UTF8);\n\
+                }",
+            )
+            .expect("invalid blocks schema"),
+        );
+        let props = std::sync::Arc::new(WriterProperties::builder().set_dictionary_enabled(true).build());
+        let (handoff_tx, _handoff_rx) = channel::<HandoffMessage>();
+
+        let make_row = |block_number: u64| BlockIndexOut {
+            block_number,
+            block_time: format!("t{block_number}"),
+            order_batch_ok: true,
+            diff_batch_ok: true,
+            fill_batch_ok: true,
+            order_n: 1,
+            diff_n: 2,
+            fill_n: 3,
+            btc_status_n: 4,
+            btc_diff_n: 5,
+            btc_fill_n: 6,
+            eth_status_n: 7,
+            eth_diff_n: 8,
+            eth_fill_n: 9,
+            archive_mode: "lite".to_string(),
+            tracked_symbols: "BTC,ETH".to_string(),
+        };
+
+        let mut writer =
+            ParquetStreamWriter::new(StreamKind::Blocks, schema.clone(), props.clone(), handoff_tx.clone());
+        writer.advance_block(ArchiveMode::Lite, 1001, write_block_rows).expect("advance 1001");
+        writer
+            .append_rows("blocks", ArchiveMode::Lite, 1001, vec![make_row(1001)], write_block_rows)
+            .expect("append 1001");
+        writer.advance_block(ArchiveMode::Lite, 1002, write_block_rows).expect("advance 1002");
+        writer
+            .append_rows("blocks", ArchiveMode::Lite, 1002, vec![make_row(1002)], write_block_rows)
+            .expect("append 1002");
+        writer.close_with_flush(ArchiveMode::Lite, write_block_rows).expect("close first writer");
+
+        let mut recovered =
+            ParquetStreamWriter::new(StreamKind::Blocks, schema.clone(), props.clone(), handoff_tx.clone());
+        recovered.advance_block(ArchiveMode::Lite, 1001, write_block_rows).expect("re-advance 1001");
+        recovered
+            .append_rows("blocks", ArchiveMode::Lite, 1001, vec![make_row(1001)], write_block_rows)
+            .expect("re-append 1001");
+        recovered.advance_block(ArchiveMode::Lite, 1003, write_block_rows).expect("advance 1003");
+        recovered
+            .append_rows("blocks", ArchiveMode::Lite, 1003, vec![make_row(1003)], write_block_rows)
+            .expect("append 1003");
+        recovered.close_with_flush(ArchiveMode::Lite, write_block_rows).expect("close recovered writer");
+
+        let final_path = base_dir.join("blocks_1001_1000000.parquet");
+        let rows = read_local_blocks_rows(&final_path).expect("read recovered blocks parquet");
+        let heights: Vec<u64> = rows.iter().map(|row| row.block_number).collect();
+        assert_eq!(heights, vec![1001, 1002, 1003]);
+
+        set_archive_handoff_config(previous_handoff);
+        set_archive_enable_blocks_fill_local_recovery(previous_recovery);
+        set_archive_align_output_to_1000_boundary(previous_align);
+        set_archive_base_dir(Some(previous_base_dir));
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn fill_lite_local_reader_round_trips() {
+        let _guard = test_lock();
+        let dir = unique_temp_dir("fill_reader");
+        let path = dir.join("BTC_fill_928200001_929000000.parquet");
+        let schema = std::sync::Arc::new(
+            parse_message_type(
+                "message fill_schema {\n\
+                    REQUIRED INT64 block_number;\n\
+                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED BINARY coin (UTF8);\n\
+                    REQUIRED BINARY side (UTF8);\n\
+                    REQUIRED INT64 px (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                    REQUIRED BOOLEAN crossed;\n\
+                    REQUIRED INT64 oid;\n\
+                    REQUIRED INT64 time;\n\
+                }",
+            )
+            .expect("invalid fill schema"),
+        );
+        let file = fs::File::create(&path).expect("create fill parquet");
+        let mut writer =
+            SerializedFileWriter::new(file, schema, std::sync::Arc::new(WriterProperties::builder().build()))
+                .expect("create writer");
+        let rows = vec![
+            FillOut {
+                block_number: 928200002,
+                block_time: "t1".to_string(),
+                coin: "BTC".to_string(),
+                side: "B".to_string(),
+                px: 11,
+                sz: 22,
+                crossed: false,
+                address: String::new(),
+                closed_pnl: 0,
+                fee: 0,
+                hash: String::new(),
+                oid: 33,
+                tid: 0,
+                time: 44,
+                start_position: 0,
+                dir: String::new(),
+                fee_token: String::new(),
+                twap_id: 0,
+                raw_event: String::new(),
+            },
+            FillOut {
+                block_number: 928200010,
+                block_time: "t2".to_string(),
+                coin: "BTC".to_string(),
+                side: "A".to_string(),
+                px: 55,
+                sz: 66,
+                crossed: true,
+                address: String::new(),
+                closed_pnl: 0,
+                fee: 0,
+                hash: String::new(),
+                oid: 77,
+                tid: 0,
+                time: 88,
+                start_position: 0,
+                dir: String::new(),
+                fee_token: String::new(),
+                twap_id: 0,
+                raw_event: String::new(),
+            },
+        ];
+        write_fill_rows(&mut writer, ArchiveMode::Lite, &rows).expect("write fill rows");
+        writer.close().expect("close fill writer");
+
+        let recovered = read_local_fill_rows(&path, ArchiveMode::Lite).expect("read fill rows");
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(recovered[0].block_number, 928200002);
+        assert_eq!(recovered[0].oid, 33);
+        assert_eq!(recovered[1].block_number, 928200010);
+        assert_eq!(recovered[1].time, 88);
+
+        fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 }
