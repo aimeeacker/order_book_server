@@ -54,7 +54,7 @@ const DIFF_WORKER_QUEUE_BLOCKS: usize = 16;
 static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
 static ARCHIVE_ALIGN_START_TO_10K_BOUNDARY: AtomicBool = AtomicBool::new(true);
 static ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY: AtomicBool = AtomicBool::new(true);
-static ARCHIVE_ENABLE_BLOCKS_FILL_LOCAL_RECOVERY: AtomicBool = AtomicBool::new(false);
+static ARCHIVE_RECOVER_BLOCKS_FILL_ON_STOP: AtomicBool = AtomicBool::new(false);
 static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
 static ARCHIVE_HANDOFF_CONFIG: OnceLock<Mutex<ArchiveHandoffConfig>> = OnceLock::new();
@@ -259,8 +259,8 @@ pub fn set_archive_align_output_to_1000_boundary(enabled: bool) {
     ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY.store(enabled, Ordering::SeqCst);
 }
 
-pub fn set_archive_enable_blocks_fill_local_recovery(enabled: bool) {
-    ARCHIVE_ENABLE_BLOCKS_FILL_LOCAL_RECOVERY.store(enabled, Ordering::SeqCst);
+pub fn set_archive_recover_blocks_fill_on_stop(enabled: bool) {
+    ARCHIVE_RECOVER_BLOCKS_FILL_ON_STOP.store(enabled, Ordering::SeqCst);
 }
 
 pub(crate) fn current_archive_align_start_to_10k_boundary() -> bool {
@@ -271,8 +271,8 @@ pub(crate) fn current_archive_align_output_to_1000_boundary() -> bool {
     ARCHIVE_ALIGN_OUTPUT_TO_1000_BOUNDARY.load(Ordering::SeqCst)
 }
 
-pub(crate) fn current_archive_enable_blocks_fill_local_recovery() -> bool {
-    ARCHIVE_ENABLE_BLOCKS_FILL_LOCAL_RECOVERY.load(Ordering::SeqCst)
+pub(crate) fn current_archive_recover_blocks_fill_on_stop() -> bool {
+    ARCHIVE_RECOVER_BLOCKS_FILL_ON_STOP.load(Ordering::SeqCst)
 }
 
 pub(crate) fn get_archive_mode() -> Option<ArchiveMode> {
@@ -908,7 +908,11 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
     }
 
     fn supports_local_recovery(&self) -> bool {
-        self.stream.supports_local_recovery() && current_archive_enable_blocks_fill_local_recovery()
+        self.stream.supports_local_recovery()
+    }
+
+    fn keep_local_on_close(&self) -> bool {
+        self.stream.supports_local_recovery() && current_archive_recover_blocks_fill_on_stop()
     }
 
     fn local_recovery_relative_path(
@@ -1043,7 +1047,7 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
             file.writer.close()?;
             fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
             let span_blocks = file.name_end_block.saturating_sub(file.name_start_block) + 1;
-            if self.supports_local_recovery() && file.name_end_block < file.window_end_block {
+            if self.keep_local_on_close() && file.name_end_block < file.window_end_block {
                 info!(
                     "Archive finalized locally without handoff for {} span={} path={}",
                     self.stream.name(),
@@ -4305,11 +4309,11 @@ mod tests {
         let base_dir = unique_temp_dir("blocks_recovery");
         let previous_base_dir = current_archive_base_dir();
         let previous_align = current_archive_align_output_to_1000_boundary();
-        let previous_recovery = current_archive_enable_blocks_fill_local_recovery();
+        let previous_recovery = current_archive_recover_blocks_fill_on_stop();
         let previous_handoff = current_archive_handoff_config();
         set_archive_base_dir(Some(base_dir.clone()));
         set_archive_align_output_to_1000_boundary(false);
-        set_archive_enable_blocks_fill_local_recovery(true);
+        set_archive_recover_blocks_fill_on_stop(true);
         set_archive_handoff_config(ArchiveHandoffConfig::new(false, Some(base_dir.clone()), false, None));
 
         let schema = std::sync::Arc::new(
@@ -4387,7 +4391,7 @@ mod tests {
         assert_eq!(heights, vec![1001, 1002, 1003]);
 
         set_archive_handoff_config(previous_handoff);
-        set_archive_enable_blocks_fill_local_recovery(previous_recovery);
+        set_archive_recover_blocks_fill_on_stop(previous_recovery);
         set_archive_align_output_to_1000_boundary(previous_align);
         set_archive_base_dir(Some(previous_base_dir));
         fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
