@@ -75,6 +75,7 @@ fn build_archive_session_options(
     rotation_blocks: Option<u64>,
     output_dir: Option<PathBuf>,
     symbols: Option<Vec<String>>,
+    stop_height: Option<u64>,
     align_start_to_10k_boundary: bool,
     align_output_to_1000_boundary: bool,
     move_to_nas: bool,
@@ -111,6 +112,7 @@ fn build_archive_session_options(
         rotation_blocks: rotation_blocks.unwrap_or_else(current_rotation_blocks_value),
         output_dir,
         symbols,
+        stop_height,
         align_start_to_10k_boundary,
         align_output_to_1000_boundary,
         handoff,
@@ -281,11 +283,19 @@ impl PyFifoListener {
         Ok(())
     }
 
+    fn request_shutdown(&self) -> PyResult<()> {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.request_shutdown();
+        }
+        Ok(())
+    }
+
     #[pyo3(signature = (
         mode=None,
         rotation_blocks=None,
         output_dir=None,
         symbols=None,
+        stop_height=None,
         align_start_to_10k_boundary=true,
         align_output_to_1000_boundary=true,
         move_to_nas=true,
@@ -303,6 +313,7 @@ impl PyFifoListener {
         rotation_blocks: Option<u64>,
         output_dir: Option<PathBuf>,
         symbols: Option<Vec<String>>,
+        stop_height: Option<u64>,
         align_start_to_10k_boundary: bool,
         align_output_to_1000_boundary: bool,
         move_to_nas: bool,
@@ -319,6 +330,7 @@ impl PyFifoListener {
             rotation_blocks,
             output_dir,
             symbols,
+            stop_height,
             align_start_to_10k_boundary,
             align_output_to_1000_boundary,
             move_to_nas,

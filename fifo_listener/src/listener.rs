@@ -93,10 +93,14 @@ pub struct ListenerHandle {
 }
 
 impl ListenerHandle {
-    pub fn stop(self) {
+    pub fn request_shutdown(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        stop_all_archive_sessions(false);
         signal_eventfd(self.stop_eventfd);
+    }
+
+    pub fn stop(self) {
+        self.request_shutdown();
+        stop_all_archive_sessions(false);
         for thread in self.threads {
             let _unused = thread.join();
         }
@@ -876,6 +880,24 @@ fn run_aggregator(rx: Receiver<StreamLine>, stop: Arc<AtomicBool>, callback: Opt
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 input_disconnected = true;
             }
+        }
+
+        if stop.load(Ordering::SeqCst) {
+            if !queues.order.is_empty() || !queues.diffs.is_empty() || !queues.fills.is_empty() {
+                warn!(
+                    "Aggregator shutdown dropping queued lines: order={} diffs={} fills={}",
+                    queues.order.len(),
+                    queues.diffs.len(),
+                    queues.fills.len()
+                );
+                queues.order.clear();
+                queues.diffs.clear();
+                queues.fills.clear();
+            }
+            if input_disconnected {
+                break;
+            }
+            continue;
         }
 
         while queues.order.len() > MAX_PENDING_HEIGHTS {

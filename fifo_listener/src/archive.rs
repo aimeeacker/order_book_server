@@ -52,6 +52,7 @@ const BLOCKS_FILL_DELAYED_FLUSH_LOOKAHEAD_BLOCKS: u64 = 2_000;
 const MIN_HANDOFF_BLOCK_SPAN: u64 = 5_000;
 const MIN_ARCHIVE_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_DISK_USED_BPS: u64 = 9_500;
+const MAX_CONCURRENT_HANDOFF_TASKS: usize = 15;
 const STATUS_WORKER_QUEUE_BLOCKS: usize = 16;
 const DIFF_WORKER_QUEUE_BLOCKS: usize = 16;
 static ROTATION_BLOCKS: AtomicU64 = AtomicU64::new(100_000);
@@ -82,6 +83,7 @@ pub struct ArchiveSessionOptions {
     pub rotation_blocks: u64,
     pub output_dir: PathBuf,
     pub symbols: Vec<String>,
+    pub stop_height: Option<u64>,
     pub align_start_to_10k_boundary: bool,
     pub align_output_to_1000_boundary: bool,
     pub handoff: ArchiveHandoffConfig,
@@ -91,9 +93,12 @@ pub struct ArchiveSessionOptions {
 struct ArchiveThreadContext {
     mode: ArchiveMode,
     enabled: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
+    phase_state: Arc<Mutex<ArchivePhaseState>>,
     rotation_blocks: u64,
     base_dir: PathBuf,
     symbols: Vec<String>,
+    stop_height: Option<u64>,
     handoff: ArchiveHandoffConfig,
     align_start_to_10k_boundary: bool,
     align_output_to_1000_boundary: bool,
@@ -104,14 +109,19 @@ impl ArchiveThreadContext {
     fn from_options(
         options: &ArchiveSessionOptions,
         enabled: Arc<AtomicBool>,
+        stop_requested: Arc<AtomicBool>,
+        phase_state: Arc<Mutex<ArchivePhaseState>>,
         recover_blocks_fill_on_stop: Arc<AtomicBool>,
     ) -> Self {
         Self {
             mode: options.mode,
             enabled,
+            stop_requested,
+            phase_state,
             rotation_blocks: options.rotation_blocks,
             base_dir: options.output_dir.clone(),
             symbols: options.symbols.clone(),
+            stop_height: options.stop_height,
             handoff: options.handoff.clone(),
             align_start_to_10k_boundary: options.align_start_to_10k_boundary,
             align_output_to_1000_boundary: options.align_output_to_1000_boundary,
@@ -123,8 +133,23 @@ impl ArchiveThreadContext {
 struct ArchiveSessionHandle {
     tx: SyncSender<ArchiveBlock>,
     enabled: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
+    phase_state: Arc<Mutex<ArchivePhaseState>>,
     recover_blocks_fill_on_stop: Arc<AtomicBool>,
     join_handle: thread::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct ArchivePhaseState {
+    block_height: Option<u64>,
+    phase: String,
+    phase_since: Instant,
+}
+
+impl Default for ArchivePhaseState {
+    fn default() -> Self {
+        Self { block_height: None, phase: "starting".to_string(), phase_since: Instant::now() }
+    }
 }
 
 #[derive(Default)]
@@ -384,6 +409,26 @@ pub(crate) fn current_archive_recover_blocks_fill_on_stop() -> bool {
         .unwrap_or_else(|| ARCHIVE_RECOVER_BLOCKS_FILL_ON_STOP.load(Ordering::SeqCst))
 }
 
+pub(crate) fn current_archive_stop_height() -> Option<u64> {
+    archive_thread_context(|ctx| ctx.and_then(|ctx| ctx.stop_height))
+}
+
+pub(crate) fn current_archive_stop_requested() -> bool {
+    archive_thread_context(|ctx| ctx.map(|ctx| ctx.stop_requested.load(Ordering::SeqCst))).unwrap_or(false)
+}
+
+fn set_archive_phase(block_height: Option<u64>, phase: impl Into<String>) {
+    archive_thread_context(|ctx| {
+        if let Some(ctx) = ctx {
+            if let Ok(mut state) = ctx.phase_state.lock() {
+                state.block_height = block_height;
+                state.phase = phase.into();
+                state.phase_since = Instant::now();
+            }
+        }
+    });
+}
+
 pub(crate) fn get_archive_mode() -> Option<ArchiveMode> {
     if let Some(mode) =
         archive_thread_context(|ctx| ctx.and_then(|ctx| ctx.enabled.load(Ordering::SeqCst).then_some(ctx.mode)))
@@ -404,18 +449,26 @@ pub fn start_archive_session(options: ArchiveSessionOptions) -> ArchiveSessionId
     registry.next_id = registry.next_id.saturating_add(1);
     let (tx, rx) = sync_channel(ARCHIVE_QUEUE_BLOCKS);
     let enabled = Arc::new(AtomicBool::new(true));
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let phase_state = Arc::new(Mutex::new(ArchivePhaseState::default()));
     let recover_blocks_fill_on_stop = Arc::new(AtomicBool::new(false));
-    let thread_context =
-        ArchiveThreadContext::from_options(&options, enabled.clone(), recover_blocks_fill_on_stop.clone());
-    let stop = enabled.clone();
+    let thread_context = ArchiveThreadContext::from_options(
+        &options,
+        enabled.clone(),
+        stop_requested.clone(),
+        phase_state.clone(),
+        recover_blocks_fill_on_stop.clone(),
+    );
+    let stop = stop_requested.clone();
     let join_handle = thread::spawn(move || {
         set_archive_thread_context(Some(thread_context));
         run_archive_writer(rx, stop);
         set_archive_thread_context(None);
     });
-    registry
-        .sessions
-        .insert(session_id, ArchiveSessionHandle { tx, enabled, recover_blocks_fill_on_stop, join_handle });
+    registry.sessions.insert(
+        session_id,
+        ArchiveSessionHandle { tx, enabled, stop_requested, phase_state, recover_blocks_fill_on_stop, join_handle },
+    );
     session_id
 }
 
@@ -428,10 +481,28 @@ pub fn stop_archive_session(session_id: ArchiveSessionId, recover_blocks_fill_lo
         return false;
     };
     handle.recover_blocks_fill_on_stop.store(recover_blocks_fill_locally, Ordering::SeqCst);
+    handle.stop_requested.store(true, Ordering::SeqCst);
     handle.enabled.store(false, Ordering::SeqCst);
     drop(handle.tx);
+    while !handle.join_handle.is_finished() {
+        thread::sleep(Duration::from_secs(5));
+        if handle.join_handle.is_finished() {
+            break;
+        }
+        if let Ok(state) = handle.phase_state.lock() {
+            warn!(
+                "Archive session {} stop stuck phase={} block={:?} elapsed_ms={}",
+                session_id,
+                state.phase,
+                state.block_height,
+                state.phase_since.elapsed().as_millis()
+            );
+        }
+    }
     if let Err(err) = handle.join_handle.join() {
         warn!("Archive session {session_id} panicked while stopping: {err:?}");
+    } else {
+        warn!("Archive session {} thread exited", session_id);
     }
     true
 }
@@ -443,10 +514,28 @@ pub fn stop_all_archive_sessions(recover_blocks_fill_locally: bool) {
     };
     for (session_id, handle) in handles {
         handle.recover_blocks_fill_on_stop.store(recover_blocks_fill_locally, Ordering::SeqCst);
+        handle.stop_requested.store(true, Ordering::SeqCst);
         handle.enabled.store(false, Ordering::SeqCst);
         drop(handle.tx);
+        while !handle.join_handle.is_finished() {
+            thread::sleep(Duration::from_secs(5));
+            if handle.join_handle.is_finished() {
+                break;
+            }
+            if let Ok(state) = handle.phase_state.lock() {
+                warn!(
+                    "Archive session {} stop stuck phase={} block={:?} elapsed_ms={}",
+                    session_id,
+                    state.phase,
+                    state.block_height,
+                    state.phase_since.elapsed().as_millis()
+                );
+            }
+        }
         if let Err(err) = handle.join_handle.join() {
             warn!("Archive session {session_id} panicked while stopping: {err:?}");
+        } else {
+            warn!("Archive session {} thread exited via stop-all", session_id);
         }
     }
 }
@@ -458,7 +547,12 @@ pub(crate) fn has_archive_sessions() -> bool {
 pub(crate) fn dispatch_archive_block(block: ArchiveBlock, shutdown: bool) {
     let session_txs: Vec<(ArchiveSessionId, SyncSender<ArchiveBlock>)> = {
         let registry = archive_session_registry().lock().expect("archive session registry");
-        registry.sessions.iter().map(|(id, handle)| (*id, handle.tx.clone())).collect()
+        registry
+            .sessions
+            .iter()
+            .filter(|(_, handle)| handle.enabled.load(Ordering::SeqCst))
+            .map(|(id, handle)| (*id, handle.tx.clone()))
+            .collect()
     };
     if session_txs.is_empty() {
         return;
@@ -1081,6 +1175,17 @@ impl<R: HasBlockNumber> PendingRowGroup<R> {
             self.end_block = self.rows.last().map(HasBlockNumber::block_number);
         }
     }
+
+    fn replace_rows(&mut self, rows: Vec<R>) {
+        self.rows = rows;
+        if self.rows.is_empty() {
+            self.start_block = None;
+            self.end_block = None;
+        } else {
+            self.start_block = self.rows.first().map(HasBlockNumber::block_number);
+            self.end_block = self.rows.last().map(HasBlockNumber::block_number);
+        }
+    }
 }
 
 struct ParquetStreamWriter<R> {
@@ -1088,6 +1193,7 @@ struct ParquetStreamWriter<R> {
     schema: std::sync::Arc<Type>,
     props: std::sync::Arc<WriterProperties>,
     handoff_tx: Sender<HandoffMessage>,
+    recover_blocks_fill_on_stop: bool,
     file: Option<ParquetFile>,
     pending_start_block: Option<u64>,
     active: PendingRowGroup<R>,
@@ -1106,6 +1212,7 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
             schema,
             props,
             handoff_tx,
+            recover_blocks_fill_on_stop: false,
             file: None,
             pending_start_block: None,
             active: PendingRowGroup::new(),
@@ -1127,7 +1234,11 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
     }
 
     fn keep_local_on_close(&self) -> bool {
-        self.stream.supports_local_recovery() && current_archive_recover_blocks_fill_on_stop()
+        self.stream.supports_local_recovery() && self.recover_blocks_fill_on_stop
+    }
+
+    fn set_recover_blocks_fill_on_stop(&mut self, enabled: bool) {
+        self.recover_blocks_fill_on_stop = enabled;
     }
 
     fn local_recovery_relative_path(
@@ -1181,10 +1292,7 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
     ) -> parquet::errors::Result<()> {
         let base_dir = current_archive_base_dir();
         let relative_dir = archive_relative_dir(self.stream, mode, coin);
-        let filename_prefix = match self.stream {
-            StreamKind::Blocks => "blocks".to_string(),
-            StreamKind::Fill | StreamKind::Diff | StreamKind::Status => format!("{}_{}", coin, self.stream.name()),
-        };
+        let filename_prefix = local_recovery_filename_prefix(self.stream, coin);
         let filename_suffix = FINAL_PARQUET_FILE_SUFFIX.to_string();
         fs::create_dir_all(&base_dir).map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
         let mut effective_name_start = name_start;
@@ -1196,11 +1304,12 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
         if let Some(existing) = recovery.as_ref() {
             if actual_start > existing.last_block.saturating_add(1) {
                 let staged_path = stage_local_file_for_handoff(&existing.path)?;
+                let logical_end_block = actual_start.saturating_sub(1).min(end);
                 let relative_path = self.local_recovery_relative_path(
                     coin,
                     mode,
                     existing.name_start_block,
-                    existing.last_block,
+                    logical_end_block,
                     &filename_prefix,
                     &filename_suffix,
                 );
@@ -1224,9 +1333,16 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
         let mut replay_skip_until_block = 0;
         if let Some(existing) = recovery {
             if actual_start <= existing.last_block.saturating_add(1) {
-                rewrite_rows_into_writer(&mut writer, mode, self.stream, existing.rows, R::write_rows)?;
+                let resume = split_recovered_rows_for_resume(self.stream, actual_start, existing.rows);
+                rewrite_rows_into_writer(&mut writer, mode, self.stream, resume.committed_rows, R::write_rows)?;
+                self.delayed.replace_rows(resume.delayed_rows);
+                self.active.replace_rows(resume.active_rows);
                 recovered_last_block = existing.last_block;
                 replay_skip_until_block = existing.last_block;
+                // Delete the old recovery file now that its contents have been loaded into memory.
+                if let Err(err) = fs::remove_file(&existing.path) {
+                    warn!("Failed to remove old recovery file {} after loading: {err}", existing.path.display());
+                }
                 info!(
                     "Recovered local {} parquet for {} window_end={} last_block={} and resumed writer",
                     self.stream.name(),
@@ -1258,6 +1374,7 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
         if let Some(file) = self.file.take() {
             let tmp_path = file.tmp_path.clone();
             let final_path = file.local_final_path.clone();
+            let log_label = file.final_filename_prefix.clone();
             let relative_path = file.relative_dir.join(format!(
                 "{}_{}_{}{}",
                 file.final_filename_prefix, file.name_start_block, file.name_end_block, file.final_filename_suffix
@@ -1265,20 +1382,11 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
             file.writer.close()?;
             fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
             let span_blocks = file.name_end_block.saturating_sub(file.name_start_block) + 1;
-            if self.keep_local_on_close() && file.name_end_block < file.window_end_block {
-                info!(
-                    "Archive finalized locally without handoff for {} span={} path={}",
-                    self.stream.name(),
-                    span_blocks,
-                    final_path.display()
-                );
-            } else if span_blocks < MIN_HANDOFF_BLOCK_SPAN {
-                info!(
-                    "Archive finalized but dropping short parquet span={} path={}",
-                    span_blocks,
-                    final_path.display()
-                );
+            if span_blocks < MIN_HANDOFF_BLOCK_SPAN {
+                info!("Archive finalized but dropping short parquet {} span={}", log_label, span_blocks);
                 fs::remove_file(&final_path).map_err(io_to_parquet_error)?;
+            } else if self.keep_local_on_close() && file.name_end_block < file.window_end_block {
+                info!("Archive finalized locally without handoff for {} span={}", log_label, span_blocks);
             } else {
                 enqueue_handoff_task(&self.handoff_tx, final_path, relative_path)?;
             }
@@ -1755,6 +1863,7 @@ impl StatusParquetWriter {
         if let Some(file) = self.file.take() {
             let tmp_path = file.tmp_path.clone();
             let final_path = file.local_final_path.clone();
+            let log_label = file.final_filename_prefix.clone();
             let relative_path = file.relative_dir.join(format!(
                 "{}_{}_{}{}",
                 file.final_filename_prefix, file.name_start_block, file.name_end_block, file.final_filename_suffix
@@ -1763,11 +1872,7 @@ impl StatusParquetWriter {
             fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
             let span_blocks = file.name_end_block.saturating_sub(file.name_start_block) + 1;
             if span_blocks < MIN_HANDOFF_BLOCK_SPAN {
-                info!(
-                    "Archive finalized but dropping short parquet span={} path={}",
-                    span_blocks,
-                    final_path.display()
-                );
+                info!("Archive finalized but dropping short parquet {} span={}", log_label, span_blocks);
                 fs::remove_file(&final_path).map_err(io_to_parquet_error)?;
             } else {
                 enqueue_handoff_task(&self.handoff_tx, final_path, relative_path)?;
@@ -1893,9 +1998,22 @@ impl DiffWorkerHandle {
 
     fn send_block(&self, height: u64, rows_by_coin: HashMap<String, Vec<DiffOut>>) -> parquet::errors::Result<()> {
         self.check_error()?;
-        self.tx
-            .send(DiffWorkerMessage::Block { height, rows_by_coin })
-            .map_err(|err| io_to_parquet_error(io_other(format!("diff worker send failed: {err}"))))?;
+        let mut message = DiffWorkerMessage::Block { height, rows_by_coin };
+        loop {
+            if current_archive_stop_requested() {
+                return Ok(());
+            }
+            match self.tx.try_send(message) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    message = returned;
+                    std::thread::yield_now();
+                }
+                Err(TrySendError::Disconnected(_returned)) => {
+                    return Err(io_to_parquet_error(io_other("diff worker send failed: worker disconnected")));
+                }
+            }
+        }
         self.check_error()
     }
 
@@ -1986,6 +2104,10 @@ impl StatusWorkerHandle {
         Self { coin, tx, ack_rx, error_rx, handle: Some(handle) }
     }
 
+    fn coin(&self) -> &str {
+        &self.coin
+    }
+
     fn check_error(&self) -> parquet::errors::Result<()> {
         match self.error_rx.try_recv() {
             Ok(err) => Err(io_to_parquet_error(io_other(format!("status worker failed for {}: {err}", self.coin)))),
@@ -1996,9 +2118,25 @@ impl StatusWorkerHandle {
 
     fn send_block(&self, height: u64, rows: StatusBlockBatch) -> parquet::errors::Result<()> {
         self.check_error()?;
-        self.tx.send(StatusWorkerMessage::Block { height, rows }).map_err(|err| {
-            io_to_parquet_error(io_other(format!("status worker send failed for {}: {err}", self.coin)))
-        })?;
+        let mut message = StatusWorkerMessage::Block { height, rows };
+        loop {
+            if current_archive_stop_requested() {
+                return Ok(());
+            }
+            match self.tx.try_send(message) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    message = returned;
+                    std::thread::yield_now();
+                }
+                Err(TrySendError::Disconnected(_returned)) => {
+                    return Err(io_to_parquet_error(io_other(format!(
+                        "status worker send failed for {}: worker disconnected",
+                        self.coin
+                    ))));
+                }
+            }
+        }
         self.check_error()
     }
 
@@ -2048,6 +2186,7 @@ struct ArchiveWriters {
     coins: HashMap<String, CoinWriters>,
     symbols: Vec<String>,
     mode: ArchiveMode,
+    recover_blocks_fill_on_stop: bool,
     pending_status_acks: HashMap<u64, usize>,
     next_uncommitted_height: Option<u64>,
     last_archived_height: Option<u64>,
@@ -2229,9 +2368,18 @@ impl ArchiveWriters {
             coins,
             symbols,
             mode,
+            recover_blocks_fill_on_stop: false,
             pending_status_acks: HashMap::new(),
             next_uncommitted_height: None,
             last_archived_height: None,
+        }
+    }
+
+    fn set_recover_blocks_fill_on_stop(&mut self, enabled: bool) {
+        self.recover_blocks_fill_on_stop = enabled;
+        self.blocks.set_recover_blocks_fill_on_stop(enabled);
+        for writers in self.coins.values_mut() {
+            writers.fill.set_recover_blocks_fill_on_stop(enabled);
         }
     }
 
@@ -2289,12 +2437,91 @@ impl ArchiveWriters {
     }
 
     fn close_all(&mut self) -> parquet::errors::Result<()> {
+        if self.recover_blocks_fill_on_stop {
+            return self.close_all_parallel_for_signal_stop();
+        }
         self.blocks.close_with_flush(self.mode, write_block_rows)?;
+        warn!("Archive close_all closed blocks");
         self.diff.close()?;
+        warn!("Archive close_all closed diff");
         for (_, writers) in std::mem::take(&mut self.coins) {
             let mut writers = writers;
+            let coin = writers.status.coin().to_string();
             writers.status.close()?;
+            warn!("Archive close_all closed status coin={}", coin);
             writers.fill.close_with_flush(self.mode, write_fill_rows)?;
+            warn!("Archive close_all closed fill coin={}", coin);
+        }
+        Ok(())
+    }
+
+    fn close_all_parallel_for_signal_stop(&mut self) -> parquet::errors::Result<()> {
+        let mode = self.mode;
+        let blocks = &mut self.blocks;
+        let diff = &mut self.diff;
+        let coins = &mut self.coins;
+        let mut first_error: Option<parquet::errors::ParquetError> = None;
+
+        thread::scope(|scope| {
+            let blocks_handle = scope.spawn(move || -> parquet::errors::Result<()> {
+                blocks.close_with_flush(mode, write_block_rows)?;
+                warn!("Archive close_all closed blocks");
+                Ok(())
+            });
+
+            let diff_handle = scope.spawn(move || -> parquet::errors::Result<()> {
+                diff.close()?;
+                warn!("Archive close_all closed diff");
+                Ok(())
+            });
+
+            let coin_handles: Vec<_> = coins
+                .drain()
+                .map(|(coin_key, mut writers)| {
+                    scope.spawn(move || -> parquet::errors::Result<()> {
+                        let coin = writers.status.coin().to_string();
+                        let _unused = coin_key;
+                        writers.status.close()?;
+                        warn!("Archive close_all closed status coin={}", coin);
+                        writers.fill.close_with_flush(mode, write_fill_rows)?;
+                        warn!("Archive close_all closed fill coin={}", coin);
+                        Ok(())
+                    })
+                })
+                .collect();
+
+            match blocks_handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => first_error = Some(err),
+                Err(err) => {
+                    first_error = Some(io_to_parquet_error(io_other(format!("blocks close thread panicked: {err:?}"))))
+                }
+            }
+            match diff_handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) if first_error.is_none() => first_error = Some(err),
+                Ok(Err(_)) => {}
+                Err(err) if first_error.is_none() => {
+                    first_error = Some(io_to_parquet_error(io_other(format!("diff close thread panicked: {err:?}"))))
+                }
+                Err(_) => {}
+            }
+            for handle in coin_handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) if first_error.is_none() => first_error = Some(err),
+                    Ok(Err(_)) => {}
+                    Err(err) if first_error.is_none() => {
+                        first_error =
+                            Some(io_to_parquet_error(io_other(format!("coin close thread panicked: {err:?}"))))
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+
+        if let Some(err) = first_error {
+            return Err(err);
         }
         Ok(())
     }
@@ -2350,6 +2577,53 @@ struct LocalRecoveryFile<R> {
     last_block: u64,
 }
 
+struct RecoveredResumeState<R> {
+    committed_rows: Vec<R>,
+    delayed_rows: Vec<R>,
+    active_rows: Vec<R>,
+}
+
+fn split_recovered_rows_for_resume<R: HasBlockNumber>(
+    stream: StreamKind,
+    actual_start: u64,
+    rows: Vec<R>,
+) -> RecoveredResumeState<R> {
+    let Some(span) = stream.row_group_block_limit() else {
+        return RecoveredResumeState { committed_rows: rows, delayed_rows: Vec::new(), active_rows: Vec::new() };
+    };
+    if rows.is_empty() {
+        return RecoveredResumeState { committed_rows: rows, delayed_rows: Vec::new(), active_rows: Vec::new() };
+    }
+
+    let current_group_start = aligned_row_group_bounds(actual_start, span).0;
+    let keep_previous_group_delayed = stream.uses_delayed_flush()
+        && stream.delayed_flush_lookahead_blocks().is_some_and(|lookahead| {
+            if actual_start <= current_group_start {
+                true
+            } else {
+                actual_start.saturating_sub(current_group_start) < lookahead
+            }
+        });
+    let delayed_group_start = current_group_start.saturating_sub(span);
+
+    let mut committed_rows = Vec::new();
+    let mut delayed_rows = Vec::new();
+    let mut active_rows = Vec::new();
+
+    for row in rows {
+        let block = row.block_number();
+        if block >= current_group_start {
+            active_rows.push(row);
+        } else if keep_previous_group_delayed && block >= delayed_group_start {
+            delayed_rows.push(row);
+        } else {
+            committed_rows.push(row);
+        }
+    }
+
+    RecoveredResumeState { committed_rows, delayed_rows, active_rows }
+}
+
 fn parse_local_archive_filename_bounds(path: &Path, filename_prefix: &str) -> Option<(u64, u64)> {
     let file_name = path.file_name()?.to_str()?;
     let stem = if let Some(stem) = file_name.strip_suffix(LOCAL_RECOVERY_FILE_SUFFIX) {
@@ -2395,6 +2669,78 @@ fn find_local_recovery_path(
         }
     }
     Ok(None)
+}
+
+fn local_recovery_filename_prefix(stream: StreamKind, coin: &str) -> String {
+    match stream {
+        StreamKind::Blocks => "blocks".to_string(),
+        StreamKind::Fill | StreamKind::Diff | StreamKind::Status => format!("{}_{}", coin, stream.name()),
+    }
+}
+
+fn local_recovery_logical_end(stream: StreamKind, observed_height: u64, window_end_block: u64) -> u64 {
+    let logical_end = if current_archive_align_output_to_1000_boundary() {
+        aligned_archive_output_end(observed_height).unwrap_or_else(|| observed_height.saturating_sub(1))
+    } else {
+        observed_height.saturating_sub(1)
+    };
+    match stream {
+        StreamKind::Blocks | StreamKind::Fill => logical_end.min(window_end_block),
+        StreamKind::Diff | StreamKind::Status => observed_height.saturating_sub(1).min(window_end_block),
+    }
+}
+
+fn preflight_local_recovery_discontinuity<R: RecoverableArchiveRow>(
+    stream: StreamKind,
+    coin: &str,
+    mode: ArchiveMode,
+    observed_height: u64,
+    handoff_tx: &Sender<HandoffMessage>,
+) -> parquet::errors::Result<()> {
+    if !stream.supports_local_recovery() {
+        return Ok(());
+    }
+    let (_, window_end_block) = rotation_bounds_for(stream, observed_height);
+    let filename_prefix = local_recovery_filename_prefix(stream, coin);
+    let Some((path, name_start_block)) =
+        find_local_recovery_path(&current_archive_base_dir(), &filename_prefix, window_end_block)?
+    else {
+        return Ok(());
+    };
+    let rows = R::read_local_rows(&path, mode)?;
+    let last_block = rows.last().map(HasBlockNumber::block_number).unwrap_or(0);
+    if last_block == 0 {
+        fs::remove_file(&path).map_err(io_to_parquet_error)?;
+        return Ok(());
+    }
+    if observed_height <= last_block.saturating_add(1) {
+        return Ok(());
+    }
+
+    let logical_end_block = local_recovery_logical_end(stream, observed_height, window_end_block);
+    let span_blocks = logical_end_block.saturating_sub(name_start_block).saturating_add(1);
+    if span_blocks < MIN_HANDOFF_BLOCK_SPAN {
+        fs::remove_file(&path).map_err(io_to_parquet_error)?;
+        return Ok(());
+    }
+
+    let staged_path = stage_local_file_for_handoff(&path)?;
+    let relative_path = archive_relative_dir(stream, mode, coin)
+        .join(format!("{}_{}_{}{}", filename_prefix, name_start_block, logical_end_block, FINAL_PARQUET_FILE_SUFFIX));
+    enqueue_handoff_task(handoff_tx, staged_path, relative_path)
+}
+
+fn preflight_startup_local_recovery(
+    mode: ArchiveMode,
+    symbols: &[String],
+    observed_height: u64,
+    handoff_tx: &Sender<HandoffMessage>,
+) -> parquet::errors::Result<()> {
+    preflight_local_recovery_discontinuity::<BlockIndexOut>(StreamKind::Blocks, "", mode, observed_height, handoff_tx)?;
+    for coin in symbols {
+        preflight_local_recovery_discontinuity::<FillOut>(StreamKind::Fill, coin, mode, observed_height, handoff_tx)?;
+    }
+    Ok(())
 }
 
 fn rewrite_rows_into_writer<R, F>(
@@ -2623,21 +2969,60 @@ fn cleanup_stale_temp_files(base_dir: &Path) {
 fn start_archive_handoff_worker(stop: Arc<AtomicBool>) -> ArchiveHandoffWorker {
     let (tx, rx) = channel::<HandoffMessage>();
     let handle = thread::spawn(move || {
+        let mut in_flight: Vec<thread::JoinHandle<()>> = Vec::new();
+
+        let reap_finished = |in_flight: &mut Vec<thread::JoinHandle<()>>| {
+            let mut idx = 0;
+            while idx < in_flight.len() {
+                if in_flight[idx].is_finished() {
+                    let handle = in_flight.swap_remove(idx);
+                    let _unused = handle.join();
+                } else {
+                    idx += 1;
+                }
+            }
+        };
+
+        let wait_for_slot = |in_flight: &mut Vec<thread::JoinHandle<()>>| {
+            while in_flight.len() >= MAX_CONCURRENT_HANDOFF_TASKS {
+                reap_finished(in_flight);
+                if in_flight.len() < MAX_CONCURRENT_HANDOFF_TASKS {
+                    break;
+                }
+                let handle = in_flight.swap_remove(0);
+                let _unused = handle.join();
+            }
+        };
+
+        let drain_all = |in_flight: &mut Vec<thread::JoinHandle<()>>| {
+            while let Some(handle) = in_flight.pop() {
+                let _unused = handle.join();
+            }
+        };
+
         while let Ok(message) = rx.recv() {
             match message {
                 HandoffMessage::File(task) => {
-                    if let Err(err) = handoff_finalized_parquet(&task) {
-                        warn!(
-                            "Archive handoff failed for {} (stop={}): {err}",
-                            task.path.display(),
-                            stop.load(Ordering::SeqCst)
-                        );
-                    }
+                    wait_for_slot(&mut in_flight);
+                    let stop = stop.clone();
+                    in_flight.push(thread::spawn(move || {
+                        if let Err(err) = handoff_finalized_parquet(&task) {
+                            warn!(
+                                "Archive handoff failed for {} (stop={}): {err}",
+                                task.path.display(),
+                                stop.load(Ordering::SeqCst)
+                            );
+                        }
+                    }));
                 }
                 HandoffMessage::Barrier(done_tx) => {
+                    drain_all(&mut in_flight);
                     let _unused = done_tx.send(());
                 }
             }
+        }
+        while let Some(handle) = in_flight.pop() {
+            let _unused = handle.join();
         }
     });
     ArchiveHandoffWorker { tx, handle }
@@ -2799,12 +3184,12 @@ fn handoff_finalized_parquet(task: &HandoffTask) -> parquet::errors::Result<()> 
     if config.move_to_nas {
         fs::remove_file(path).map_err(io_to_parquet_error)?;
         if let Some(dest_path) = nas_dest {
-            info!("Archive handoff complete: local={} nas={}", path.display(), dest_path.display());
+            warn!("Archive handoff complete: local={} nas={}", path.display(), dest_path.display());
         }
     } else if config.upload_to_oss {
-        info!("Archive handoff complete: local={} retained after OSS upload", path.display());
+        warn!("Archive handoff complete: local={} retained after OSS upload", path.display());
     } else {
-        info!("Archive finalized locally without handoff: {}", path.display());
+        warn!("Archive finalized locally without handoff: {}", path.display());
     }
     Ok(())
 }
@@ -3952,15 +4337,19 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
     let mut current_mode: Option<ArchiveMode> = None;
     let mut current_symbols = current_archive_symbols();
     let mut bootstrap_checkpoint_evaluated = false;
+    let mut startup_recovery_prepared = false;
     let mut start_alignment_wait_logged = false;
     let mut last_input_height: Option<u64> = None;
     let mut replay_skip_log = ReplaySkipLogState::default();
 
     loop {
+        set_archive_phase(last_input_height, "waiting_for_block");
         let mode = get_archive_mode();
         let symbols = current_archive_symbols();
         if mode != current_mode || symbols != current_symbols {
+            set_archive_phase(last_input_height, "reconfigure");
             if let Some(mut w) = writers.take() {
+                w.set_recover_blocks_fill_on_stop(current_archive_recover_blocks_fill_on_stop());
                 if let Err(err) = w.close_all() {
                     warn!("Archive writer close failed during reconfigure: {err}");
                     w.abort_all();
@@ -3975,6 +4364,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     current_mode = None;
                     current_symbols = symbols;
                     bootstrap_checkpoint_evaluated = false;
+                    startup_recovery_prepared = false;
                     continue;
                 }
             }
@@ -3982,6 +4372,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             current_mode = mode;
             current_symbols = symbols;
             bootstrap_checkpoint_evaluated = false;
+            startup_recovery_prepared = false;
             start_alignment_wait_logged = false;
             last_input_height = None;
             replay_skip_log = ReplaySkipLogState::default();
@@ -3991,17 +4382,22 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             Ok(msg) => msg,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if stop.load(Ordering::SeqCst) {
-                    continue;
+                    break;
                 }
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+
         if writers.is_none() {
             continue;
         }
         let mode = writers.as_ref().expect("writers checked above").mode;
+        set_archive_phase(Some(msg.block_number), "drain_status_progress");
         if let Some(writers_ref) = writers.as_mut() {
             if let Err(err) = writers_ref.drain_status_progress() {
                 disable_archive_after_failure(
@@ -4015,6 +4411,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             }
         }
 
+        set_archive_phase(Some(msg.block_number), "parse_batches");
         let order_batch: BatchLite<OrderStatusLite> = match serde_json::from_slice(&msg.order_line) {
             Ok(batch) => batch,
             Err(err) => {
@@ -4077,6 +4474,29 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 height, diff_batch.block_number, fill_batch.block_number
             );
             continue;
+        }
+
+        if last_input_height.is_none() && current_archive_stop_height().is_some_and(|stop_height| stop_height < height)
+        {
+            info!(
+                "Archive ignoring stale stop height {} because current height is {}",
+                current_archive_stop_height().unwrap_or(height),
+                height
+            );
+            archive_thread_context(|ctx| {
+                if let Some(ctx) = ctx {
+                    ctx.enabled.store(false, Ordering::SeqCst);
+                    ctx.stop_requested.store(true, Ordering::SeqCst);
+                }
+            });
+            break;
+        }
+
+        if !startup_recovery_prepared {
+            if let Err(err) = preflight_startup_local_recovery(mode, &current_symbols, height, &handoff_tx) {
+                warn!("Archive startup local recovery precheck failed at {height}: {err}");
+            }
+            startup_recovery_prepared = true;
         }
 
         if !bootstrap_checkpoint_evaluated
@@ -4152,6 +4572,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             ArchiveMode::Full => "full".to_string(),
         };
 
+        set_archive_phase(Some(height), "build_status_rows");
         let mut status_rows: HashMap<String, StatusBlockBatch> = HashMap::new();
         let mut btc_status_n = 0;
         let mut eth_status_n = 0;
@@ -4252,6 +4673,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             }
         }
 
+        set_archive_phase(Some(height), "build_diff_rows");
         let mut diff_rows: HashMap<String, Vec<DiffOut>> = HashMap::new();
         let mut btc_diff_n = 0;
         let mut eth_diff_n = 0;
@@ -4305,6 +4727,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             diff_rows.entry(coin).or_default().push(out);
         }
 
+        set_archive_phase(Some(height), "build_fill_rows");
         let mut fill_rows: HashMap<String, Vec<FillOut>> = HashMap::new();
         let mut btc_fill_n = 0;
         let mut eth_fill_n = 0;
@@ -4380,6 +4803,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             fill_rows.entry(coin).or_default().push(out);
         }
 
+        set_archive_phase(Some(height), "blocks_advance_append");
         let mut fatal_error: Option<String> = None;
         let writers_ref = writers.as_mut().expect("writers checked above");
         if let Err(err) = writers_ref.blocks.advance_block(mode, height, write_block_rows) {
@@ -4428,6 +4852,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
 
         writers_ref.register_status_block(height);
 
+        set_archive_phase(Some(height), "diff_send");
         if let Err(err) = writers_ref.diff.send_block(height, diff_rows) {
             disable_archive_after_failure(
                 &mut writers,
@@ -4441,16 +4866,19 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
 
         for coin in writers_ref.symbols.clone() {
             if let Some(coin_writers) = writers_ref.coin_mut(&coin) {
+                set_archive_phase(Some(height), format!("fill_advance:{coin}"));
                 if let Err(err) = coin_writers.fill.advance_block(mode, height, write_fill_rows) {
                     fatal_error = Some(format!("fill advance failed for {coin}: {err}"));
                     break;
                 }
                 let status_for_block = status_rows.remove(&coin).unwrap_or_else(|| StatusBlockBatch::new(mode));
+                set_archive_phase(Some(height), format!("status_send:{coin}"));
                 if let Err(err) = coin_writers.status.send_block(height, status_for_block) {
                     fatal_error = Some(format!("status write failed for {coin}: {err}"));
                     break;
                 }
                 if let Some(rows) = fill_rows.remove(&coin).filter(|rows| !rows.is_empty()) {
+                    set_archive_phase(Some(height), format!("fill_append:{coin}"));
                     if let Err(err) = coin_writers.fill.append_rows(&coin, mode, height, rows, write_fill_rows) {
                         fatal_error = Some(format!("fill write failed for {coin}: {err}"));
                         break;
@@ -4462,6 +4890,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             disable_archive_after_failure(&mut writers, &mut current_mode, &mut current_symbols, height, &context);
             continue;
         }
+        set_archive_phase(Some(height), "drain_status_progress_post_block");
         if let Some(writers_ref) = writers.as_mut() {
             if let Err(err) = writers_ref.drain_status_progress() {
                 disable_archive_after_failure(
@@ -4474,7 +4903,19 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 continue;
             }
         }
+        set_archive_phase(Some(height), "block_complete");
         last_input_height = Some(height);
+
+        if current_archive_stop_height().is_some_and(|stop_height| height >= stop_height) {
+            info!("Archive auto-stopping after reaching configured stop height {}", height);
+            archive_thread_context(|ctx| {
+                if let Some(ctx) = ctx {
+                    ctx.enabled.store(false, Ordering::SeqCst);
+                    ctx.stop_requested.store(true, Ordering::SeqCst);
+                }
+            });
+            break;
+        }
 
         if height % CHECKPOINT_BLOCKS == 0 {
             match ensure_archive_disk_headroom(&current_archive_base_dir()) {
@@ -4492,18 +4933,22 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                         &mut bootstrap_checkpoint_evaluated,
                         height,
                     );
+                    startup_recovery_prepared = false;
                 }
             }
         }
     }
 
     if let Some(mut w) = writers.take() {
+        set_archive_phase(last_input_height, "close_all");
+        w.set_recover_blocks_fill_on_stop(current_archive_recover_blocks_fill_on_stop());
         if let Err(err) = w.close_all() {
             warn!("Archive writer close failed: {err}");
             w.abort_all();
         }
     }
     let ArchiveHandoffWorker { tx: handoff_worker_tx, handle } = handoff_worker;
+    set_archive_phase(last_input_height, "handoff_worker_join");
     drop(handoff_tx);
     drop(handoff_worker_tx);
     if let Err(err) = handle.join() {
@@ -4517,6 +4962,15 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Clone, Debug)]
+    struct TestRow(u64);
+
+    impl HasBlockNumber for TestRow {
+        fn block_number(&self) -> u64 {
+            self.0
+        }
+    }
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4536,6 +4990,28 @@ mod tests {
         assert_eq!(parse_local_archive_filename_bounds(path, "BTC_fill"), Some((928200001, 929000000)));
         let recovery = Path::new("/tmp/BTC_fill_928200001_929000000.parquet.0");
         assert_eq!(parse_local_archive_filename_bounds(recovery, "BTC_fill"), Some((928200001, 929000000)));
+    }
+
+    #[test]
+    fn split_recovered_rows_keeps_same_group_tail_active() {
+        let rows = vec![TestRow(1001), TestRow(1002), TestRow(1003)];
+        let state = split_recovered_rows_for_resume(StreamKind::Blocks, 1004, rows);
+        assert!(state.committed_rows.is_empty());
+        assert!(state.delayed_rows.is_empty());
+        let active: Vec<u64> = state.active_rows.into_iter().map(|row| row.0).collect();
+        assert_eq!(active, vec![1001, 1002, 1003]);
+    }
+
+    #[test]
+    fn split_recovered_rows_restores_previous_group_as_delayed() {
+        let rows = vec![TestRow(1), TestRow(250000)];
+        let state = split_recovered_rows_for_resume(StreamKind::Blocks, 250001, rows);
+        let committed: Vec<u64> = state.committed_rows.into_iter().map(|row| row.0).collect();
+        let delayed: Vec<u64> = state.delayed_rows.into_iter().map(|row| row.0).collect();
+        let active: Vec<u64> = state.active_rows.into_iter().map(|row| row.0).collect();
+        assert!(committed.is_empty());
+        assert_eq!(delayed, vec![1, 250000]);
+        assert!(active.is_empty());
     }
 
     #[test]
