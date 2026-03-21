@@ -18,6 +18,7 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3_asyncio::TaskLocals;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Once;
@@ -29,8 +30,9 @@ static PY_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 fn parse_archive_mode(mode: Option<&str>) -> PyResult<Option<ArchiveMode>> {
     match mode {
         Some("FULL") => Ok(Some(ArchiveMode::Full)),
+        Some("HFT") => Ok(Some(ArchiveMode::Hft)),
         Some("LITE") | None => Ok(Some(ArchiveMode::Lite)),
-        _ => Err(pyo3::exceptions::PyValueError::new_err("mode must be 'FULL' or 'LITE'")),
+        _ => Err(pyo3::exceptions::PyValueError::new_err("mode must be 'FULL', 'HFT', or 'LITE'")),
     }
 }
 
@@ -103,6 +105,12 @@ fn build_archive_session_options(
         set_rotation_blocks(n);
     }
     let output_dir = output_dir.unwrap_or_else(current_archive_base_dir);
+    fs::create_dir_all(&output_dir).map_err(|err| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to create archive output dir {}: {err}",
+            output_dir.display()
+        ))
+    })?;
     let symbols = symbols.unwrap_or_else(current_archive_symbols);
     Ok(ArchiveSessionOptions {
         mode: mode.unwrap_or(ArchiveMode::Lite),

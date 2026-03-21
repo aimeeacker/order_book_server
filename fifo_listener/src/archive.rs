@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use aliyun_oss_rust_sdk::oss::OSS;
 use aliyun_oss_rust_sdk::request::RequestBuilder;
+use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use compute_l4::{ComputeOptions, append_l4_checkpoint_from_snapshot_json};
 use log::{error, info, warn};
 use parquet::basic::{Compression, ZstdLevel};
@@ -63,6 +64,8 @@ static ARCHIVE_BASE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::n
 static ARCHIVE_SYMBOLS_OVERRIDE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
 static ARCHIVE_HANDOFF_CONFIG: OnceLock<Mutex<ArchiveHandoffConfig>> = OnceLock::new();
 static ARCHIVE_SESSION_REGISTRY: OnceLock<Mutex<ArchiveSessionRegistry>> = OnceLock::new();
+static ARCHIVE_SHARED_BLOCKS: OnceLock<Mutex<SharedBlocksIndex>> = OnceLock::new();
+static ARCHIVE_STALE_TMP_CLEANED: AtomicBool = AtomicBool::new(false);
 pub(crate) const ARCHIVE_QUEUE_BLOCKS: usize = 127;
 
 thread_local! {
@@ -73,6 +76,13 @@ thread_local! {
 pub enum ArchiveMode {
     Lite = 1,
     Full = 2,
+    Hft = 3,
+}
+
+impl ArchiveMode {
+    fn uses_full_scaling(self) -> bool {
+        matches!(self, Self::Full | Self::Hft)
+    }
 }
 
 pub type ArchiveSessionId = u64;
@@ -98,6 +108,7 @@ struct ArchiveThreadContext {
     phase_state: Arc<Mutex<ArchivePhaseState>>,
     rotation_blocks: u64,
     base_dir: PathBuf,
+    shared_blocks_base_dir: PathBuf,
     symbols: Vec<String>,
     archive_height: Option<u64>,
     stop_height: Option<u64>,
@@ -110,6 +121,7 @@ struct ArchiveThreadContext {
 impl ArchiveThreadContext {
     fn from_options(
         options: &ArchiveSessionOptions,
+        shared_blocks_base_dir: PathBuf,
         enabled: Arc<AtomicBool>,
         stop_requested: Arc<AtomicBool>,
         phase_state: Arc<Mutex<ArchivePhaseState>>,
@@ -122,6 +134,7 @@ impl ArchiveThreadContext {
             phase_state,
             rotation_blocks: options.rotation_blocks,
             base_dir: options.output_dir.clone(),
+            shared_blocks_base_dir,
             symbols: options.symbols.clone(),
             archive_height: options.archive_height,
             stop_height: options.stop_height,
@@ -268,6 +281,51 @@ fn archive_session_registry() -> &'static Mutex<ArchiveSessionRegistry> {
     ARCHIVE_SESSION_REGISTRY.get_or_init(|| Mutex::new(ArchiveSessionRegistry { next_id: 1, ..Default::default() }))
 }
 
+fn shared_blocks_index() -> &'static Mutex<SharedBlocksIndex> {
+    ARCHIVE_SHARED_BLOCKS.get_or_init(|| Mutex::new(SharedBlocksIndex::new()))
+}
+
+fn finalize_shared_blocks_after_last_session(recover_for_restart: bool) {
+    let no_active_sessions = archive_session_registry().lock().expect("archive session registry").sessions.is_empty();
+    if !no_active_sessions {
+        return;
+    }
+    let mut shared = shared_blocks_index().lock().expect("shared blocks index");
+    if recover_for_restart {
+        if let Err(err) = shared.persist_for_recovery() {
+            warn!("Shared blocks recovery persist failed: {err}");
+        }
+    } else {
+        shared.reset_runtime_state();
+    }
+}
+
+fn reap_finished_archive_sessions() {
+    let finished: Vec<(ArchiveSessionId, ArchiveSessionHandle)> = {
+        let mut registry = archive_session_registry().lock().expect("archive session registry");
+        let finished_ids: Vec<ArchiveSessionId> = registry
+            .sessions
+            .iter()
+            .filter_map(|(session_id, handle)| handle.join_handle.is_finished().then_some(*session_id))
+            .collect();
+        finished_ids
+            .into_iter()
+            .filter_map(|session_id| registry.sessions.remove(&session_id).map(|handle| (session_id, handle)))
+            .collect()
+    };
+    if finished.is_empty() {
+        return;
+    }
+    for (session_id, handle) in finished {
+        if let Err(err) = handle.join_handle.join() {
+            warn!("Archive session {session_id} panicked while reaping: {err:?}");
+        } else {
+            warn!("Archive session {} thread exited", session_id);
+        }
+    }
+    finalize_shared_blocks_after_last_session(false);
+}
+
 fn archive_thread_context<T>(f: impl FnOnce(Option<&ArchiveThreadContext>) -> T) -> T {
     ARCHIVE_THREAD_CONTEXT.with(|ctx| {
         let borrow = ctx.borrow();
@@ -331,6 +389,11 @@ pub fn current_archive_base_dir() -> PathBuf {
     })
 }
 
+fn current_archive_shared_blocks_base_dir() -> PathBuf {
+    archive_thread_context(|ctx| ctx.map(|ctx| ctx.shared_blocks_base_dir.clone()))
+        .unwrap_or_else(current_archive_base_dir)
+}
+
 pub fn set_archive_base_dir(path: Option<PathBuf>) -> PathBuf {
     let mut guard = archive_base_dir_override().lock().expect("archive base dir mutex");
     *guard = path;
@@ -371,6 +434,7 @@ pub fn set_archive_mode(mode: Option<ArchiveMode>) {
         None => 0,
         Some(ArchiveMode::Lite) => 1,
         Some(ArchiveMode::Full) => 2,
+        Some(ArchiveMode::Hft) => 3,
     };
     ARCHIVE_MODE.store(val, Ordering::SeqCst);
 }
@@ -445,15 +509,25 @@ pub(crate) fn get_archive_mode() -> Option<ArchiveMode> {
         match ARCHIVE_MODE.load(Ordering::SeqCst) {
             1 => Some(ArchiveMode::Lite),
             2 => Some(ArchiveMode::Full),
+            3 => Some(ArchiveMode::Hft),
             _ => None,
         }
     }
 }
 
 pub fn start_archive_session(options: ArchiveSessionOptions) -> ArchiveSessionId {
+    reap_finished_archive_sessions();
     let mut registry = archive_session_registry().lock().expect("archive session registry");
     let session_id = registry.next_id;
     registry.next_id = registry.next_id.saturating_add(1);
+    let mut options = options;
+    let shared_blocks_base_dir = options.output_dir.clone();
+    if options.stop_height.is_some() || options.archive_height.is_some() {
+        options.output_dir = options.output_dir.join(format!("session_{session_id}"));
+        if let Err(err) = fs::create_dir_all(&options.output_dir) {
+            panic!("failed to create per-session archive output dir {}: {err}", options.output_dir.display());
+        }
+    }
     let (tx, rx) = sync_channel(ARCHIVE_QUEUE_BLOCKS);
     let enabled = Arc::new(AtomicBool::new(true));
     let stop_requested = Arc::new(AtomicBool::new(false));
@@ -461,6 +535,7 @@ pub fn start_archive_session(options: ArchiveSessionOptions) -> ArchiveSessionId
     let recover_blocks_fill_on_stop = Arc::new(AtomicBool::new(false));
     let thread_context = ArchiveThreadContext::from_options(
         &options,
+        shared_blocks_base_dir,
         enabled.clone(),
         stop_requested.clone(),
         phase_state.clone(),
@@ -480,12 +555,13 @@ pub fn start_archive_session(options: ArchiveSessionOptions) -> ArchiveSessionId
 }
 
 pub fn stop_archive_session(session_id: ArchiveSessionId, recover_blocks_fill_locally: bool) -> bool {
+    reap_finished_archive_sessions();
     let handle = {
         let mut registry = archive_session_registry().lock().expect("archive session registry");
         registry.sessions.remove(&session_id)
     };
     let Some(handle) = handle else {
-        return false;
+        return true;
     };
     handle.recover_blocks_fill_on_stop.store(recover_blocks_fill_locally, Ordering::SeqCst);
     handle.stop_requested.store(true, Ordering::SeqCst);
@@ -511,10 +587,12 @@ pub fn stop_archive_session(session_id: ArchiveSessionId, recover_blocks_fill_lo
     } else {
         warn!("Archive session {} thread exited", session_id);
     }
+    finalize_shared_blocks_after_last_session(recover_blocks_fill_locally);
     true
 }
 
 pub fn stop_all_archive_sessions(recover_blocks_fill_locally: bool) {
+    reap_finished_archive_sessions();
     let handles: Vec<(ArchiveSessionId, ArchiveSessionHandle)> = {
         let mut registry = archive_session_registry().lock().expect("archive session registry");
         registry.sessions.drain().collect()
@@ -545,13 +623,21 @@ pub fn stop_all_archive_sessions(recover_blocks_fill_locally: bool) {
             warn!("Archive session {} thread exited via stop-all", session_id);
         }
     }
+    finalize_shared_blocks_after_last_session(recover_blocks_fill_locally);
 }
 
 pub(crate) fn has_archive_sessions() -> bool {
-    !archive_session_registry().lock().expect("archive session registry").sessions.is_empty()
+    reap_finished_archive_sessions();
+    archive_session_registry()
+        .lock()
+        .expect("archive session registry")
+        .sessions
+        .values()
+        .any(|handle| handle.enabled.load(Ordering::SeqCst))
 }
 
 pub(crate) fn dispatch_archive_block(block: ArchiveBlock, shutdown: bool) {
+    reap_finished_archive_sessions();
     let session_txs: Vec<(ArchiveSessionId, SyncSender<ArchiveBlock>)> = {
         let registry = archive_session_registry().lock().expect("archive session registry");
         registry
@@ -656,6 +742,8 @@ struct OrderLite {
     orig_sz: String,
     tif: Option<String>,
     cloid: serde_json::Value,
+    #[serde(default)]
+    children: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -695,7 +783,8 @@ struct FillLite {
     px: String,
     sz: String,
     side: String,
-    time: u64,
+    #[serde(rename = "time")]
+    _time: u64,
     start_position: String,
     dir: String,
     closed_pnl: String,
@@ -802,6 +891,8 @@ struct StatusFullColumns {
     timestamp: Vec<i64>,
     trigger_condition: Vec<ByteArray>,
     trigger_px: Vec<i64>,
+    tp_trigger_px: Vec<ByteArray>,
+    sl_trigger_px: Vec<ByteArray>,
     is_position_tpsl: Vec<bool>,
     reduce_only: Vec<bool>,
     cloid: Vec<ByteArray>,
@@ -832,6 +923,8 @@ impl StatusFullColumns {
         self.timestamp.extend(other.timestamp);
         self.trigger_condition.extend(other.trigger_condition);
         self.trigger_px.extend(other.trigger_px);
+        self.tp_trigger_px.extend(other.tp_trigger_px);
+        self.sl_trigger_px.extend(other.sl_trigger_px);
         self.is_position_tpsl.extend(other.is_position_tpsl);
         self.reduce_only.extend(other.reduce_only);
         self.cloid.extend(other.cloid);
@@ -858,6 +951,8 @@ impl StatusFullColumns {
         self.timestamp.truncate(keep);
         self.trigger_condition.truncate(keep);
         self.trigger_px.truncate(keep);
+        self.tp_trigger_px.truncate(keep);
+        self.sl_trigger_px.truncate(keep);
         self.is_position_tpsl.truncate(keep);
         self.reduce_only.truncate(keep);
         self.cloid.truncate(keep);
@@ -869,6 +964,7 @@ impl StatusFullColumns {
 enum StatusBlockBatch {
     Lite(StatusLiteColumns),
     Full(StatusFullColumns),
+    Hft(StatusFullColumns),
 }
 
 impl StatusBlockBatch {
@@ -876,6 +972,7 @@ impl StatusBlockBatch {
         match mode {
             ArchiveMode::Lite => Self::Lite(StatusLiteColumns::default()),
             ArchiveMode::Full => Self::Full(StatusFullColumns::default()),
+            ArchiveMode::Hft => Self::Hft(StatusFullColumns::default()),
         }
     }
 
@@ -883,6 +980,7 @@ impl StatusBlockBatch {
         match self {
             Self::Lite(columns) => columns.is_empty(),
             Self::Full(columns) => columns.is_empty(),
+            Self::Hft(columns) => columns.is_empty(),
         }
     }
 
@@ -890,6 +988,7 @@ impl StatusBlockBatch {
         match self {
             Self::Lite(columns) => columns.trim_to_block(max_block),
             Self::Full(columns) => columns.trim_to_block(max_block),
+            Self::Hft(columns) => columns.trim_to_block(max_block),
         }
     }
 }
@@ -932,11 +1031,10 @@ struct FillOut {
     hash: String,
     oid: u64,
     tid: u64,
-    time: i64,
     start_position: i64,
     dir: String,
     fee_token: String,
-    twap_id: i64,
+    twap_id: Option<i64>,
     raw_event: String,
 }
 
@@ -946,7 +1044,7 @@ impl HasBlockNumber for FillOut {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct BlockIndexOut {
     block_number: u64,
     block_time: String,
@@ -969,6 +1067,195 @@ struct BlockIndexOut {
 impl HasBlockNumber for BlockIndexOut {
     fn block_number(&self) -> u64 {
         self.block_number
+    }
+}
+
+struct SharedBlocksIndex {
+    base_dir: Option<PathBuf>,
+    current_window_start: Option<u64>,
+    current_window_end: Option<u64>,
+    current_name_start: Option<u64>,
+    current_rows: Vec<BlockIndexOut>,
+    startup_recovery_prepared: bool,
+}
+
+impl SharedBlocksIndex {
+    fn new() -> Self {
+        Self {
+            base_dir: None,
+            current_window_start: None,
+            current_window_end: None,
+            current_name_start: None,
+            current_rows: Vec::new(),
+            startup_recovery_prepared: false,
+        }
+    }
+
+    fn set_base_dir(&mut self, base_dir: &Path) {
+        if self.base_dir.is_none() {
+            self.base_dir = Some(base_dir.to_path_buf());
+        }
+    }
+
+    fn prepare_for_height(
+        &mut self,
+        observed_height: u64,
+        handoff_tx: &Sender<HandoffMessage>,
+    ) -> parquet::errors::Result<()> {
+        if self.startup_recovery_prepared {
+            return Ok(());
+        }
+        self.startup_recovery_prepared = true;
+        let base_dir = current_archive_shared_blocks_base_dir();
+        self.set_base_dir(&base_dir);
+        preflight_local_recovery_discontinuity::<BlockIndexOut>(
+            StreamKind::Blocks,
+            "",
+            ArchiveMode::Lite,
+            observed_height,
+            handoff_tx,
+        )?;
+        let (_, window_end) = rotation_bounds_for(StreamKind::Blocks, observed_height);
+        let filename_prefix = local_recovery_filename_prefix(StreamKind::Blocks, ArchiveMode::Lite, "");
+        let Some((path, name_start_block)) = find_local_recovery_path(&base_dir, &filename_prefix, window_end)? else {
+            return Ok(());
+        };
+        let rows = read_local_blocks_rows(&path)?;
+        if rows.is_empty() {
+            let _unused = fs::remove_file(path);
+            return Ok(());
+        }
+        if let Err(err) = fs::remove_file(&path) {
+            warn!("Failed to remove stale shared blocks recovery file {} after loading: {err}", path.display());
+        }
+        self.current_window_start = Some(rotation_bounds_for(StreamKind::Blocks, observed_height).0);
+        self.current_window_end = Some(window_end);
+        self.current_name_start = Some(name_start_block);
+        self.current_rows = rows;
+        info!(
+            "Recovered shared blocks locally window_end={} last_block={} and removed recovery file",
+            window_end,
+            self.current_rows.last().map(|row| row.block_number).unwrap_or(0)
+        );
+        Ok(())
+    }
+
+    fn flush_current_window_to_local(&mut self) -> parquet::errors::Result<()> {
+        let Some(base_dir) = self.base_dir.clone() else {
+            return Ok(());
+        };
+        let (Some(name_start), Some(window_end)) = (self.current_name_start, self.current_window_end) else {
+            return Ok(());
+        };
+        if self.current_rows.is_empty() {
+            return Ok(());
+        }
+        fs::create_dir_all(&base_dir).map_err(io_to_parquet_error)?;
+        let final_path = base_dir.join(format!("blocks_{}_{}{}", name_start, window_end, LOCAL_RECOVERY_FILE_SUFFIX));
+        let tmp_path = final_path.with_file_name(format!(
+            "{}{}",
+            final_path.file_name().and_then(|name| name.to_str()).unwrap_or("blocks.parquet.0"),
+            TEMP_FILE_SUFFIX
+        ));
+        if tmp_path.exists() {
+            fs::remove_file(&tmp_path).map_err(io_to_parquet_error)?;
+        }
+        let file = fs::File::create(&tmp_path).map_err(io_to_parquet_error)?;
+        let mut writer = SerializedFileWriter::new(file, blocks_schema(), archive_writer_props())?;
+        write_block_rows(&mut writer, ArchiveMode::Lite, &self.current_rows)?;
+        writer.close()?;
+        fs::rename(tmp_path, final_path).map_err(io_to_parquet_error)?;
+        info!(
+            "Shared blocks persisted locally for recovery span={} window_end={}",
+            self.current_rows
+                .last()
+                .map(|row| row.block_number.saturating_sub(name_start).saturating_add(1))
+                .unwrap_or(0),
+            window_end
+        );
+        Ok(())
+    }
+
+    fn rotate_if_needed(&mut self, height: u64) -> parquet::errors::Result<()> {
+        let (window_start, window_end) = rotation_bounds_for(StreamKind::Blocks, height);
+        if self.current_window_end.is_some_and(|end| end == window_end) {
+            return Ok(());
+        }
+        if self.current_window_end.is_some() {
+            self.flush_current_window_to_local()?;
+            self.current_rows.clear();
+        }
+        self.current_window_start = Some(window_start);
+        self.current_window_end = Some(window_end);
+        self.current_name_start = Some(height);
+        Ok(())
+    }
+
+    fn append(&mut self, row: BlockIndexOut, handoff_tx: &Sender<HandoffMessage>) -> parquet::errors::Result<()> {
+        self.prepare_for_height(row.block_number, handoff_tx)?;
+        self.rotate_if_needed(row.block_number)?;
+        if self.current_rows.last().is_some_and(|last| last.block_number >= row.block_number) {
+            return Ok(());
+        }
+        self.current_name_start.get_or_insert(row.block_number);
+        self.current_rows.push(row);
+        Ok(())
+    }
+
+    fn persist_for_recovery(&mut self) -> parquet::errors::Result<()> {
+        self.flush_current_window_to_local()
+    }
+
+    fn reset_runtime_state(&mut self) {
+        self.current_window_start = None;
+        self.current_window_end = None;
+        self.current_name_start = None;
+        self.current_rows.clear();
+        self.startup_recovery_prepared = false;
+    }
+
+    fn collect_rows(&self, start_block: u64, end_block: u64) -> parquet::errors::Result<Vec<BlockIndexOut>> {
+        let mut rows = Vec::new();
+        let Some(base_dir) = self.base_dir.as_ref() else {
+            return Ok(rows);
+        };
+        if let Ok(entries) = fs::read_dir(base_dir) {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(io_to_parquet_error)?;
+                let path = entry.path();
+                if !entry.file_type().map_err(io_to_parquet_error)?.is_file() {
+                    continue;
+                }
+                let Some((file_start, file_end)) = parse_local_archive_filename_bounds(&path, "blocks") else {
+                    continue;
+                };
+                if file_end < start_block || file_start > end_block {
+                    continue;
+                }
+                let is_current =
+                    self.current_window_end == Some(file_end) && self.current_name_start == Some(file_start);
+                if is_current {
+                    continue;
+                }
+                paths.push((file_start, path));
+            }
+            paths.sort_by_key(|(file_start, _)| *file_start);
+            for (_, path) in paths {
+                rows.extend(
+                    read_local_blocks_rows(&path)?
+                        .into_iter()
+                        .filter(|row| row.block_number >= start_block && row.block_number <= end_block),
+                );
+            }
+        }
+        rows.extend(
+            self.current_rows
+                .iter()
+                .filter(|row| row.block_number >= start_block && row.block_number <= end_block)
+                .cloned(),
+        );
+        Ok(rows)
     }
 }
 
@@ -1050,6 +1337,7 @@ fn archive_coin_dir(mode: ArchiveMode, coin: &str) -> PathBuf {
     match mode {
         ArchiveMode::Lite => PathBuf::from(coin),
         ArchiveMode::Full => PathBuf::from(format!("{coin}_full")),
+        ArchiveMode::Hft => PathBuf::from(format!("{coin}_hft")),
     }
 }
 
@@ -1057,6 +1345,7 @@ fn archive_mode_filename_suffix(mode: ArchiveMode) -> &'static str {
     match mode {
         ArchiveMode::Lite => "",
         ArchiveMode::Full => "_FULL",
+        ArchiveMode::Hft => "_HFT",
     }
 }
 
@@ -1248,8 +1537,8 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
     fn ensure_open(&mut self, coin: &str, mode: ArchiveMode, block: u64) -> parquet::errors::Result<()> {
         if self.file.is_none() {
             let (window_start, end) = rotation_bounds_for(self.stream, block);
-            let name_start = self.pending_start_block.unwrap_or(block);
-            self.open_file(coin, mode, name_start, block, window_start, end)?;
+            let logical_start = self.pending_start_block.unwrap_or(block);
+            self.open_file(coin, mode, logical_start, logical_start, window_start, end)?;
         }
         Ok(())
     }
@@ -1796,6 +2085,7 @@ impl StatusParquetWriter {
         match batch {
             StatusBlockBatch::Lite(columns) => write_status_lite_columns(&mut file.writer, &self.coin, columns)?,
             StatusBlockBatch::Full(columns) => write_status_full_columns(&mut file.writer, &self.coin, columns)?,
+            StatusBlockBatch::Hft(columns) => write_status_hft_columns(&mut file.writer, &self.coin, columns)?,
         }
         trim_allocator();
         self.active_start_block = None;
@@ -1854,6 +2144,7 @@ impl StatusParquetWriter {
         match (&mut self.active, rows) {
             (StatusBlockBatch::Lite(active), StatusBlockBatch::Lite(batch)) => active.append(batch),
             (StatusBlockBatch::Full(active), StatusBlockBatch::Full(batch)) => active.append(batch),
+            (StatusBlockBatch::Hft(active), StatusBlockBatch::Hft(batch)) => active.append(batch),
             _ => {
                 return Err(io_to_parquet_error(io_other(
                     "status block batch mode mismatch while appending status archive rows",
@@ -2219,13 +2510,49 @@ struct CoinWriters {
     fill: ParquetStreamWriter<FillOut>,
 }
 
+fn archive_writer_props() -> std::sync::Arc<WriterProperties> {
+    let zstd_level = ZstdLevel::try_new(3).unwrap_or_default();
+    std::sync::Arc::new(
+        WriterProperties::builder().set_compression(Compression::ZSTD(zstd_level)).set_dictionary_enabled(true).build(),
+    )
+}
+
+fn blocks_schema() -> std::sync::Arc<Type> {
+    std::sync::Arc::new(
+        parse_message_type(
+            "message blocks_schema {\n\
+                REQUIRED INT64 block_number;\n\
+                REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
+                REQUIRED BOOLEAN order_batch_ok;\n\
+                REQUIRED BOOLEAN diff_batch_ok;\n\
+                REQUIRED BOOLEAN fill_batch_ok;\n\
+                REQUIRED INT32 order_n;\n\
+                REQUIRED INT32 diff_n;\n\
+                REQUIRED INT32 fill_n;\n\
+                REQUIRED INT32 btc_status_n;\n\
+                REQUIRED INT32 btc_diff_n;\n\
+                REQUIRED INT32 btc_fill_n;\n\
+                REQUIRED INT32 eth_status_n;\n\
+                REQUIRED INT32 eth_diff_n;\n\
+                REQUIRED INT32 eth_fill_n;\n\
+                REQUIRED BINARY archive_mode (UTF8);\n\
+                REQUIRED BINARY tracked_symbols (UTF8);\n\
+            }",
+        )
+        .expect("invalid blocks schema"),
+    )
+}
+
 struct ArchiveWriters {
-    blocks: ParquetStreamWriter<BlockIndexOut>,
     diff: DiffWorkerHandle,
     coins: HashMap<String, CoinWriters>,
     symbols: Vec<String>,
     mode: ArchiveMode,
+    handoff_tx: Sender<HandoffMessage>,
+    handoff_config: ArchiveHandoffConfig,
     recover_blocks_fill_on_stop: bool,
+    blocks_segment_start: Option<u64>,
+    blocks_last_height: Option<u64>,
     pending_status_acks: HashMap<u64, usize>,
     next_uncommitted_height: Option<u64>,
     last_archived_height: Option<u64>,
@@ -2234,45 +2561,14 @@ struct ArchiveWriters {
 impl ArchiveWriters {
     fn new(mode: ArchiveMode, symbols: Vec<String>, handoff_tx: Sender<HandoffMessage>) -> Self {
         let handoff_config = current_archive_handoff_config();
-        let zstd_level = ZstdLevel::try_new(3).unwrap_or_default();
-        let props = std::sync::Arc::new(
-            WriterProperties::builder()
-                .set_compression(Compression::ZSTD(zstd_level))
-                .set_dictionary_enabled(true)
-                .build(),
-        );
-
-        let blocks_schema = std::sync::Arc::new(
-            parse_message_type(
-                "message blocks_schema {\n\
-                    REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY block_time (UTF8);\n\
-                    REQUIRED BOOLEAN order_batch_ok;\n\
-                    REQUIRED BOOLEAN diff_batch_ok;\n\
-                    REQUIRED BOOLEAN fill_batch_ok;\n\
-                    REQUIRED INT32 order_n;\n\
-                    REQUIRED INT32 diff_n;\n\
-                    REQUIRED INT32 fill_n;\n\
-                    REQUIRED INT32 btc_status_n;\n\
-                    REQUIRED INT32 btc_diff_n;\n\
-                    REQUIRED INT32 btc_fill_n;\n\
-                    REQUIRED INT32 eth_status_n;\n\
-                    REQUIRED INT32 eth_diff_n;\n\
-                    REQUIRED INT32 eth_fill_n;\n\
-                    REQUIRED BINARY archive_mode (UTF8);\n\
-                    REQUIRED BINARY tracked_symbols (UTF8);\n\
-                }",
-            )
-            .expect("invalid blocks schema"),
-        );
+        let props = archive_writer_props();
 
         let (status_schema_str, diff_schema_str, fill_schema_str) = match mode {
             ArchiveMode::Lite => (
                 "message status_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
                     REQUIRED BINARY coin (UTF8);\n\
-                    REQUIRED BINARY time (UTF8);\n\
                     REQUIRED BINARY user (UTF8);\n\
                     REQUIRED BINARY status (UTF8);\n\
                     REQUIRED INT64 oid;\n\
@@ -2280,7 +2576,6 @@ impl ArchiveWriters {
                     REQUIRED INT64 limit_px (DECIMAL(18, 8));\n\
                     REQUIRED INT64 sz (DECIMAL(18, 8));\n\
                     REQUIRED INT64 orig_sz (DECIMAL(18, 8));\n\
-                    REQUIRED INT64 timestamp;\n\
                     REQUIRED BOOLEAN is_trigger;\n\
                     REQUIRED BINARY tif (UTF8);\n\
                     REQUIRED BINARY trigger_condition (UTF8);\n\
@@ -2288,11 +2583,11 @@ impl ArchiveWriters {
                     REQUIRED BOOLEAN is_position_tpsl;\n\
                     REQUIRED BOOLEAN reduce_only;\n\
                     REQUIRED BINARY order_type (UTF8);\n\
-                    REQUIRED BINARY cloid (UTF8);\n\
+                    OPTIONAL BINARY cloid (UTF8);\n\
                 }",
                 "message diff_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
                     REQUIRED INT64 oid;\n\
                     REQUIRED BINARY side (UTF8);\n\
                     REQUIRED INT64 px (DECIMAL(18, 8));\n\
@@ -2302,20 +2597,71 @@ impl ArchiveWriters {
                 }",
                 "message fill_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
                     REQUIRED BINARY coin (UTF8);\n\
                     REQUIRED BINARY side (UTF8);\n\
                     REQUIRED INT64 px (DECIMAL(18, 8));\n\
                     REQUIRED INT64 sz (DECIMAL(18, 8));\n\
                     REQUIRED BOOLEAN crossed;\n\
                     REQUIRED INT64 oid;\n\
-                    REQUIRED INT64 time;\n\
+                }",
+            ),
+            ArchiveMode::Hft => (
+                "message status_schema {\n\
+                    REQUIRED INT64 block_number;\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
+                    REQUIRED BINARY coin (UTF8);\n\
+                    REQUIRED BINARY user (UTF8);\n\
+                    REQUIRED BINARY status (UTF8);\n\
+                    REQUIRED INT64 oid;\n\
+                    REQUIRED BINARY side (UTF8);\n\
+                    REQUIRED INT64 limit_px (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 orig_sz (DECIMAL(18, 8));\n\
+                    REQUIRED BOOLEAN is_trigger;\n\
+                    REQUIRED BINARY tif (UTF8);\n\
+                    REQUIRED BINARY trigger_condition (UTF8);\n\
+                    REQUIRED INT64 trigger_px (DECIMAL(18, 8));\n\
+                    REQUIRED BOOLEAN is_position_tpsl;\n\
+                    REQUIRED BOOLEAN reduce_only;\n\
+                    REQUIRED BINARY order_type (UTF8);\n\
+                    OPTIONAL BINARY cloid (UTF8);\n\
+                    REQUIRED BINARY hash (UTF8);\n\
+                    REQUIRED BINARY builder (UTF8);\n\
+                    OPTIONAL INT64 tp_trigger_px (DECIMAL(18, 8));\n\
+                    OPTIONAL INT64 sl_trigger_px (DECIMAL(18, 8));\n\
+                }",
+                "message diff_schema {\n\
+                    REQUIRED INT64 block_number;\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
+                    REQUIRED INT64 oid;\n\
+                    REQUIRED BINARY side (UTF8);\n\
+                    REQUIRED INT64 px (DECIMAL(18, 8));\n\
+                    REQUIRED INT32 diff_type;\n\
+                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 orig_sz (DECIMAL(18, 8));\n\
+                    REQUIRED BINARY user (UTF8);\n\
+                }",
+                "message fill_schema {\n\
+                    REQUIRED INT64 block_number;\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
+                    REQUIRED BINARY coin (UTF8);\n\
+                    REQUIRED BINARY side (UTF8);\n\
+                    REQUIRED INT64 px (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
+                    REQUIRED BOOLEAN crossed;\n\
+                    REQUIRED INT64 oid;\n\
+                    REQUIRED BINARY address (UTF8);\n\
+                    REQUIRED INT64 closed_pnl (DECIMAL(18, 8));\n\
+                    REQUIRED INT64 fee (DECIMAL(18, 8));\n\
+                    REQUIRED BINARY hash (UTF8);\n\
+                    REQUIRED INT64 tid;\n\
                 }",
             ),
             ArchiveMode::Full => (
                 "message status_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
                     REQUIRED BINARY coin (UTF8);\n\
                     REQUIRED BINARY status (UTF8);\n\
                     REQUIRED INT64 oid;\n\
@@ -2328,19 +2674,17 @@ impl ArchiveWriters {
                     REQUIRED BINARY order_type (UTF8);\n\
                     REQUIRED INT64 sz (DECIMAL(18, 8));\n\
                     REQUIRED INT64 orig_sz (DECIMAL(18, 8));\n\
-                    REQUIRED BINARY time (UTF8);\n\
                     REQUIRED BINARY builder (UTF8);\n\
-                    REQUIRED INT64 timestamp;\n\
                     REQUIRED BINARY trigger_condition (UTF8);\n\
                     REQUIRED INT64 trigger_px (DECIMAL(18, 8));\n\
                     REQUIRED BOOLEAN is_position_tpsl;\n\
                     REQUIRED BOOLEAN reduce_only;\n\
-                    REQUIRED BINARY cloid (UTF8);\n\
+                    OPTIONAL BINARY cloid (UTF8);\n\
                     REQUIRED BINARY raw_event (UTF8);\n\
                 }",
                 "message diff_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
                     REQUIRED BINARY coin (UTF8);\n\
                     REQUIRED INT64 oid;\n\
                     REQUIRED INT32 diff_type;\n\
@@ -2353,7 +2697,7 @@ impl ArchiveWriters {
                 }",
                 "message fill_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
                     REQUIRED BINARY coin (UTF8);\n\
                     REQUIRED BINARY side (UTF8);\n\
                     REQUIRED INT64 px (DECIMAL(18, 8));\n\
@@ -2365,11 +2709,10 @@ impl ArchiveWriters {
                     REQUIRED BINARY hash (UTF8);\n\
                     REQUIRED INT64 oid;\n\
                     REQUIRED INT64 tid;\n\
-                    REQUIRED INT64 time;\n\
                     REQUIRED INT64 start_position (DECIMAL(18, 8));\n\
                     REQUIRED BINARY dir (UTF8);\n\
                     REQUIRED BINARY fee_token (UTF8);\n\
-                    REQUIRED INT64 twap_id;\n\
+                    OPTIONAL INT64 twap_id;\n\
                     REQUIRED BINARY raw_event (UTF8);\n\
                 }",
             ),
@@ -2412,18 +2755,15 @@ impl ArchiveWriters {
         }
 
         Self {
-            blocks: ParquetStreamWriter::new(
-                StreamKind::Blocks,
-                blocks_schema,
-                props.clone(),
-                handoff_tx,
-                handoff_config,
-            ),
             diff,
             coins,
             symbols,
             mode,
+            handoff_tx,
+            handoff_config,
             recover_blocks_fill_on_stop: false,
+            blocks_segment_start: None,
+            blocks_last_height: None,
             pending_status_acks: HashMap::new(),
             next_uncommitted_height: None,
             last_archived_height: None,
@@ -2432,10 +2772,14 @@ impl ArchiveWriters {
 
     fn set_recover_blocks_fill_on_stop(&mut self, enabled: bool) {
         self.recover_blocks_fill_on_stop = enabled;
-        self.blocks.set_recover_blocks_fill_on_stop(enabled);
         for writers in self.coins.values_mut() {
             writers.fill.set_recover_blocks_fill_on_stop(enabled);
         }
+    }
+
+    fn record_blocks_height(&mut self, height: u64) {
+        self.blocks_segment_start.get_or_insert(height);
+        self.blocks_last_height = Some(height);
     }
 
     fn coin_mut(&mut self, coin: &str) -> Option<&mut CoinWriters> {
@@ -2495,7 +2839,15 @@ impl ArchiveWriters {
         if self.recover_blocks_fill_on_stop {
             return self.close_all_parallel_for_signal_stop();
         }
-        self.blocks.close_with_flush(self.mode, write_block_rows)?;
+        export_shared_blocks_segment(
+            self.mode,
+            &self.symbols,
+            self.blocks_segment_start,
+            self.blocks_last_height,
+            &self.handoff_tx,
+            &self.handoff_config,
+            self.recover_blocks_fill_on_stop,
+        )?;
         warn!("Archive close_all closed blocks");
         self.diff.close()?;
         warn!("Archive close_all closed diff");
@@ -2512,14 +2864,27 @@ impl ArchiveWriters {
 
     fn close_all_parallel_for_signal_stop(&mut self) -> parquet::errors::Result<()> {
         let mode = self.mode;
-        let blocks = &mut self.blocks;
+        let blocks_segment_start = self.blocks_segment_start;
+        let blocks_last_height = self.blocks_last_height;
+        let blocks_symbols = self.symbols.clone();
+        let blocks_handoff_tx = self.handoff_tx.clone();
+        let blocks_handoff_config = self.handoff_config.clone();
+        let recover_blocks_fill_on_stop = self.recover_blocks_fill_on_stop;
         let diff = &mut self.diff;
         let coins = &mut self.coins;
         let mut first_error: Option<parquet::errors::ParquetError> = None;
 
         thread::scope(|scope| {
             let blocks_handle = scope.spawn(move || -> parquet::errors::Result<()> {
-                blocks.close_with_flush(mode, write_block_rows)?;
+                export_shared_blocks_segment(
+                    mode,
+                    &blocks_symbols,
+                    blocks_segment_start,
+                    blocks_last_height,
+                    &blocks_handoff_tx,
+                    &blocks_handoff_config,
+                    recover_blocks_fill_on_stop,
+                )?;
                 warn!("Archive close_all closed blocks");
                 Ok(())
             });
@@ -2582,7 +2947,6 @@ impl ArchiveWriters {
     }
 
     fn abort_all(&mut self) {
-        self.blocks.abort();
         self.diff.abort();
         for (_, writers) in std::mem::take(&mut self.coins) {
             let mut writers = writers;
@@ -2799,7 +3163,6 @@ fn preflight_startup_local_recovery(
     observed_height: u64,
     handoff_tx: &Sender<HandoffMessage>,
 ) -> parquet::errors::Result<()> {
-    preflight_local_recovery_discontinuity::<BlockIndexOut>(StreamKind::Blocks, "", mode, observed_height, handoff_tx)?;
     for coin in symbols {
         preflight_local_recovery_discontinuity::<FillOut>(StreamKind::Fill, coin, mode, observed_height, handoff_tx)?;
     }
@@ -2861,7 +3224,7 @@ fn read_local_blocks_rows(path: &Path) -> parquet::errors::Result<Vec<BlockIndex
         let row = row.map_err(io_to_parquet_error)?;
         rows.push(BlockIndexOut {
             block_number: row.get_long(0).map_err(io_to_parquet_error)? as u64,
-            block_time: row.get_string(1).map_err(io_to_parquet_error)?.clone(),
+            block_time: format_timestamp_millis(row.get_long(1).map_err(io_to_parquet_error)?)?,
             order_batch_ok: row.get_bool(2).map_err(io_to_parquet_error)?,
             diff_batch_ok: row.get_bool(3).map_err(io_to_parquet_error)?,
             fill_batch_ok: row.get_bool(4).map_err(io_to_parquet_error)?,
@@ -2881,6 +3244,114 @@ fn read_local_blocks_rows(path: &Path) -> parquet::errors::Result<Vec<BlockIndex
     Ok(rows)
 }
 
+fn shared_blocks_row(
+    block_number: u64,
+    block_time: String,
+    order_n: i32,
+    diff_n: i32,
+    fill_n: i32,
+    btc_status_n: i32,
+    btc_diff_n: i32,
+    btc_fill_n: i32,
+    eth_status_n: i32,
+    eth_diff_n: i32,
+    eth_fill_n: i32,
+) -> BlockIndexOut {
+    BlockIndexOut {
+        block_number,
+        block_time,
+        order_batch_ok: true,
+        diff_batch_ok: true,
+        fill_batch_ok: true,
+        order_n,
+        diff_n,
+        fill_n,
+        btc_status_n,
+        btc_diff_n,
+        btc_fill_n,
+        eth_status_n,
+        eth_diff_n,
+        eth_fill_n,
+        archive_mode: "shared".to_string(),
+        tracked_symbols: String::new(),
+    }
+}
+
+fn export_shared_blocks_segment(
+    mode: ArchiveMode,
+    symbols: &[String],
+    segment_start_block: Option<u64>,
+    last_block: Option<u64>,
+    handoff_tx: &Sender<HandoffMessage>,
+    handoff_config: &ArchiveHandoffConfig,
+    recover_locally: bool,
+) -> parquet::errors::Result<()> {
+    if recover_locally {
+        return Ok(());
+    }
+    let Some(start_block) = segment_start_block else {
+        return Ok(());
+    };
+    let Some(mut logical_end_block) = last_block else {
+        return Ok(());
+    };
+    if current_archive_align_output_to_1000_boundary() {
+        let Some(aligned_end) = aligned_archive_output_end(logical_end_block) else {
+            return Ok(());
+        };
+        logical_end_block = aligned_end;
+    }
+    if logical_end_block < start_block {
+        return Ok(());
+    }
+    let span_blocks = logical_end_block.saturating_sub(start_block) + 1;
+    if span_blocks < MIN_HANDOFF_BLOCK_SPAN {
+        info!("Archive finalized but dropping short parquet blocks span={}", span_blocks);
+        return Ok(());
+    }
+    let shared_rows = {
+        let shared = shared_blocks_index().lock().expect("shared blocks index");
+        shared.collect_rows(start_block, logical_end_block)?
+    };
+    if shared_rows.is_empty() {
+        return Ok(());
+    }
+    let archive_mode = match mode {
+        ArchiveMode::Lite => "lite".to_string(),
+        ArchiveMode::Full => "full".to_string(),
+        ArchiveMode::Hft => "hft".to_string(),
+    };
+    let tracked_symbols = symbols.join(",");
+    let rows: Vec<BlockIndexOut> = shared_rows
+        .into_iter()
+        .map(|row| BlockIndexOut {
+            archive_mode: archive_mode.clone(),
+            tracked_symbols: tracked_symbols.clone(),
+            ..row
+        })
+        .collect();
+    let base_dir = current_archive_base_dir();
+    fs::create_dir_all(&base_dir).map_err(io_to_parquet_error)?;
+    let final_path =
+        base_dir.join(format!("blocks_{}_{}{}", start_block, logical_end_block, FINAL_PARQUET_FILE_SUFFIX));
+    let tmp_path = final_path.with_file_name(format!(
+        "{}{}",
+        final_path.file_name().and_then(|name| name.to_str()).unwrap_or("blocks.parquet"),
+        TEMP_FILE_SUFFIX
+    ));
+    if tmp_path.exists() {
+        fs::remove_file(&tmp_path).map_err(io_to_parquet_error)?;
+    }
+    let file = fs::File::create(&tmp_path).map_err(io_to_parquet_error)?;
+    let mut writer = SerializedFileWriter::new(file, blocks_schema(), archive_writer_props())?;
+    write_block_rows(&mut writer, mode, &rows)?;
+    writer.close()?;
+    fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
+    let relative_path = archive_relative_dir(StreamKind::Blocks, ArchiveMode::Lite, "")
+        .join(format!("blocks_{}_{}{}", start_block, logical_end_block, FINAL_PARQUET_FILE_SUFFIX));
+    enqueue_handoff_task(handoff_tx, handoff_config, final_path, relative_path)
+}
+
 fn read_local_fill_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Result<Vec<FillOut>> {
     let reader = SerializedFileReader::try_from(path).map_err(io_to_parquet_error)?;
     let iter = reader.get_row_iter(None).map_err(io_to_parquet_error)?;
@@ -2889,7 +3360,7 @@ fn read_local_fill_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
         let row = row.map_err(io_to_parquet_error)?;
         let mut out = FillOut {
             block_number: row.get_long(0).map_err(io_to_parquet_error)? as u64,
-            block_time: row.get_string(1).map_err(io_to_parquet_error)?.clone(),
+            block_time: format_timestamp_millis(row.get_long(1).map_err(io_to_parquet_error)?)?,
             coin: row.get_string(2).map_err(io_to_parquet_error)?.clone(),
             side: row.get_string(3).map_err(io_to_parquet_error)?.clone(),
             px: decimal_to_i64(row.get_decimal(4).map_err(io_to_parquet_error)?)?,
@@ -2901,17 +3372,23 @@ fn read_local_fill_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
             hash: String::new(),
             oid: 0,
             tid: 0,
-            time: 0,
             start_position: 0,
             dir: String::new(),
             fee_token: String::new(),
-            twap_id: 0,
+            twap_id: None,
             raw_event: String::new(),
         };
         match mode {
             ArchiveMode::Lite => {
                 out.oid = row.get_long(7).map_err(io_to_parquet_error)? as u64;
-                out.time = row.get_long(8).map_err(io_to_parquet_error)?;
+            }
+            ArchiveMode::Hft => {
+                out.oid = row.get_long(7).map_err(io_to_parquet_error)? as u64;
+                out.address = row.get_string(8).map_err(io_to_parquet_error)?.clone();
+                out.closed_pnl = decimal_to_i64(row.get_decimal(9).map_err(io_to_parquet_error)?)?;
+                out.fee = decimal_to_i64(row.get_decimal(10).map_err(io_to_parquet_error)?)?;
+                out.hash = row.get_string(11).map_err(io_to_parquet_error)?.clone();
+                out.tid = row.get_long(12).map_err(io_to_parquet_error)? as u64;
             }
             ArchiveMode::Full => {
                 out.address = row.get_string(7).map_err(io_to_parquet_error)?.clone();
@@ -2920,11 +3397,19 @@ fn read_local_fill_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.hash = row.get_string(10).map_err(io_to_parquet_error)?.clone();
                 out.oid = row.get_long(11).map_err(io_to_parquet_error)? as u64;
                 out.tid = row.get_long(12).map_err(io_to_parquet_error)? as u64;
-                out.time = row.get_long(13).map_err(io_to_parquet_error)?;
-                out.start_position = decimal_to_i64(row.get_decimal(14).map_err(io_to_parquet_error)?)?;
-                out.dir = row.get_string(15).map_err(io_to_parquet_error)?.clone();
-                out.fee_token = row.get_string(16).map_err(io_to_parquet_error)?.clone();
-                out.twap_id = row.get_long(17).map_err(io_to_parquet_error)?;
+                out.start_position = decimal_to_i64(row.get_decimal(13).map_err(io_to_parquet_error)?)?;
+                out.dir = row.get_string(14).map_err(io_to_parquet_error)?.clone();
+                out.fee_token = row.get_string(15).map_err(io_to_parquet_error)?.clone();
+                out.twap_id = match row.get_column_iter().nth(16).map(|(_, field)| field) {
+                    Some(parquet::record::Field::Long(value)) => Some(*value),
+                    Some(parquet::record::Field::Null) => None,
+                    Some(field) => {
+                        return Err(io_to_parquet_error(io_other(format!(
+                            "unexpected twap_id parquet field value {field:?}"
+                        ))));
+                    }
+                    None => None,
+                };
                 out.raw_event = row.get_string(18).map_err(io_to_parquet_error)?.clone();
             }
         }
@@ -3001,6 +3486,9 @@ fn ensure_archive_disk_headroom(base_dir: &Path) -> std::io::Result<()> {
 }
 
 fn cleanup_stale_temp_files(base_dir: &Path) {
+    if ARCHIVE_STALE_TMP_CLEANED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let mut stack = vec![base_dir.to_path_buf()];
     let mut removed = 0usize;
     while let Some(dir) = stack.pop() {
@@ -3564,12 +4052,129 @@ fn flatten_to_string(v: &serde_json::Value) -> String {
     }
 }
 
+fn extract_hft_child_trigger_px(children: &serde_json::Value) -> (String, String) {
+    let mut tp_trigger_px = String::new();
+    let mut sl_trigger_px = String::new();
+    let Some(items) = children.as_array() else {
+        return (tp_trigger_px, sl_trigger_px);
+    };
+    for child in items {
+        let Some(obj) = child.as_object() else {
+            continue;
+        };
+        let order_type = obj.get("orderType").and_then(|v| v.as_str()).unwrap_or_default();
+        let trigger_px = obj.get("triggerPx").map_or_else(String::new, flatten_to_string);
+        if tp_trigger_px.is_empty() && order_type.starts_with("Take Profit") {
+            tp_trigger_px = trigger_px;
+        } else if sl_trigger_px.is_empty() && order_type.starts_with("Stop") {
+            sl_trigger_px = trigger_px;
+        }
+    }
+    (tp_trigger_px, sl_trigger_px)
+}
+
 fn byte_array_from_string(value: String) -> ByteArray {
     ByteArray::from(value.into_bytes())
 }
 
 fn byte_array_from_str(value: &str) -> ByteArray {
     ByteArray::from(value.as_bytes().to_vec())
+}
+
+fn byte_array_to_string(value: &ByteArray) -> parquet::errors::Result<String> {
+    String::from_utf8(value.data().to_vec())
+        .map_err(|err| io_to_parquet_error(io_other(format!("invalid utf8 in archive byte array: {err}"))))
+}
+
+fn infer_epoch_timestamp_millis(value: i64) -> parquet::errors::Result<i64> {
+    let abs = value.saturating_abs();
+    if abs >= 1_000_000_000_000_000_000 {
+        Ok(value / 1_000_000)
+    } else if abs >= 1_000_000_000_000_000 {
+        Ok(value / 1_000)
+    } else if abs >= 1_000_000_000_000 {
+        Ok(value)
+    } else {
+        value
+            .checked_mul(1_000)
+            .ok_or_else(|| io_to_parquet_error(io_other(format!("timestamp seconds overflow: {value}"))))
+    }
+}
+
+fn parse_timestamp_millis(value: &str) -> parquet::errors::Result<i64> {
+    let value = value.trim();
+    if let Ok(raw) = value.parse::<i64>() {
+        return infer_epoch_timestamp_millis(raw);
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.timestamp_millis());
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Ok(dt.and_utc().timestamp_millis());
+    }
+    Err(io_to_parquet_error(io_other(format!("invalid timestamp '{value}'"))))
+}
+
+fn parse_timestamp_column_millis(values: &[ByteArray]) -> parquet::errors::Result<Vec<i64>> {
+    values.iter().map(|value| byte_array_to_string(value).and_then(|s| parse_timestamp_millis(&s))).collect()
+}
+
+fn format_timestamp_millis(value: i64) -> parquet::errors::Result<String> {
+    let seconds = value.div_euclid(1_000);
+    let millis = value.rem_euclid(1_000) as u32;
+    let nanos = millis.saturating_mul(1_000_000);
+    let dt = DateTime::<Utc>::from_timestamp(seconds, nanos)
+        .ok_or_else(|| io_to_parquet_error(io_other(format!("timestamp millis overflow: {value}"))))?;
+    Ok(dt.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
+fn parse_optional_scaled_decimal_column(
+    values: &[ByteArray],
+    scale: u32,
+) -> parquet::errors::Result<(Vec<i64>, Vec<i16>)> {
+    let mut parsed = Vec::new();
+    let mut def_levels = Vec::with_capacity(values.len());
+    for value in values {
+        let text = byte_array_to_string(value)?;
+        if text.is_empty() {
+            def_levels.push(0);
+            continue;
+        }
+        let scaled = parse_scaled(&text, scale)
+            .ok_or_else(|| io_to_parquet_error(io_other(format!("invalid decimal '{text}' with scale {scale}"))))?;
+        parsed.push(scaled);
+        def_levels.push(1);
+    }
+    Ok((parsed, def_levels))
+}
+
+fn parse_optional_utf8_column(values: &[ByteArray]) -> parquet::errors::Result<(Vec<ByteArray>, Vec<i16>)> {
+    let mut parsed = Vec::new();
+    let mut def_levels = Vec::with_capacity(values.len());
+    for value in values {
+        let text = byte_array_to_string(value)?;
+        if text.is_empty() {
+            def_levels.push(0);
+            continue;
+        }
+        parsed.push(ByteArray::from(text.into_bytes()));
+        def_levels.push(1);
+    }
+    Ok((parsed, def_levels))
+}
+
+fn parse_optional_i64_column(values: &[Option<i64>]) -> (Vec<i64>, Vec<i16>) {
+    let mut parsed = Vec::new();
+    let mut def_levels = Vec::with_capacity(values.len());
+    for value in values {
+        if let Some(value) = value {
+            parsed.push(*value);
+            def_levels.push(1);
+        } else {
+            def_levels.push(0);
+        }
+    }
+    (parsed, def_levels)
 }
 
 fn write_status_lite_columns(
@@ -3583,7 +4188,6 @@ fn write_status_lite_columns(
     let StatusLiteColumns {
         block_number,
         block_time,
-        time,
         user,
         status,
         oid,
@@ -3591,7 +4195,6 @@ fn write_status_lite_columns(
         limit_px,
         sz,
         orig_sz,
-        timestamp,
         is_trigger,
         tif,
         trigger_condition,
@@ -3600,9 +4203,13 @@ fn write_status_lite_columns(
         reduce_only,
         order_type,
         cloid,
+        time: _,
+        timestamp: _,
     } = rows;
     let mut row_group = file.next_row_group()?;
     let coins = vec![byte_array_from_str(coin); block_number.len()];
+    let block_time_millis = parse_timestamp_column_millis(&block_time)?;
+    let (cloid_values, cloid_def_levels) = parse_optional_utf8_column(&cloid)?;
 
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
@@ -3611,20 +4218,14 @@ fn write_status_lite_columns(
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_time, None, None)?;
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&block_time_millis, None, None)?;
         }
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
             typed.write_batch(&coins, None, None)?;
-        }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&time, None, None)?;
         }
         col.close()?;
     }
@@ -3667,12 +4268,6 @@ fn write_status_lite_columns(
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
             typed.write_batch(&orig_sz, None, None)?;
-        }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&timestamp, None, None)?;
         }
         col.close()?;
     }
@@ -3720,7 +4315,7 @@ fn write_status_lite_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&cloid, None, None)?;
+            typed.write_batch(&cloid_values, Some(&cloid_def_levels), None)?;
         }
         col.close()?;
     }
@@ -3752,18 +4347,22 @@ fn write_status_full_columns(
         order_type,
         sz,
         orig_sz,
-        time,
         builder,
-        timestamp,
         trigger_condition,
         trigger_px,
+        tp_trigger_px: _,
+        sl_trigger_px: _,
         is_position_tpsl,
         reduce_only,
         cloid,
         raw_event,
+        time: _,
+        timestamp: _,
     } = rows;
     let mut row_group = file.next_row_group()?;
     let coins = vec![byte_array_from_str(coin); block_number.len()];
+    let block_time_millis = parse_timestamp_column_millis(&block_time)?;
+    let (cloid_values, cloid_def_levels) = parse_optional_utf8_column(&cloid)?;
 
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
@@ -3772,8 +4371,8 @@ fn write_status_full_columns(
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_time, None, None)?;
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&block_time_millis, None, None)?;
         }
         col.close()?;
     }
@@ -3851,19 +4450,7 @@ fn write_status_full_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&time, None, None)?;
-        }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
             typed.write_batch(&builder, None, None)?;
-        }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&timestamp, None, None)?;
         }
         col.close()?;
     }
@@ -3893,7 +4480,7 @@ fn write_status_full_columns(
     }
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&cloid, None, None)?;
+            typed.write_batch(&cloid_values, Some(&cloid_def_levels), None)?;
         }
         col.close()?;
     }
@@ -3921,6 +4508,7 @@ fn write_diff_rows(
 
     let block_numbers: Vec<i64> = rows.iter().map(|r| r.block_number as i64).collect();
     let block_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.block_time.as_bytes())).collect();
+    let block_time_millis = parse_timestamp_column_millis(&block_times)?;
     let oids: Vec<i64> = rows.iter().map(|r| r.oid as i64).collect();
     let sides: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.side.as_bytes())).collect();
     let pxs: Vec<i64> = rows.iter().map(|r| r.px).collect();
@@ -3936,8 +4524,8 @@ fn write_diff_rows(
             col.close()?;
         }
         if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&block_times, None, None)?;
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_time_millis, None, None)?;
             }
             col.close()?;
         }
@@ -3977,6 +4565,63 @@ fn write_diff_rows(
             }
             col.close()?;
         }
+    } else if mode == ArchiveMode::Hft {
+        let users: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.user.as_bytes())).collect();
+
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_numbers, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_time_millis, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&oids, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sides, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&pxs, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&diff_types, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sizes, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&orig_szs, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&users, None, None)?;
+            }
+            col.close()?;
+        }
     } else {
         let coins: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.coin.as_bytes())).collect();
         let users: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.user.as_bytes())).collect();
@@ -3989,8 +4634,8 @@ fn write_diff_rows(
             col.close()?;
         }
         if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&block_times, None, None)?;
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_time_millis, None, None)?;
             }
             col.close()?;
         }
@@ -4067,14 +4712,13 @@ fn write_fill_rows(
 
     let block_numbers: Vec<i64> = rows.iter().map(|r| r.block_number as i64).collect();
     let block_times: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.block_time.as_bytes())).collect();
+    let block_time_millis = parse_timestamp_column_millis(&block_times)?;
     let coins: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.coin.as_bytes())).collect();
     let sides: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.side.as_bytes())).collect();
     let px: Vec<i64> = rows.iter().map(|r| r.px).collect();
     let sz: Vec<i64> = rows.iter().map(|r| r.sz).collect();
     let crossed: Vec<bool> = rows.iter().map(|r| r.crossed).collect();
     let oids: Vec<i64> = rows.iter().map(|r| r.oid as i64).collect();
-    let times: Vec<i64> = rows.iter().map(|r| r.time).collect();
-
     if mode == ArchiveMode::Lite {
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
@@ -4083,8 +4727,62 @@ fn write_fill_rows(
             col.close()?;
         }
         if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_time_millis, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&block_times, None, None)?;
+                typed.write_batch(&coins, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sides, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&px, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sz, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&crossed, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&oids, None, None)?;
+            }
+            col.close()?;
+        }
+    } else if mode == ArchiveMode::Hft {
+        let addresses: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.address.as_bytes())).collect();
+        let pnls: Vec<i64> = rows.iter().map(|r| r.closed_pnl).collect();
+        let fees: Vec<i64> = rows.iter().map(|r| r.fee).collect();
+        let hashes: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.hash.as_bytes())).collect();
+        let tids: Vec<i64> = rows.iter().map(|r| r.tid as i64).collect();
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_numbers, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_time_millis, None, None)?;
             }
             col.close()?;
         }
@@ -4125,8 +4823,32 @@ fn write_fill_rows(
             col.close()?;
         }
         if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&addresses, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&times, None, None)?;
+                typed.write_batch(&pnls, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&fees, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&hashes, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&tids, None, None)?;
             }
             col.close()?;
         }
@@ -4139,7 +4861,8 @@ fn write_fill_rows(
         let start_positions: Vec<i64> = rows.iter().map(|r| r.start_position).collect();
         let dirs: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.dir.as_bytes())).collect();
         let fee_tokens: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.fee_token.as_bytes())).collect();
-        let twap_ids: Vec<i64> = rows.iter().map(|r| r.twap_id).collect();
+        let twap_ids: Vec<Option<i64>> = rows.iter().map(|r| r.twap_id).collect();
+        let (twap_id_values, twap_id_def_levels) = parse_optional_i64_column(&twap_ids);
         let raw_events: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.raw_event.as_bytes())).collect();
 
         if let Some(mut col) = row_group.next_column()? {
@@ -4149,8 +4872,8 @@ fn write_fill_rows(
             col.close()?;
         }
         if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&block_times, None, None)?;
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&block_time_millis, None, None)?;
             }
             col.close()?;
         }
@@ -4222,12 +4945,6 @@ fn write_fill_rows(
         }
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&times, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&start_positions, None, None)?;
             }
             col.close()?;
@@ -4246,7 +4963,7 @@ fn write_fill_rows(
         }
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&twap_ids, None, None)?;
+                typed.write_batch(&twap_id_values, Some(&twap_id_def_levels), None)?;
             }
             col.close()?;
         }
@@ -4256,6 +4973,185 @@ fn write_fill_rows(
             }
             col.close()?;
         }
+    }
+
+    row_group.close()?;
+    trim_allocator();
+    Ok(())
+}
+
+fn write_status_hft_columns(
+    file: &mut SerializedFileWriter<std::fs::File>,
+    coin: &str,
+    rows: StatusFullColumns,
+) -> parquet::errors::Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let StatusFullColumns {
+        block_number,
+        block_time,
+        status,
+        oid,
+        side,
+        limit_px,
+        is_trigger,
+        tif,
+        user,
+        hash,
+        order_type,
+        sz,
+        orig_sz,
+        builder,
+        trigger_condition,
+        trigger_px,
+        tp_trigger_px,
+        sl_trigger_px,
+        is_position_tpsl,
+        reduce_only,
+        cloid,
+        raw_event: _,
+        time: _,
+        timestamp: _,
+    } = rows;
+    let mut row_group = file.next_row_group()?;
+    let coins = vec![byte_array_from_str(coin); block_number.len()];
+    let block_time_millis = parse_timestamp_column_millis(&block_time)?;
+    let (cloid_values, cloid_def_levels) = parse_optional_utf8_column(&cloid)?;
+    let (tp_trigger_px_values, tp_trigger_px_def_levels) = parse_optional_scaled_decimal_column(&tp_trigger_px, 8)?;
+    let (sl_trigger_px_values, sl_trigger_px_def_levels) = parse_optional_scaled_decimal_column(&sl_trigger_px, 8)?;
+
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&block_number, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&block_time_millis, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&coins, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&user, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&status, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&oid, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&side, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&limit_px, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&sz, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&orig_sz, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&is_trigger, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&tif, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&trigger_condition, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&trigger_px, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&is_position_tpsl, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&reduce_only, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&order_type, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&cloid_values, Some(&cloid_def_levels), None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&hash, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&builder, None, None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&tp_trigger_px_values, Some(&tp_trigger_px_def_levels), None)?;
+        }
+        col.close()?;
+    }
+    if let Some(mut col) = row_group.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&sl_trigger_px_values, Some(&sl_trigger_px_def_levels), None)?;
+        }
+        col.close()?;
     }
 
     row_group.close()?;
@@ -4275,6 +5171,7 @@ fn write_block_rows(
 
     let block_numbers: Vec<i64> = rows.iter().map(|row| row.block_number as i64).collect();
     let block_times: Vec<ByteArray> = rows.iter().map(|row| ByteArray::from(row.block_time.as_bytes())).collect();
+    let block_time_millis = parse_timestamp_column_millis(&block_times)?;
     let order_batch_ok: Vec<bool> = rows.iter().map(|row| row.order_batch_ok).collect();
     let diff_batch_ok: Vec<bool> = rows.iter().map(|row| row.diff_batch_ok).collect();
     let fill_batch_ok: Vec<bool> = rows.iter().map(|row| row.fill_batch_ok).collect();
@@ -4298,8 +5195,8 @@ fn write_block_rows(
         col.close()?;
     }
     if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&block_times, None, None)?;
+        if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+            typed.write_batch(&block_time_millis, None, None)?;
         }
         col.close()?;
     }
@@ -4484,7 +5381,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 continue;
             }
         };
-        let order_batch_raw: Option<BatchLite<serde_json::Value>> = if mode == ArchiveMode::Full {
+        let order_batch_raw: Option<BatchLite<serde_json::Value>> = if matches!(mode, ArchiveMode::Full) {
             match serde_json::from_slice(&msg.order_line) {
                 Ok(batch) => Some(batch),
                 Err(err) => {
@@ -4502,7 +5399,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 continue;
             }
         };
-        let diff_batch_raw: Option<BatchLite<serde_json::Value>> = if mode == ArchiveMode::Full {
+        let diff_batch_raw: Option<BatchLite<serde_json::Value>> = if matches!(mode, ArchiveMode::Full) {
             match serde_json::from_slice(&msg.diffs_line) {
                 Ok(batch) => Some(batch),
                 Err(err) => {
@@ -4520,7 +5417,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 continue;
             }
         };
-        let fill_batch_raw: Option<BatchLite<serde_json::Value>> = if mode == ArchiveMode::Full {
+        let fill_batch_raw: Option<BatchLite<serde_json::Value>> = if matches!(mode, ArchiveMode::Full) {
             match serde_json::from_slice(&msg.fills_line) {
                 Ok(batch) => Some(batch),
                 Err(err) => {
@@ -4636,12 +5533,6 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         let order_n = order_batch.events.len() as i32;
         let diff_n = diff_batch.events.len() as i32;
         let fill_n = fill_batch.events.len() as i32;
-        let tracked_symbols = writers.as_ref().expect("writers checked above").symbols.join(",");
-        let archive_mode = match mode {
-            ArchiveMode::Lite => "lite".to_string(),
-            ArchiveMode::Full => "full".to_string(),
-        };
-
         set_archive_phase(Some(height), "build_status_rows");
         let mut status_rows: HashMap<String, StatusBlockBatch> = HashMap::new();
         let mut btc_status_n = 0;
@@ -4664,6 +5555,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 orig_sz,
                 tif,
                 cloid,
+                children,
             } = status.order;
             if coin == "BTC" {
                 btc_status_n += 1;
@@ -4673,7 +5565,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             if !writers.as_ref().expect("writers checked above").has_coin(&coin) {
                 continue;
             }
-            let (s_px, s_sz, s_orig, s_trig) = if mode == ArchiveMode::Full {
+            let (s_px, s_sz, s_orig, s_trig) = if mode.uses_full_scaling() {
                 (
                     parse_scaled(&limit_px, 8).unwrap_or(0),
                     parse_scaled(&sz, 8).unwrap_or(0),
@@ -4688,6 +5580,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     parse_scaled(&trigger_px, LITE_PRICE_SCALE).unwrap_or(0),
                 )
             };
+            let (tp_child_trigger_px, sl_child_trigger_px) = extract_hft_child_trigger_px(&children);
             let entry = status_rows.entry(coin.clone()).or_insert_with(|| StatusBlockBatch::new(mode));
             match entry {
                 StatusBlockBatch::Lite(columns) => {
@@ -4730,6 +5623,8 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     columns.timestamp.push(timestamp as i64);
                     columns.trigger_condition.push(byte_array_from_string(trigger_condition));
                     columns.trigger_px.push(s_trig);
+                    columns.tp_trigger_px.push(ByteArray::from(Vec::<u8>::new()));
+                    columns.sl_trigger_px.push(ByteArray::from(Vec::<u8>::new()));
                     columns.is_position_tpsl.push(is_position_tpsl);
                     columns.reduce_only.push(reduce_only);
                     columns.cloid.push(byte_array_from_string(flatten_to_string(&cloid)));
@@ -4739,6 +5634,32 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                             .and_then(|batch| batch.events.get(idx))
                             .map_or_else(String::new, serde_json::Value::to_string),
                     ));
+                }
+                StatusBlockBatch::Hft(columns) => {
+                    columns.block_number.push(height as i64);
+                    columns.block_time.push(block_time_bytes.clone());
+                    columns.status.push(byte_array_from_string(status.status));
+                    columns.oid.push(oid as i64);
+                    columns.side.push(byte_array_from_string(side));
+                    columns.limit_px.push(s_px);
+                    columns.is_trigger.push(is_trigger);
+                    columns.tif.push(byte_array_from_string(tif.unwrap_or_default()));
+                    columns.user.push(byte_array_from_string(status.user.unwrap_or_default()));
+                    columns.hash.push(byte_array_from_string(flatten_to_string(&status.hash)));
+                    columns.order_type.push(byte_array_from_string(order_type));
+                    columns.sz.push(s_sz);
+                    columns.orig_sz.push(s_orig);
+                    columns.time.push(byte_array_from_string(status.time));
+                    columns.builder.push(byte_array_from_string(flatten_to_string(&status.builder)));
+                    columns.timestamp.push(timestamp as i64);
+                    columns.trigger_condition.push(byte_array_from_string(trigger_condition));
+                    columns.trigger_px.push(s_trig);
+                    columns.tp_trigger_px.push(byte_array_from_string(tp_child_trigger_px));
+                    columns.sl_trigger_px.push(byte_array_from_string(sl_child_trigger_px));
+                    columns.is_position_tpsl.push(is_position_tpsl);
+                    columns.reduce_only.push(reduce_only);
+                    columns.cloid.push(byte_array_from_string(flatten_to_string(&cloid)));
+                    columns.raw_event.push(ByteArray::from(Vec::<u8>::new()));
                 }
             }
         }
@@ -4757,7 +5678,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             if !writers.as_ref().expect("writers checked above").has_coin(&coin) {
                 continue;
             }
-            let (d_px, d_sz, d_orig, diff_type) = if mode == ArchiveMode::Full {
+            let (d_px, d_sz, d_orig, diff_type) = if mode.uses_full_scaling() {
                 let (dt, sz, osz) = match raw_book_diff {
                     RawDiffLite::New { sz } => (0u8, parse_scaled(&sz, 8).unwrap_or(0), 0i64),
                     RawDiffLite::Update { orig_sz, new_sz } => {
@@ -4808,7 +5729,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 px,
                 sz,
                 side,
-                time,
+                _time: _,
                 start_position,
                 dir,
                 closed_pnl,
@@ -4829,7 +5750,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             if !writers.as_ref().expect("writers checked above").has_coin(&coin) {
                 continue;
             }
-            let (f_px, f_sz, f_pnl, f_fee, f_start) = if mode == ArchiveMode::Full {
+            let (f_px, f_sz, f_pnl, f_fee, f_start) = if mode.uses_full_scaling() {
                 (
                     parse_scaled(&px, 8).unwrap_or(0),
                     parse_scaled(&sz, 8).unwrap_or(0),
@@ -4860,11 +5781,10 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 hash,
                 oid,
                 tid,
-                time: time as i64,
                 start_position: f_start,
                 dir,
                 fee_token,
-                twap_id: twap_id.unwrap_or(0) as i64,
+                twap_id: twap_id.map(|value| value as i64),
                 raw_event: fill_batch_raw
                     .as_ref()
                     .and_then(|batch| batch.events.get(idx))
@@ -4876,40 +5796,24 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         set_archive_phase(Some(height), "blocks_advance_append");
         let mut fatal_error: Option<String> = None;
         let writers_ref = writers.as_mut().expect("writers checked above");
-        if let Err(err) = writers_ref.blocks.advance_block(mode, height, write_block_rows) {
-            disable_archive_after_failure(
-                &mut writers,
-                &mut current_mode,
-                &mut current_symbols,
-                height,
-                &format!("blocks advance failed: {err}"),
-            );
-            continue;
-        }
-        if let Err(err) = writers_ref.blocks.append_rows(
-            "blocks",
-            mode,
+        let shared_blocks_row = shared_blocks_row(
             height,
-            vec![BlockIndexOut {
-                block_number: height,
-                block_time: block_time.clone(),
-                order_batch_ok: true,
-                diff_batch_ok: true,
-                fill_batch_ok: true,
-                order_n,
-                diff_n,
-                fill_n,
-                btc_status_n,
-                btc_diff_n,
-                btc_fill_n,
-                eth_status_n,
-                eth_diff_n,
-                eth_fill_n,
-                archive_mode,
-                tracked_symbols,
-            }],
-            write_block_rows,
-        ) {
+            block_time.clone(),
+            order_n,
+            diff_n,
+            fill_n,
+            btc_status_n,
+            btc_diff_n,
+            btc_fill_n,
+            eth_status_n,
+            eth_diff_n,
+            eth_fill_n,
+        );
+        let append_blocks_result = {
+            let mut shared = shared_blocks_index().lock().expect("shared blocks index");
+            shared.append(shared_blocks_row, &handoff_tx)
+        };
+        if let Err(err) = append_blocks_result {
             disable_archive_after_failure(
                 &mut writers,
                 &mut current_mode,
@@ -4919,6 +5823,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             );
             continue;
         }
+        writers_ref.record_blocks_height(height);
 
         writers_ref.register_status_block(height);
 
@@ -5101,7 +6006,7 @@ mod tests {
             parse_message_type(
                 "message blocks_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
                     REQUIRED BOOLEAN order_batch_ok;\n\
                     REQUIRED BOOLEAN diff_batch_ok;\n\
                     REQUIRED BOOLEAN fill_batch_ok;\n\
@@ -5125,7 +6030,7 @@ mod tests {
 
         let make_row = |block_number: u64| BlockIndexOut {
             block_number,
-            block_time: format!("t{block_number}"),
+            block_time: format!("2026-03-21T07:{:02}:00.000000Z", block_number % 60),
             order_batch_ok: true,
             diff_batch_ok: true,
             fill_batch_ok: true,
@@ -5142,8 +6047,13 @@ mod tests {
             tracked_symbols: "BTC,ETH".to_string(),
         };
 
-        let mut writer =
-            ParquetStreamWriter::new(StreamKind::Blocks, schema.clone(), props.clone(), handoff_tx.clone());
+        let mut writer = ParquetStreamWriter::new(
+            StreamKind::Blocks,
+            schema.clone(),
+            props.clone(),
+            handoff_tx.clone(),
+            current_archive_handoff_config(),
+        );
         writer.advance_block(ArchiveMode::Lite, 1001, write_block_rows).expect("advance 1001");
         writer
             .append_rows("blocks", ArchiveMode::Lite, 1001, vec![make_row(1001)], write_block_rows)
@@ -5154,8 +6064,13 @@ mod tests {
             .expect("append 1002");
         writer.close_with_flush(ArchiveMode::Lite, write_block_rows).expect("close first writer");
 
-        let mut recovered =
-            ParquetStreamWriter::new(StreamKind::Blocks, schema.clone(), props.clone(), handoff_tx.clone());
+        let mut recovered = ParquetStreamWriter::new(
+            StreamKind::Blocks,
+            schema.clone(),
+            props.clone(),
+            handoff_tx.clone(),
+            current_archive_handoff_config(),
+        );
         recovered.advance_block(ArchiveMode::Lite, 1001, write_block_rows).expect("re-advance 1001");
         recovered
             .append_rows("blocks", ArchiveMode::Lite, 1001, vec![make_row(1001)], write_block_rows)
@@ -5187,14 +6102,13 @@ mod tests {
             parse_message_type(
                 "message fill_schema {\n\
                     REQUIRED INT64 block_number;\n\
-                    REQUIRED BINARY block_time (UTF8);\n\
+                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
                     REQUIRED BINARY coin (UTF8);\n\
                     REQUIRED BINARY side (UTF8);\n\
                     REQUIRED INT64 px (DECIMAL(18, 8));\n\
                     REQUIRED INT64 sz (DECIMAL(18, 8));\n\
                     REQUIRED BOOLEAN crossed;\n\
                     REQUIRED INT64 oid;\n\
-                    REQUIRED INT64 time;\n\
                 }",
             )
             .expect("invalid fill schema"),
@@ -5206,7 +6120,7 @@ mod tests {
         let rows = vec![
             FillOut {
                 block_number: 928200002,
-                block_time: "t1".to_string(),
+                block_time: "2026-03-21T07:00:01.000000Z".to_string(),
                 coin: "BTC".to_string(),
                 side: "B".to_string(),
                 px: 11,
@@ -5218,16 +6132,15 @@ mod tests {
                 hash: String::new(),
                 oid: 33,
                 tid: 0,
-                time: 44,
                 start_position: 0,
                 dir: String::new(),
                 fee_token: String::new(),
-                twap_id: 0,
+                twap_id: None,
                 raw_event: String::new(),
             },
             FillOut {
                 block_number: 928200010,
-                block_time: "t2".to_string(),
+                block_time: "2026-03-21T07:00:02.000000Z".to_string(),
                 coin: "BTC".to_string(),
                 side: "A".to_string(),
                 px: 55,
@@ -5239,11 +6152,10 @@ mod tests {
                 hash: String::new(),
                 oid: 77,
                 tid: 0,
-                time: 88,
                 start_position: 0,
                 dir: String::new(),
                 fee_token: String::new(),
-                twap_id: 0,
+                twap_id: None,
                 raw_event: String::new(),
             },
         ];
@@ -5255,7 +6167,7 @@ mod tests {
         assert_eq!(recovered[0].block_number, 928200002);
         assert_eq!(recovered[0].oid, 33);
         assert_eq!(recovered[1].block_number, 928200010);
-        assert_eq!(recovered[1].time, 88);
+        assert_eq!(recovered[1].oid, 77);
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }

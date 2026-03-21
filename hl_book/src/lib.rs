@@ -28,6 +28,7 @@ use log as _;
 use pyo3 as _;
 use pyo3_asyncio as _;
 
+use std::fs;
 static PY_LOG_INIT: Once = Once::new();
 static PY_BRIDGE_ENABLED: AtomicBool = AtomicBool::new(true);
 const APPEND_CHECKPOINT_WORKER_BIN: &str = "snapshot_checkpoint";
@@ -36,8 +37,9 @@ const APPEND_CHECKPOINT_WORKER_BIN_ENV: &str = "HL_APPEND_CHECKPOINT_WORKER_BIN"
 fn parse_archive_mode(mode: Option<&str>) -> PyResult<Option<ArchiveMode>> {
     match mode {
         Some("FULL") => Ok(Some(ArchiveMode::Full)),
+        Some("HFT") => Ok(Some(ArchiveMode::Hft)),
         Some("LITE") | None => Ok(Some(ArchiveMode::Lite)),
-        _ => Err(pyo3::exceptions::PyValueError::new_err("mode must be 'FULL' or 'LITE'")),
+        _ => Err(pyo3::exceptions::PyValueError::new_err("mode must be 'FULL', 'HFT', or 'LITE'")),
     }
 }
 
@@ -110,6 +112,12 @@ fn build_archive_session_options(
         set_rotation_blocks(n);
     }
     let output_dir = output_dir.unwrap_or_else(current_archive_base_dir);
+    fs::create_dir_all(&output_dir).map_err(|err| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to create archive output dir {}: {err}",
+            output_dir.display()
+        ))
+    })?;
     let symbols = symbols.unwrap_or_else(current_archive_symbols);
     Ok(ArchiveSessionOptions {
         mode: mode.unwrap_or(ArchiveMode::Lite),

@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 aliyun-oss-rust-sdk = "0.2.2"
+chrono = { version = "0.4", features = ["clock"] }
 compute_l4 = { path = "../compute_l4" }
 env_logger = "0.11"
 libc = "0.2"

@@ -1838,6 +1838,7 @@ name = "fifo_listener"
 version = "0.1.0"
 dependencies = [
  "aliyun-oss-rust-sdk",
+ "chrono",
  "compute_l4",
  "env_logger",
  "libc",
