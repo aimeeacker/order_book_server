@@ -1136,7 +1136,8 @@ pub fn run_forever() {
     let split_stop = stop.clone();
     let split_tx = tx.clone();
     let split_reject_tx = reject_tx.clone();
-    threads.push(thread::spawn(move || run_order_splitter_inner(order_rx, split_tx, Some(split_reject_tx), split_stop)));
+    threads
+        .push(thread::spawn(move || run_order_splitter_inner(order_rx, split_tx, Some(split_reject_tx), split_stop)));
     let reject_stop = stop.clone();
     threads.push(thread::spawn(move || run_reject_dispatcher(reject_rx, reject_stop)));
 
@@ -1178,7 +1179,8 @@ pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<Liste
     let split_stop = stop.clone();
     let split_tx = tx.clone();
     let split_reject_tx = reject_tx.clone();
-    threads.push(thread::spawn(move || run_order_splitter_inner(order_rx, split_tx, Some(split_reject_tx), split_stop)));
+    threads
+        .push(thread::spawn(move || run_order_splitter_inner(order_rx, split_tx, Some(split_reject_tx), split_stop)));
     let reject_stop = stop.clone();
     threads.push(thread::spawn(move || run_reject_dispatcher(reject_rx, reject_stop)));
 

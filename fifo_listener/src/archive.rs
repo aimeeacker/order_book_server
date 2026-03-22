@@ -709,12 +709,10 @@ pub fn start_reject_archive_session(mut options: ArchiveSessionOptions) -> Archi
         run_reject_archive_writer(rx, stop);
         set_archive_thread_context(None);
     });
-    registry
-        .sessions
-        .insert(
-            session_id,
-            RejectArchiveSessionHandle { tx, enabled, stop_requested, phase_state, cleanup_dir, join_handle },
-        );
+    registry.sessions.insert(
+        session_id,
+        RejectArchiveSessionHandle { tx, enabled, stop_requested, phase_state, cleanup_dir, join_handle },
+    );
     session_id
 }
 
@@ -1379,8 +1377,17 @@ struct DiffOut {
     px: i64,
     orig_sz: i64,
     event: String,
+    status: String,
     tif: String,
     reduce_only: Option<bool>,
+    status_sz: Option<i64>,
+    status_orig_sz: Option<i64>,
+    is_trigger: Option<bool>,
+    trigger_condition: String,
+    trigger_px: Option<i64>,
+    is_position_tpsl: Option<bool>,
+    tp_trigger_px: Option<i64>,
+    sl_trigger_px: Option<i64>,
     delta_sz: Option<i64>,
     delta_notional: Option<i64>,
     raw_event: String,
@@ -1418,6 +1425,33 @@ impl HasBlockNumber for HftStatusRecoveryRow {
     fn block_number(&self) -> u64 {
         self.block_number
     }
+}
+
+#[derive(Clone, Debug)]
+struct HftDiffStatusMeta {
+    status: String,
+    sz: i64,
+    orig_sz: i64,
+    tif: String,
+    reduce_only: bool,
+    is_trigger: bool,
+    trigger_condition: String,
+    trigger_px: i64,
+    is_position_tpsl: bool,
+    tp_trigger_px: Option<i64>,
+    sl_trigger_px: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+struct HftStatusEventForDiff {
+    block_number: u64,
+    block_time: String,
+    coin: String,
+    user: String,
+    oid: u64,
+    side: String,
+    px: i64,
+    meta: HftDiffStatusMeta,
 }
 
 #[derive(Debug)]
@@ -1563,12 +1597,8 @@ fn user_fee_feature_cache() -> &'static Mutex<UserFeeFeatureCache> {
 }
 
 fn local_info_client() -> &'static Client {
-    LOCAL_INFO_CLIENT.get_or_init(|| {
-        Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .expect("build local info client")
-    })
+    LOCAL_INFO_CLIENT
+        .get_or_init(|| Client::builder().timeout(Duration::from_secs(2)).build().expect("build local info client"))
 }
 
 fn parse_ratio_percent_scaled_2(numerator: &str, denominator: &str) -> Option<i64> {
@@ -1659,11 +1689,8 @@ fn cached_user_fee_features(user: &str) -> Option<UserFeeFeatures> {
 }
 
 fn enrich_hft_trade_rows_with_user_fees(rows: &mut [FillOut]) {
-    let maker_users: HashSet<String> = rows
-        .iter()
-        .filter(|row| row.fee_m < 0 && !row.address_m.is_empty())
-        .map(|row| row.address_m.clone())
-        .collect();
+    let maker_users: HashSet<String> =
+        rows.iter().filter(|row| row.fee_m < 0 && !row.address_m.is_empty()).map(|row| row.address_m.clone()).collect();
     if maker_users.is_empty() {
         return;
     }
@@ -3580,14 +3607,23 @@ fn diff_schema_for(mode: ArchiveMode, scales: ArchiveDecimalScales) -> std::sync
                 REQUIRED INT64 oid;
                 REQUIRED BINARY side (UTF8);
                 REQUIRED INT64 px (DECIMAL(18, {p}));
-                REQUIRED BINARY diff_type (UTF8);
-                REQUIRED INT64 sz (DECIMAL(18, {s}));
-                REQUIRED INT64 orig_sz (DECIMAL(18, {s}));
-                REQUIRED BINARY event (UTF8);
-                OPTIONAL BINARY tif (UTF8);
-                OPTIONAL BOOLEAN reduce_only;
+                OPTIONAL BINARY diff_type (UTF8);
+                OPTIONAL BINARY event (UTF8);
+                OPTIONAL BINARY status (UTF8);
+                OPTIONAL INT64 diff_sz (DECIMAL(18, {s}));
+                OPTIONAL INT64 diff_orig_sz (DECIMAL(18, {s}));
+                OPTIONAL INT64 status_sz (DECIMAL(18, {s}));
+                OPTIONAL INT64 status_orig_sz (DECIMAL(18, {s}));
                 OPTIONAL INT64 delta_sz (DECIMAL(18, {s}));
                 OPTIONAL INT64 delta_notional (DECIMAL(18, 2));
+                OPTIONAL BINARY tif (UTF8);
+                OPTIONAL BOOLEAN reduce_only;
+                OPTIONAL BOOLEAN is_trigger;
+                OPTIONAL BINARY trigger_condition (UTF8);
+                OPTIONAL INT64 trigger_px (DECIMAL(18, {p}));
+                OPTIONAL BOOLEAN is_position_tpsl;
+                OPTIONAL INT64 tp_trigger_px (DECIMAL(18, {p}));
+                OPTIONAL INT64 sl_trigger_px (DECIMAL(18, {p}));
             }}"
         ),
         ArchiveMode::Full => format!(
@@ -4529,8 +4565,17 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
             px: 0,
             orig_sz: 0,
             event: String::new(),
+            status: String::new(),
             tif: String::new(),
             reduce_only: None,
+            status_sz: None,
+            status_orig_sz: None,
+            is_trigger: None,
+            trigger_condition: String::new(),
+            trigger_px: None,
+            is_position_tpsl: None,
+            tp_trigger_px: None,
+            sl_trigger_px: None,
             delta_sz: None,
             delta_notional: None,
             raw_event: String::new(),
@@ -4545,18 +4590,33 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.orig_sz = decimal_to_i64(row.get_decimal(8).map_err(io_to_parquet_error)?)?;
             }
             ArchiveMode::Hft => {
+                let field_count = row.get_column_iter().count();
+                if field_count < 24 {
+                    return Err(io_to_parquet_error(io_other(format!(
+                        "obsolete HFT diff local recovery schema with {field_count} columns is unsupported"
+                    ))));
+                }
                 out.user = row.get_string(3).map_err(io_to_parquet_error)?.clone();
                 out.oid = row.get_long(4).map_err(io_to_parquet_error)? as u64;
                 out.side = row.get_string(5).map_err(io_to_parquet_error)?.clone();
                 out.px = decimal_to_i64(row.get_decimal(6).map_err(io_to_parquet_error)?)?;
-                out.diff_type = row.get_string(7).map_err(io_to_parquet_error)?.clone();
-                out.sz = decimal_to_i64(row.get_decimal(8).map_err(io_to_parquet_error)?)?;
-                out.orig_sz = decimal_to_i64(row.get_decimal(9).map_err(io_to_parquet_error)?)?;
-                out.event = row.get_string(10).map_err(io_to_parquet_error)?.clone();
-                out.tif = read_row_optional_utf8(&row, 11)?.unwrap_or_default();
-                out.reduce_only = read_row_optional_bool(&row, 12)?;
-                out.delta_sz = read_row_optional_decimal_i64(&row, 13)?;
-                out.delta_notional = read_row_optional_decimal_i64(&row, 14)?;
+                out.diff_type = read_row_optional_utf8(&row, 7)?.unwrap_or_default();
+                out.event = read_row_optional_utf8(&row, 8)?.unwrap_or_default();
+                out.status = read_row_optional_utf8(&row, 9)?.unwrap_or_default();
+                out.sz = read_row_optional_decimal_i64(&row, 10)?.unwrap_or_default();
+                out.orig_sz = read_row_optional_decimal_i64(&row, 11)?.unwrap_or_default();
+                out.status_sz = read_row_optional_decimal_i64(&row, 12)?;
+                out.status_orig_sz = read_row_optional_decimal_i64(&row, 13)?;
+                out.delta_sz = read_row_optional_decimal_i64(&row, 14)?;
+                out.delta_notional = read_row_optional_decimal_i64(&row, 15)?;
+                out.tif = read_row_optional_utf8(&row, 16)?.unwrap_or_default();
+                out.reduce_only = read_row_optional_bool(&row, 17)?;
+                out.is_trigger = read_row_optional_bool(&row, 18)?;
+                out.trigger_condition = read_row_optional_utf8(&row, 19)?.unwrap_or_default();
+                out.trigger_px = read_row_optional_decimal_i64(&row, 20)?;
+                out.is_position_tpsl = read_row_optional_bool(&row, 21)?;
+                out.tp_trigger_px = read_row_optional_decimal_i64(&row, 22)?;
+                out.sl_trigger_px = read_row_optional_decimal_i64(&row, 23)?;
             }
             ArchiveMode::Full => {
                 out.user = row.get_string(3).map_err(io_to_parquet_error)?.clone();
@@ -6262,11 +6322,37 @@ fn write_diff_rows(
         }
     } else if mode == ArchiveMode::Hft {
         let users: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.user.as_bytes())).collect();
+        let statuses: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.status.as_bytes())).collect();
         let events: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.event.as_bytes())).collect();
+        let (diff_type_values, diff_type_def_levels) = parse_optional_utf8_column(&diff_types)?;
+        let (event_values, event_def_levels) = parse_optional_utf8_column(&events)?;
+        let (status_values, status_def_levels) = parse_optional_utf8_column(&statuses)?;
+        let diff_szs: Vec<Option<i64>> = rows.iter().map(|r| (!r.diff_type.is_empty()).then_some(r.sz)).collect();
+        let diff_orig_szs: Vec<Option<i64>> =
+            rows.iter().map(|r| (!r.diff_type.is_empty()).then_some(r.orig_sz)).collect();
+        let (diff_sz_values, diff_sz_def_levels) = parse_optional_i64_column(&diff_szs);
+        let (diff_orig_sz_values, diff_orig_sz_def_levels) = parse_optional_i64_column(&diff_orig_szs);
+        let status_szs: Vec<Option<i64>> = rows.iter().map(|r| r.status_sz).collect();
+        let status_orig_szs: Vec<Option<i64>> = rows.iter().map(|r| r.status_orig_sz).collect();
+        let (status_sz_values, status_sz_def_levels) = parse_optional_i64_column(&status_szs);
+        let (status_orig_sz_values, status_orig_sz_def_levels) = parse_optional_i64_column(&status_orig_szs);
         let tifs: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.tif.as_bytes())).collect();
         let (tif_values, tif_def_levels) = parse_optional_utf8_column(&tifs)?;
         let reduce_onlys: Vec<Option<bool>> = rows.iter().map(|r| r.reduce_only).collect();
         let (reduce_only_values, reduce_only_def_levels) = parse_optional_bool_column(&reduce_onlys);
+        let is_triggers: Vec<Option<bool>> = rows.iter().map(|r| r.is_trigger).collect();
+        let (is_trigger_values, is_trigger_def_levels) = parse_optional_bool_column(&is_triggers);
+        let trigger_conditions: Vec<ByteArray> =
+            rows.iter().map(|r| ByteArray::from(r.trigger_condition.as_bytes())).collect();
+        let (trigger_condition_values, trigger_condition_def_levels) = parse_optional_utf8_column(&trigger_conditions)?;
+        let trigger_pxs: Vec<Option<i64>> = rows.iter().map(|r| r.trigger_px).collect();
+        let (trigger_px_values, trigger_px_def_levels) = parse_optional_i64_column(&trigger_pxs);
+        let is_position_tpsls: Vec<Option<bool>> = rows.iter().map(|r| r.is_position_tpsl).collect();
+        let (is_position_tpsl_values, is_position_tpsl_def_levels) = parse_optional_bool_column(&is_position_tpsls);
+        let tp_trigger_pxs: Vec<Option<i64>> = rows.iter().map(|r| r.tp_trigger_px).collect();
+        let sl_trigger_pxs: Vec<Option<i64>> = rows.iter().map(|r| r.sl_trigger_px).collect();
+        let (tp_trigger_px_values, tp_trigger_px_def_levels) = parse_optional_i64_column(&tp_trigger_pxs);
+        let (sl_trigger_px_values, sl_trigger_px_def_levels) = parse_optional_i64_column(&sl_trigger_pxs);
         let delta_szs: Vec<Option<i64>> = rows.iter().map(|r| r.delta_sz).collect();
         let (delta_sz_values, delta_sz_def_levels) = parse_optional_i64_column(&delta_szs);
         let delta_notionals: Vec<Option<i64>> = rows.iter().map(|r| r.delta_notional).collect();
@@ -6316,25 +6402,55 @@ fn write_diff_rows(
         }
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&diff_types, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&sizes, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&orig_szs, None, None)?;
+                typed.write_batch(&diff_type_values, Some(&diff_type_def_levels), None)?;
             }
             col.close()?;
         }
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&events, None, None)?;
+                typed.write_batch(&event_values, Some(&event_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&status_values, Some(&status_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&diff_sz_values, Some(&diff_sz_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&diff_orig_sz_values, Some(&diff_orig_sz_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&status_sz_values, Some(&status_sz_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&status_orig_sz_values, Some(&status_orig_sz_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&delta_sz_values, Some(&delta_sz_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&delta_notional_values, Some(&delta_notional_def_levels), None)?;
             }
             col.close()?;
         }
@@ -6351,14 +6467,38 @@ fn write_diff_rows(
             col.close()?;
         }
         if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&delta_sz_values, Some(&delta_sz_def_levels), None)?;
+            if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&is_trigger_values, Some(&is_trigger_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&trigger_condition_values, Some(&trigger_condition_def_levels), None)?;
             }
             col.close()?;
         }
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&delta_notional_values, Some(&delta_notional_def_levels), None)?;
+                typed.write_batch(&trigger_px_values, Some(&trigger_px_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&is_position_tpsl_values, Some(&is_position_tpsl_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&tp_trigger_px_values, Some(&tp_trigger_px_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sl_trigger_px_values, Some(&sl_trigger_px_def_levels), None)?;
             }
             col.close()?;
         }
@@ -7287,9 +7427,8 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         let fill_n = fill_batch.events.len() as i32;
         set_archive_phase(Some(height), "build_status_rows");
         let mut status_rows: HashMap<String, StatusBlockBatch> = HashMap::new();
-        let mut same_block_status_sz_by_oid: HashMap<(String, u64), i64> = HashMap::new();
-        let mut same_block_status_tif_by_oid: HashMap<(String, u64), String> = HashMap::new();
-        let mut same_block_status_reduce_only_by_oid: HashMap<(String, u64), bool> = HashMap::new();
+        let mut hft_status_meta_by_oid: HashMap<(String, u64), HftDiffStatusMeta> = HashMap::new();
+        let mut hft_status_events_for_diff = Vec::new();
         let mut btc_status_n = 0;
         let mut eth_status_n = 0;
         let block_time_bytes = byte_array_from_str(&block_time);
@@ -7340,17 +7479,41 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             let tp_child_trigger_px = parse_scaled(&tp_child_trigger_px, scales.px_scale);
             let sl_child_trigger_px = parse_scaled(&sl_child_trigger_px, scales.px_scale);
             let status_text = status.status;
-            same_block_status_sz_by_oid.insert((coin.clone(), oid), s_sz);
-            same_block_status_tif_by_oid.insert((coin.clone(), oid), tif.clone().unwrap_or_default());
-            same_block_status_reduce_only_by_oid.insert((coin.clone(), oid), reduce_only);
+            let status_user = status.user.unwrap_or_default();
+            if mode == ArchiveMode::Hft {
+                let meta = HftDiffStatusMeta {
+                    status: status_text.clone(),
+                    sz: s_sz,
+                    orig_sz: s_orig,
+                    tif: tif.clone().unwrap_or_default(),
+                    reduce_only,
+                    is_trigger,
+                    trigger_condition: trigger_condition.clone(),
+                    trigger_px: s_trig,
+                    is_position_tpsl,
+                    tp_trigger_px: tp_child_trigger_px,
+                    sl_trigger_px: sl_child_trigger_px,
+                };
+                hft_status_meta_by_oid.insert((coin.clone(), oid), meta.clone());
+                hft_status_events_for_diff.push(HftStatusEventForDiff {
+                    block_number: height,
+                    block_time: block_time.clone(),
+                    coin: coin.clone(),
+                    user: status_user.clone(),
+                    oid,
+                    side: side.clone(),
+                    px: s_px,
+                    meta,
+                });
+            }
             let entry = status_rows.entry(coin.clone()).or_insert_with(|| StatusBlockBatch::new(mode));
             match entry {
                 StatusBlockBatch::Lite(columns) => {
                     columns.block_number.push(height as i64);
                     columns.block_time.push(block_time_bytes.clone());
                     columns.time.push(byte_array_from_string(status.time));
-                    columns.user.push(byte_array_from_string(status.user.unwrap_or_default()));
-                    columns.status.push(byte_array_from_string(status_text));
+                    columns.user.push(byte_array_from_string(status_user.clone()));
+                    columns.status.push(byte_array_from_string(status_text.clone()));
                     columns.oid.push(oid as i64);
                     columns.side.push(byte_array_from_string(side));
                     columns.limit_px.push(s_px);
@@ -7368,13 +7531,13 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 StatusBlockBatch::Full(columns) => {
                     columns.block_number.push(height as i64);
                     columns.block_time.push(block_time_bytes.clone());
-                    columns.status.push(byte_array_from_string(status_text));
+                    columns.status.push(byte_array_from_string(status_text.clone()));
                     columns.oid.push(oid as i64);
                     columns.side.push(byte_array_from_string(side));
                     columns.limit_px.push(s_px);
                     columns.is_trigger.push(is_trigger);
                     columns.tif.push(byte_array_from_string(tif.unwrap_or_default()));
-                    columns.user.push(byte_array_from_string(status.user.unwrap_or_default()));
+                    columns.user.push(byte_array_from_string(status_user.clone()));
                     columns.hash.push(byte_array_from_string(flatten_to_string(&status.hash)));
                     columns.order_type.push(byte_array_from_string(order_type));
                     columns.sz.push(s_sz);
@@ -7399,13 +7562,13 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 StatusBlockBatch::Hft(columns) => {
                     columns.block_number.push(height as i64);
                     columns.block_time.push(block_time_bytes.clone());
-                    columns.status.push(byte_array_from_string(status_text));
+                    columns.status.push(byte_array_from_string(status_text.clone()));
                     columns.oid.push(oid as i64);
                     columns.side.push(byte_array_from_string(side));
                     columns.limit_px.push(s_px);
                     columns.is_trigger.push(is_trigger);
                     columns.tif.push(byte_array_from_string(tif.unwrap_or_default()));
-                    columns.user.push(byte_array_from_string(status.user.unwrap_or_default()));
+                    columns.user.push(byte_array_from_string(status_user));
                     columns.hash.push(byte_array_from_string(flatten_to_string(&status.hash)));
                     columns.order_type.push(byte_array_from_string(order_type));
                     columns.sz.push(s_sz);
@@ -7474,8 +7637,17 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 px: d_px,
                 orig_sz: d_orig,
                 event: String::new(),
+                status: String::new(),
                 tif: String::new(),
                 reduce_only: None,
+                status_sz: None,
+                status_orig_sz: None,
+                is_trigger: None,
+                trigger_condition: String::new(),
+                trigger_px: None,
+                is_position_tpsl: None,
+                tp_trigger_px: None,
+                sl_trigger_px: None,
                 delta_sz: None,
                 delta_notional: None,
                 raw_event: diff_batch_raw
@@ -7578,26 +7750,54 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 }
                 *rows = aggregated;
             }
+            let mut same_block_diff_keys: HashSet<(String, u64)> = HashSet::new();
             for (coin, rows) in &mut diff_rows {
                 let scales = current_archive_coin_decimal_scales(coin);
                 for row in rows {
+                    same_block_diff_keys.insert((coin.clone(), row.oid));
                     let same_block_trade_sz = same_block_trade_sz_by_oid.get(&(coin.clone(), row.oid)).copied();
-                    let same_block_status_sz = same_block_status_sz_by_oid.get(&(coin.clone(), row.oid)).copied();
+                    let same_block_status = hft_status_meta_by_oid.get(&(coin.clone(), row.oid));
+                    let same_block_status_sz = same_block_status.map(|value| value.sz);
                     let diff_type = match row.diff_type.as_str() {
                         "new" => 0,
                         "update" => 1,
                         "remove" => 2,
                         _ => 255,
                     };
-                    row.reduce_only = if diff_type == 0 {
-                        same_block_status_reduce_only_by_oid.get(&(coin.clone(), row.oid)).copied()
-                    } else {
-                        None
-                    };
-                    row.tif = if diff_type == 0 {
-                        same_block_status_tif_by_oid.get(&(coin.clone(), row.oid)).cloned().unwrap_or_default()
-                    } else {
-                        String::new()
+                    row.status_sz = same_block_status.map(|value| value.sz);
+                    row.status_orig_sz = same_block_status.map(|value| value.orig_sz);
+                    row.tif = same_block_status.map(|value| value.tif.clone()).unwrap_or_default();
+                    row.reduce_only = same_block_status.map(|value| value.reduce_only);
+                    row.is_trigger = same_block_status.map(|value| value.is_trigger);
+                    row.trigger_condition =
+                        same_block_status.map(|value| value.trigger_condition.clone()).unwrap_or_default();
+                    row.trigger_px = same_block_status.map(|value| value.trigger_px);
+                    row.is_position_tpsl = same_block_status.map(|value| value.is_position_tpsl);
+                    row.tp_trigger_px = same_block_status.and_then(|value| value.tp_trigger_px);
+                    row.sl_trigger_px = same_block_status.and_then(|value| value.sl_trigger_px);
+                    row.status = match diff_type {
+                        0 => {
+                            if let Some(value) = same_block_status {
+                                value.status.clone()
+                            } else {
+                                error!(
+                                    "HFT merged diff missing same-block status for new row coin={} oid={} block={}",
+                                    coin, row.oid, row.block_number
+                                );
+                                String::new()
+                            }
+                        }
+                        1 => {
+                            if let Some(value) = same_block_status {
+                                value.status.clone()
+                            } else if same_block_trade_sz.is_some() {
+                                "filling".to_string()
+                            } else {
+                                "modified".to_string()
+                            }
+                        }
+                        2 => same_block_status.map(|value| value.status.clone()).unwrap_or_default(),
+                        _ => String::new(),
                     };
                     let (event, delta_sz) = classify_hft_diff_cause_and_delta(
                         diff_type,
@@ -7612,6 +7812,38 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                         scale_decimal_product_to_scale_2(delta, scales.sz_scale, row.px, scales.px_scale)
                     });
                 }
+            }
+            for status_event in hft_status_events_for_diff {
+                if same_block_diff_keys.contains(&(status_event.coin.clone(), status_event.oid)) {
+                    continue;
+                }
+                diff_rows.entry(status_event.coin.clone()).or_default().push(DiffOut {
+                    block_number: status_event.block_number,
+                    block_time: status_event.block_time,
+                    coin: status_event.coin,
+                    oid: status_event.oid,
+                    diff_type: String::new(),
+                    sz: 0,
+                    user: status_event.user,
+                    side: status_event.side,
+                    px: status_event.px,
+                    orig_sz: 0,
+                    event: String::new(),
+                    status: status_event.meta.status,
+                    tif: status_event.meta.tif,
+                    reduce_only: Some(status_event.meta.reduce_only),
+                    status_sz: Some(status_event.meta.sz),
+                    status_orig_sz: Some(status_event.meta.orig_sz),
+                    is_trigger: Some(status_event.meta.is_trigger),
+                    trigger_condition: status_event.meta.trigger_condition,
+                    trigger_px: Some(status_event.meta.trigger_px),
+                    is_position_tpsl: Some(status_event.meta.is_position_tpsl),
+                    tp_trigger_px: status_event.meta.tp_trigger_px,
+                    sl_trigger_px: status_event.meta.sl_trigger_px,
+                    delta_sz: None,
+                    delta_notional: None,
+                    raw_event: String::new(),
+                });
             }
         }
 
@@ -8029,8 +8261,17 @@ mod tests {
                 px: 7071200,
                 orig_sz: 0,
                 event: "add".to_string(),
+                status: "open".to_string(),
                 tif: "Alo".to_string(),
                 reduce_only: Some(false),
+                status_sz: Some(12345),
+                status_orig_sz: Some(12345),
+                is_trigger: Some(false),
+                trigger_condition: "N/A".to_string(),
+                trigger_px: Some(0),
+                is_position_tpsl: Some(false),
+                tp_trigger_px: Some(7075000),
+                sl_trigger_px: None,
                 delta_sz: Some(12345),
                 delta_notional: Some(87005741),
                 raw_event: String::new(),
@@ -8047,8 +8288,17 @@ mod tests {
                 px: 7071500,
                 orig_sz: 12000,
                 event: "fill".to_string(),
+                status: "filling".to_string(),
                 tif: String::new(),
                 reduce_only: None,
+                status_sz: None,
+                status_orig_sz: None,
+                is_trigger: None,
+                trigger_condition: String::new(),
+                trigger_px: None,
+                is_position_tpsl: None,
+                tp_trigger_px: None,
+                sl_trigger_px: None,
                 delta_sz: Some(-2000),
                 delta_notional: Some(-141430),
                 raw_event: String::new(),
@@ -8061,10 +8311,13 @@ mod tests {
         assert_eq!(recovered.len(), 2);
         assert_eq!(recovered[0].oid, 33);
         assert_eq!(recovered[0].event, "add");
+        assert_eq!(recovered[0].status, "open");
         assert_eq!(recovered[0].tif, "Alo");
         assert_eq!(recovered[0].reduce_only, Some(false));
+        assert_eq!(recovered[0].status_sz, Some(12345));
         assert_eq!(recovered[1].oid, 77);
         assert_eq!(recovered[1].event, "fill");
+        assert_eq!(recovered[1].status, "filling");
         assert_eq!(recovered[1].tif, "");
         assert_eq!(recovered[1].reduce_only, None);
 
@@ -8121,10 +8374,7 @@ mod tests {
         let z = parse_timestamp_millis("2026-03-22T06:14:19.685Z").expect("parse rfc3339");
         let naive = parse_timestamp_millis("2026-03-22T06:14:19.685").expect("parse naive iso");
         assert_eq!(z, naive);
-        assert_eq!(
-            format_timestamp_millis(z).expect("format millis"),
-            "2026-03-22T06:14:19.685Z"
-        );
+        assert_eq!(format_timestamp_millis(z).expect("format millis"), "2026-03-22T06:14:19.685Z");
     }
 
     #[test]
