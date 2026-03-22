@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -38,6 +39,18 @@ const CODEC_ZSTD: &str = "zstd";
 const CODEC_MSGPACK: &str = "msgpack";
 const SNAPSHOT_INDEX_DB_FILENAME: &str = "snapshot_index.sqlite";
 static DATASET_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+#[allow(unsafe_code)]
+fn best_effort_drop_file_cache(file: &File, path: &Path) {
+    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if rc != 0 {
+        eprintln!(
+            "compute_l4: posix_fadvise(DONTNEED) failed for {}: {}",
+            path.display(),
+            std::io::Error::from_raw_os_error(rc)
+        );
+    }
+}
 
 impl Display for AppError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -879,6 +892,8 @@ fn write_checkpoint_record(
     file.write_all(&len.to_le_bytes())?;
     file.write_all(&payload)?;
     file.flush()?;
+    file.sync_data()?;
+    best_effort_drop_file_cache(&file, &segment_path);
     let snapshot_index_path = output_dir.join(SNAPSHOT_INDEX_DB_FILENAME);
     let entry = SegmentIndexEntry {
         block_height: record.block_height,

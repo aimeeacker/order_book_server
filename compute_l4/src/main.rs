@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use compute_l4::{AppError, ComputeOptions, compute_l4_to_file};
+use libc as _;
 use pyo3 as _;
 use rmp_serde as _;
 use rusqlite as _;

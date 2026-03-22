@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(non_local_definitions, unused_qualifications)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -12,10 +13,11 @@ use compute_l4::{
     current_dataset_dir, set_current_dataset_dir,
 };
 use fifo_listener::{
-    ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, ArchiveSessionId, ArchiveSessionOptions, HeightCallback,
-    ListenerHandle, current_archive_base_dir, current_archive_symbols, current_rotation_blocks_value,
+    ArchiveDecimalScales, ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, ArchiveSessionId, ArchiveSessionOptions,
+    HeightCallback, ListenerHandle, current_archive_base_dir, current_archive_symbols, current_rotation_blocks_value,
     set_archive_base_dir, set_archive_symbols, set_rotation_blocks, start_archive_session, start_listener,
-    stop_all_archive_sessions_api, stop_archive_session,
+    start_reject_archive_session, stop_all_archive_sessions_api, stop_all_reject_archive_sessions_api,
+    stop_archive_session, stop_reject_archive_session,
 };
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use pyo3::prelude::*;
@@ -77,6 +79,7 @@ fn build_archive_session_options(
     rotation_blocks: Option<u64>,
     output_dir: Option<PathBuf>,
     symbols: Option<Vec<String>>,
+    symbol_decimals: Option<HashMap<String, (u32, u32)>>,
     archive_height: Option<u64>,
     stop_height: Option<u64>,
     align_start_to_10k_boundary: bool,
@@ -119,11 +122,30 @@ fn build_archive_session_options(
         ))
     })?;
     let symbols = symbols.unwrap_or_else(current_archive_symbols);
+    let mut normalized_symbol_decimals: HashMap<String, ArchiveDecimalScales> =
+        symbols.iter().cloned().map(|symbol| (symbol, ArchiveDecimalScales::default())).collect();
+    if let Some(symbol_decimals) = symbol_decimals {
+        for (symbol, (px_scale, sz_scale)) in symbol_decimals {
+            let symbol = symbol.trim().to_ascii_uppercase();
+            if !normalized_symbol_decimals.contains_key(&symbol) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "symbol_decimals contains unknown symbol '{symbol}'"
+                )));
+            }
+            if px_scale > 18 || sz_scale > 18 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "symbol_decimals for {symbol} must satisfy px_scale<=18 and sz_scale<=18"
+                )));
+            }
+            normalized_symbol_decimals.insert(symbol, ArchiveDecimalScales { px_scale, sz_scale });
+        }
+    }
     Ok(ArchiveSessionOptions {
         mode: mode.unwrap_or(ArchiveMode::Lite),
         rotation_blocks: rotation_blocks.unwrap_or_else(current_rotation_blocks_value),
         output_dir,
         symbols,
+        symbol_decimals: normalized_symbol_decimals,
         archive_height,
         stop_height,
         align_start_to_10k_boundary,
@@ -135,17 +157,19 @@ fn build_archive_session_options(
 #[pyclass(unsendable, name = "ArchiveHandle")]
 struct PyArchiveHandle {
     session_id: ArchiveSessionId,
+    reject: bool,
 }
 
 #[pymethods]
 impl PyArchiveHandle {
     #[pyo3(signature = (recover_blocks_fill_locally=false))]
     fn stop_archive(&self, recover_blocks_fill_locally: bool) -> PyResult<()> {
-        if stop_archive_session(self.session_id, recover_blocks_fill_locally) {
-            Ok(())
+        let stopped = if self.reject {
+            stop_reject_archive_session(self.session_id)
         } else {
-            Err(pyo3::exceptions::PyRuntimeError::new_err("archive session already stopped"))
-        }
+            stop_archive_session(self.session_id, recover_blocks_fill_locally)
+        };
+        if stopped { Ok(()) } else { Err(pyo3::exceptions::PyRuntimeError::new_err("archive session already stopped")) }
     }
 
     fn session_id(&self) -> u64 {
@@ -308,6 +332,7 @@ impl PyFifoListener {
         rotation_blocks=None,
         output_dir=None,
         symbols=None,
+        symbol_decimals=None,
         archive_height=None,
         stop_height=None,
         align_start_to_10k_boundary=true,
@@ -327,6 +352,7 @@ impl PyFifoListener {
         rotation_blocks: Option<u64>,
         output_dir: Option<PathBuf>,
         symbols: Option<Vec<String>>,
+        symbol_decimals: Option<HashMap<String, (u32, u32)>>,
         archive_height: Option<u64>,
         stop_height: Option<u64>,
         align_start_to_10k_boundary: bool,
@@ -345,6 +371,7 @@ impl PyFifoListener {
             rotation_blocks,
             output_dir,
             symbols,
+            symbol_decimals,
             archive_height,
             stop_height,
             align_start_to_10k_boundary,
@@ -359,12 +386,77 @@ impl PyFifoListener {
             oss_prefix,
         )?;
         let session_id = start_archive_session(options);
-        Ok(PyArchiveHandle { session_id })
+        Ok(PyArchiveHandle { session_id, reject: false })
+    }
+
+    #[pyo3(signature = (
+        rotation_blocks=None,
+        output_dir=None,
+        symbols=None,
+        symbol_decimals=None,
+        archive_height=None,
+        stop_height=None,
+        align_start_to_10k_boundary=true,
+        align_output_to_1000_boundary=true,
+        move_to_nas=true,
+        nas_output_dir=None,
+        upload_to_oss=false,
+        oss_access_key_id=None,
+        oss_access_key_secret=None,
+        oss_endpoint=None,
+        oss_bucket=None,
+        oss_prefix=None
+    ))]
+    fn start_reject_archive(
+        &self,
+        rotation_blocks: Option<u64>,
+        output_dir: Option<PathBuf>,
+        symbols: Option<Vec<String>>,
+        symbol_decimals: Option<HashMap<String, (u32, u32)>>,
+        archive_height: Option<u64>,
+        stop_height: Option<u64>,
+        align_start_to_10k_boundary: bool,
+        align_output_to_1000_boundary: bool,
+        move_to_nas: bool,
+        nas_output_dir: Option<PathBuf>,
+        upload_to_oss: bool,
+        oss_access_key_id: Option<String>,
+        oss_access_key_secret: Option<String>,
+        oss_endpoint: Option<String>,
+        oss_bucket: Option<String>,
+        oss_prefix: Option<String>,
+    ) -> PyResult<PyArchiveHandle> {
+        let options = build_archive_session_options(
+            Some("HFT"),
+            rotation_blocks,
+            output_dir,
+            symbols,
+            symbol_decimals,
+            archive_height,
+            stop_height,
+            align_start_to_10k_boundary,
+            align_output_to_1000_boundary,
+            move_to_nas,
+            nas_output_dir,
+            upload_to_oss,
+            oss_access_key_id,
+            oss_access_key_secret,
+            oss_endpoint,
+            oss_bucket,
+            oss_prefix,
+        )?;
+        let session_id = start_reject_archive_session(options);
+        Ok(PyArchiveHandle { session_id, reject: true })
     }
 
     #[pyo3(signature = (recover_blocks_fill_locally=false))]
     fn stop_archive(&self, recover_blocks_fill_locally: bool) -> PyResult<()> {
         stop_all_archive_sessions_api(recover_blocks_fill_locally);
+        Ok(())
+    }
+
+    fn stop_reject_archive(&self) -> PyResult<()> {
+        stop_all_reject_archive_sessions_api();
         Ok(())
     }
 

@@ -1361,6 +1361,7 @@ name = "compute_l4"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "pyo3",
  "rmp-serde",
  "rusqlite",
@@ -1838,7 +1839,6 @@ name = "fifo_listener"
 version = "0.1.0"
 dependencies = [
  "aliyun-oss-rust-sdk",
- "chrono",
  "compute_l4",
  "env_logger",
  "libc",
@@ -1850,6 +1850,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "simd-json 0.14.3",
+ "time",
 ]
 
 [[package]]

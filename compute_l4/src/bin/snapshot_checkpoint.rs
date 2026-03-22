@@ -2,6 +2,7 @@ use clap as _;
 use std::path::PathBuf;
 
 use compute_l4::{ComputeOptions, append_l4_checkpoint};
+use libc as _;
 use pyo3 as _;
 use rmp_serde as _;
 use rusqlite as _;

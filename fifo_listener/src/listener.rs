@@ -12,15 +12,22 @@ use std::time::Duration;
 
 use log::{info, warn};
 use memchr::{memchr, memmem};
+use serde_json::Value;
+use simd_json::serde::from_slice as simd_from_slice;
 
-use crate::archive::{ArchiveBlock, dispatch_archive_block, has_archive_sessions, stop_all_archive_sessions};
+use crate::archive::{
+    ArchiveBlock, RejectArchiveBlock, dispatch_archive_block, dispatch_reject_archive_block, has_archive_sessions,
+    has_reject_archive_sessions, stop_all_archive_sessions, stop_all_reject_archive_sessions,
+};
 pub use crate::archive::{
     ArchiveHandoffConfig, ArchiveMode, ArchiveOssConfig, ArchiveSessionId, ArchiveSessionOptions,
     current_archive_base_dir, current_archive_symbols, current_rotation_blocks_value,
     set_archive_align_output_to_1000_boundary, set_archive_align_start_to_10k_boundary, set_archive_base_dir,
     set_archive_enabled, set_archive_handoff_config, set_archive_mode, set_archive_recover_blocks_fill_on_stop,
-    set_archive_symbols, set_rotation_blocks, start_archive_session,
-    stop_all_archive_sessions as stop_all_archive_sessions_api, stop_archive_session,
+    set_archive_symbols, set_rotation_blocks, start_archive_session, start_reject_archive_session,
+    stop_all_archive_sessions as stop_all_archive_sessions_api,
+    stop_all_reject_archive_sessions as stop_all_reject_archive_sessions_api, stop_archive_session,
+    stop_reject_archive_session,
 };
 
 const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book/runtime_fifo";
@@ -33,6 +40,7 @@ const SOCKET_BUFFER: i32 = 16 * 1024 * 1024;
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const DROP_LOG_THRESHOLD: u64 = 50;
 const CHECKPOINT_DEBUG_BLOCKS: u64 = 10_000;
+const REJECT_DISPATCH_QUEUE_BLOCKS: usize = 1024;
 
 static LOG_INIT: Once = Once::new();
 
@@ -101,6 +109,7 @@ impl ListenerHandle {
     pub fn stop(self) {
         self.request_shutdown();
         stop_all_archive_sessions(false);
+        stop_all_reject_archive_sessions();
         for thread in self.threads {
             let _unused = thread.join();
         }
@@ -620,6 +629,124 @@ fn flush_rollback_buffer(
     true
 }
 
+fn split_reject_order_line(line: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+    let mut owned = line.to_vec();
+    let value: Value = simd_from_slice(&mut owned).map_err(|err| err.to_string())?;
+    let Value::Object(mut object) = value else {
+        return Err("order line is not a json object".to_string());
+    };
+    let Some(Value::Array(events)) = object.remove("events") else {
+        return Err("order line missing events array".to_string());
+    };
+
+    let mut live_events = Vec::with_capacity(events.len());
+    let mut reject_events = Vec::new();
+    for event in events {
+        let is_reject = event.get("status").and_then(Value::as_str).is_some_and(|status| status.ends_with("Rejected"));
+        if is_reject {
+            reject_events.push(event);
+        } else {
+            live_events.push(event);
+        }
+    }
+
+    if reject_events.is_empty() {
+        return Ok((line.to_vec(), None));
+    }
+
+    let mut live_object = object.clone();
+    live_object.insert("events".to_string(), Value::Array(live_events));
+    object.insert("events".to_string(), Value::Array(reject_events));
+    let live_line = serde_json::to_vec(&Value::Object(live_object)).map_err(|err| err.to_string())?;
+    let reject_line = serde_json::to_vec(&Value::Object(object)).map_err(|err| err.to_string())?;
+    Ok((live_line, Some(reject_line)))
+}
+
+fn run_order_splitter_inner(
+    rx: Receiver<StreamLine>,
+    tx: SyncSender<StreamLine>,
+    reject_tx: Option<SyncSender<RejectArchiveBlock>>,
+    stop: Arc<AtomicBool>,
+) {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(msg) => {
+                let shutdown = stop.load(Ordering::SeqCst);
+                let (live_line, reject_line) = match split_reject_order_line(&msg.line) {
+                    Ok(lines) => lines,
+                    Err(err) => {
+                        warn!(
+                            "Order splitter failed to parse block {}: {}; forwarding raw line",
+                            msg.block_number, err
+                        );
+                        (msg.line.clone(), None)
+                    }
+                };
+                if tx.send(StreamLine { source: msg.source, block_number: msg.block_number, line: live_line }).is_err()
+                {
+                    warn!("Aggregator dropped; exiting order splitter");
+                    return;
+                }
+                if let Some(reject_line) = reject_line.filter(|_| has_reject_archive_sessions()) {
+                    if let Some(reject_tx) = &reject_tx {
+                        let block = RejectArchiveBlock::new(msg.block_number, reject_line);
+                        if shutdown {
+                            if reject_tx.send(block).is_err() {
+                                warn!("Reject dispatch thread dropped; continuing without reject archive");
+                            }
+                        } else {
+                            match reject_tx.try_send(block) {
+                                Ok(()) => {}
+                                Err(std::sync::mpsc::TrySendError::Full(block)) => {
+                                    warn!(
+                                        "Reject dispatch queue full; dropped reject block {} before archive fanout",
+                                        block.block_number
+                                    );
+                                }
+                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                    warn!("Reject dispatch thread disconnected; continuing without reject archive");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
+}
+
+fn run_reject_dispatcher(rx: Receiver<RejectArchiveBlock>, stop: Arc<AtomicBool>) {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(block) => {
+                dispatch_reject_archive_block(block, stop.load(Ordering::SeqCst));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+        }
+    }
+}
+
 fn listen_fifo(
     source: FifoSource,
     path: PathBuf,
@@ -866,22 +993,6 @@ fn run_aggregator(rx: Receiver<StreamLine>, stop: Arc<AtomicBool>, callback: Opt
     let mut input_disconnected = false;
 
     loop {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(msg) => match msg.source {
-                FifoSource::Order => queues.order.push_back(msg),
-                FifoSource::Diffs => queues.diffs.push_back(msg),
-                FifoSource::Fills => queues.fills.push_back(msg),
-            },
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if stop.load(Ordering::SeqCst) && input_disconnected {
-                    break;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                input_disconnected = true;
-            }
-        }
-
         if stop.load(Ordering::SeqCst) {
             if !queues.order.is_empty() || !queues.diffs.is_empty() || !queues.fills.is_empty() {
                 warn!(
@@ -894,10 +1005,25 @@ fn run_aggregator(rx: Receiver<StreamLine>, stop: Arc<AtomicBool>, callback: Opt
                 queues.diffs.clear();
                 queues.fills.clear();
             }
-            if input_disconnected {
-                break;
+            break;
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(msg) => match msg.source {
+                FifoSource::Order => queues.order.push_back(msg),
+                FifoSource::Diffs => queues.diffs.push_back(msg),
+                FifoSource::Fills => queues.fills.push_back(msg),
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if stop.load(Ordering::SeqCst) || input_disconnected {
+                    break;
+                }
             }
-            continue;
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                input_disconnected = true;
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+            }
         }
 
         while queues.order.len() > MAX_PENDING_HEIGHTS {
@@ -983,6 +1109,8 @@ pub fn run_forever() {
     info!("fifo_listener starting");
 
     let (tx, rx) = sync_channel(512);
+    let (order_tx, order_rx) = sync_channel(512);
+    let (reject_tx, reject_rx) = sync_channel(REJECT_DISPATCH_QUEUE_BLOCKS);
     let stop = Arc::new(AtomicBool::new(false));
     let rollback = Arc::new(RollbackTracker::new());
     let stop_eventfd = match create_eventfd() {
@@ -996,7 +1124,7 @@ pub fn run_forever() {
 
     for source in [FifoSource::Order, FifoSource::Fills, FifoSource::Diffs] {
         let stop = stop.clone();
-        let tx = tx.clone();
+        let tx = if matches!(source, FifoSource::Order) { order_tx.clone() } else { tx.clone() };
         let path = fifo_path(source);
         let rollback = rollback.clone();
         let stop_eventfd = stop_eventfd;
@@ -1005,10 +1133,18 @@ pub fn run_forever() {
         }));
     }
 
+    let split_stop = stop.clone();
+    let split_tx = tx.clone();
+    let split_reject_tx = reject_tx.clone();
+    threads.push(thread::spawn(move || run_order_splitter_inner(order_rx, split_tx, Some(split_reject_tx), split_stop)));
+    let reject_stop = stop.clone();
+    threads.push(thread::spawn(move || run_reject_dispatcher(reject_rx, reject_stop)));
+
     run_aggregator(rx, stop.clone(), None);
 
     stop.store(true, Ordering::SeqCst);
     stop_all_archive_sessions(false);
+    stop_all_reject_archive_sessions();
     signal_eventfd(stop_eventfd);
     for thread in threads {
         let _unused = thread.join();
@@ -1021,6 +1157,8 @@ pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<Liste
     info!("fifo_listener starting");
 
     let (tx, rx) = sync_channel(512);
+    let (order_tx, order_rx) = sync_channel(512);
+    let (reject_tx, reject_rx) = sync_channel(REJECT_DISPATCH_QUEUE_BLOCKS);
     let stop = Arc::new(AtomicBool::new(false));
     let mut threads = Vec::new();
     let rollback = Arc::new(RollbackTracker::new());
@@ -1028,7 +1166,7 @@ pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<Liste
 
     for source in [FifoSource::Order, FifoSource::Fills, FifoSource::Diffs] {
         let stop = stop.clone();
-        let tx = tx.clone();
+        let tx = if matches!(source, FifoSource::Order) { order_tx.clone() } else { tx.clone() };
         let path = fifo_path(source);
         let rollback = rollback.clone();
         let stop_eventfd = stop_eventfd;
@@ -1036,6 +1174,13 @@ pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<Liste
             listen_fifo(source, path, stop, stop_eventfd, rollback, tx);
         }));
     }
+
+    let split_stop = stop.clone();
+    let split_tx = tx.clone();
+    let split_reject_tx = reject_tx.clone();
+    threads.push(thread::spawn(move || run_order_splitter_inner(order_rx, split_tx, Some(split_reject_tx), split_stop)));
+    let reject_stop = stop.clone();
+    threads.push(thread::spawn(move || run_reject_dispatcher(reject_rx, reject_stop)));
 
     let agg_stop = stop.clone();
     threads.push(thread::spawn(move || run_aggregator(rx, agg_stop, callback)));
