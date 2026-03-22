@@ -4904,7 +4904,6 @@ fn copy_to_nas(path: &PathBuf, relative_path: &PathBuf, dest_root: &Path) -> par
     fs::rename(&tmp_path, &dest_path).map_err(io_to_parquet_error)?;
     best_effort_drop_file_cache(path);
     best_effort_drop_file_cache(&dest_path);
-    info!("Archive finalized and copied to NAS: {} -> {}", path.display(), dest_path.display());
     Ok(dest_path)
 }
 
@@ -4927,19 +4926,40 @@ fn upload_finalized_parquet_to_oss(
     let file_path = source_path.to_string_lossy().into_owned();
     oss.put_object_from_file(object_key.as_str(), file_path.as_str(), RequestBuilder::new())
         .map_err(|err| io_to_parquet_error(io_other(format!("OSS upload failed for {}: {err}", object_key))))?;
-    info!(
-        "Archive finalized and uploaded to OSS bucket={} object_key={} source={}",
-        oss_config.bucket,
-        object_key,
-        source_path.display()
-    );
     Ok(())
+}
+
+fn archive_handoff_label(relative_path: &Path) -> String {
+    let Some(file_name) = relative_path.file_name().and_then(|name| name.to_str()) else {
+        return relative_path.display().to_string();
+    };
+    file_name
+        .strip_suffix(FINAL_PARQUET_FILE_SUFFIX)
+        .or_else(|| file_name.strip_suffix(LOCAL_RECOVERY_FILE_SUFFIX))
+        .unwrap_or(file_name)
+        .to_string()
+}
+
+fn archive_handoff_span(relative_path: &Path) -> Option<(u64, u64)> {
+    let file_name = relative_path.file_name()?.to_str()?;
+    let stem = file_name
+        .strip_suffix(FINAL_PARQUET_FILE_SUFFIX)
+        .or_else(|| file_name.strip_suffix(LOCAL_RECOVERY_FILE_SUFFIX))
+        .unwrap_or(file_name);
+    let mut parts = stem.rsplitn(3, '_');
+    let end = parts.next()?.parse::<u64>().ok()?;
+    let start = parts.next()?.parse::<u64>().ok()?;
+    Some((start, end))
 }
 
 fn handoff_finalized_parquet(task: &HandoffTask) -> parquet::errors::Result<()> {
     let path = &task.path;
     let relative_path = &task.relative_path;
     let config = &task.config;
+    let label = archive_handoff_label(relative_path);
+    let span = archive_handoff_span(relative_path)
+        .map(|(start, end)| format!("{}..{}", start, end))
+        .unwrap_or_else(|| "unknown".to_string());
     let nas_dest =
         if config.move_to_nas { Some(copy_to_nas(path, relative_path, &config.nas_output_dir)?) } else { None };
 
@@ -4956,15 +4976,15 @@ fn handoff_finalized_parquet(task: &HandoffTask) -> parquet::errors::Result<()> 
     if config.move_to_nas {
         best_effort_drop_file_cache(path);
         fs::remove_file(path).map_err(io_to_parquet_error)?;
-        if let Some(dest_path) = nas_dest {
-            warn!("Archive handoff complete: local={} nas={}", path.display(), dest_path.display());
-        }
+        let target = if config.upload_to_oss { "NAS+OSS" } else { "NAS" };
+        let _unused = nas_dest;
+        info!("Archive handoff complete: {} [{}] -> {}", label, span, target);
     } else if config.upload_to_oss {
         best_effort_drop_file_cache(path);
-        warn!("Archive handoff complete: local={} retained after OSS upload", path.display());
+        info!("Archive handoff complete: {} [{}] -> OSS", label, span);
     } else {
         best_effort_drop_file_cache(path);
-        warn!("Archive finalized locally without handoff: {}", path.display());
+        info!("Archive finalized locally without handoff: {} [{}]", label, span);
     }
     Ok(())
 }
