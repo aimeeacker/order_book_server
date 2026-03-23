@@ -1514,6 +1514,12 @@ struct HftTradePair {
     maker: Option<FillOut>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct HftRemoveStatusSummary {
+    has_filled: bool,
+    canceled_sz: Option<i64>,
+}
+
 fn aggregate_hft_trades(rows: Vec<FillOut>) -> Vec<FillOut> {
     let mut by_tid: BTreeMap<u64, HftTradePair> = BTreeMap::new();
     for row in rows {
@@ -1561,6 +1567,14 @@ fn hft_status_keeps_order_live(status: &str) -> bool {
     status == "open" || status == "triggered"
 }
 
+fn hft_status_is_filled(status: &str) -> bool {
+    status.eq_ignore_ascii_case("filled")
+}
+
+fn hft_status_is_canceled(status: &str) -> bool {
+    status.to_ascii_lowercase().ends_with("canceled")
+}
+
 fn encode_hft_lifetime(lag_ms: i64) -> Option<i32> {
     if lag_ms < 0 {
         return None;
@@ -1570,6 +1584,14 @@ fn encode_hft_lifetime(lag_ms: i64) -> Option<i32> {
     }
     let rounded_minutes = lag_ms.checked_add(30_000)?.checked_div(60_000)?;
     i32::try_from(rounded_minutes).ok().and_then(|minutes| minutes.checked_neg())
+}
+
+fn classify_hft_remove_from_status_summary(summary: Option<HftRemoveStatusSummary>) -> (&'static str, Option<i64>, bool) {
+    match summary {
+        Some(summary) if summary.has_filled => ("fill", None, false),
+        Some(summary) if summary.canceled_sz.is_some() => ("cancel", summary.canceled_sz, false),
+        _ => ("cancel", None, true),
+    }
 }
 
 fn user_fee_feature_cache() -> &'static Mutex<UserFeeFeatureCache> {
@@ -2823,6 +2845,7 @@ impl StatusParquetWriter {
         let file = fs::File::create(&tmp_path).map_err(io_to_parquet_error)?;
         let mut writer = SerializedFileWriter::new(file, self.schema.clone(), self.props.clone())?;
         let mut recovered_last_block = actual_start;
+        let mut replay_skip_until_block = 0u64;
         if let Some(recovered_path) = recovered_path.as_ref() {
             let rows = read_local_hft_status_rows(recovered_path)?;
             let last_block = rows.last().map(HasBlockNumber::block_number).unwrap_or(0);
@@ -2841,6 +2864,7 @@ impl StatusParquetWriter {
                     self.active_start_block = status_block_batch_start(&self.active);
                     self.active_end_block = status_block_batch_end(&self.active);
                     recovered_last_block = resume_end_block;
+                    replay_skip_until_block = resume_end_block;
                     if let Err(err) = fs::remove_file(recovered_path) {
                         warn!("Failed to remove old recovery file {} after loading: {err}", recovered_path.display());
                     }
@@ -2858,7 +2882,7 @@ impl StatusParquetWriter {
             writer,
             window_start_block: window_start,
             window_end_block: end,
-            replay_skip_until_block: recovered_last_block,
+            replay_skip_until_block,
             name_start_block: effective_name_start,
             name_end_block: recovered_last_block,
             last_block: recovered_last_block,
@@ -7281,6 +7305,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         let mut same_block_status_tif_by_oid: HashMap<(String, u64), String> = HashMap::new();
         let mut same_block_status_reduce_only_by_oid: HashMap<(String, u64), bool> = HashMap::new();
         let mut same_block_status_timestamp_ms_by_oid: HashMap<(String, u64), i64> = HashMap::new();
+        let mut same_block_remove_status_by_oid: HashMap<(String, u64), HftRemoveStatusSummary> = HashMap::new();
         let mut hft_terminal_oids_this_block: Vec<(String, u64)> = Vec::new();
         let mut btc_status_n = 0;
         let mut eth_status_n = 0;
@@ -7335,6 +7360,14 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             let status_user = status.user.unwrap_or_default();
             same_block_status_tif_by_oid.insert((coin.clone(), oid), tif.clone().unwrap_or_default());
             same_block_status_reduce_only_by_oid.insert((coin.clone(), oid), reduce_only);
+            if mode == ArchiveMode::Hft {
+                let summary = same_block_remove_status_by_oid.entry((coin.clone(), oid)).or_default();
+                if hft_status_is_filled(&status_text) {
+                    summary.has_filled = true;
+                } else if hft_status_is_canceled(&status_text) {
+                    summary.canceled_sz = Some(s_sz);
+                }
+            }
             if mode == ArchiveMode::Hft {
                 match infer_epoch_timestamp_millis(timestamp as i64) {
                     Ok(timestamp_ms) => {
@@ -7592,11 +7625,10 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             fill_rows.entry(coin).or_default().push(out);
         }
         if mode == ArchiveMode::Hft {
-            for (coin, rows) in &mut fill_rows {
+            for rows in fill_rows.values_mut() {
                 let aggregated = aggregate_hft_trades(std::mem::take(rows));
                 let mut aggregated = aggregated;
                 enrich_hft_trade_rows_with_user_fees(&mut aggregated);
-                let mut missing_filltime = 0u64;
                 if let Some(block_time_ms) = block_time_ms {
                     for trade in &mut aggregated {
                         match hft_order_timestamp_ms_by_oid.get(&(trade.coin.clone(), trade.oid_m)).copied() {
@@ -7604,18 +7636,9 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                                 trade.filltime =
                                     block_time_ms.checked_sub(order_timestamp_ms).and_then(encode_hft_lifetime);
                             }
-                            None => {
-                                missing_filltime += 1;
-                                trade.filltime = None;
-                            }
+                            None => trade.filltime = None,
                         }
                     }
-                }
-                if missing_filltime > 0 {
-                    warn!(
-                        "HFT trade filltime missing maker order timestamp for {} row(s) coin={} height={}",
-                        missing_filltime, coin, height
-                    );
                 }
                 for trade in &aggregated {
                     *same_block_trade_sz_by_oid.entry((trade.coin.clone(), trade.oid_m)).or_default() += trade.sz;
@@ -7624,6 +7647,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             }
             for (coin, rows) in &mut diff_rows {
                 let mut missing_remove_lifetime = 0u64;
+                let mut missing_remove_terminal_status = 0u64;
                 for row in rows {
                     let same_block_trade_sz = same_block_trade_sz_by_oid.get(&(coin.clone(), row.oid)).copied();
                     let diff_type = match row.diff_type.as_str() {
@@ -7642,8 +7666,21 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     } else {
                         String::new()
                     };
-                    row.event =
-                        classify_hft_diff_event(diff_type, row.sz, row.orig_sz, same_block_trade_sz).to_string();
+                    if diff_type == 2 {
+                        let (event, canceled_orig_sz, should_warn) = classify_hft_remove_from_status_summary(
+                            same_block_remove_status_by_oid.get(&(coin.clone(), row.oid)).copied(),
+                        );
+                        row.event = event.to_string();
+                        if let Some(canceled_orig_sz) = canceled_orig_sz {
+                            row.orig_sz = canceled_orig_sz;
+                        }
+                        if should_warn {
+                            missing_remove_terminal_status += 1;
+                        }
+                    } else {
+                        row.event =
+                            classify_hft_diff_event(diff_type, row.sz, row.orig_sz, same_block_trade_sz).to_string();
+                    }
                     row.lifetime = if diff_type == 2 {
                         match same_block_status_timestamp_ms_by_oid.get(&(coin.clone(), row.oid)).copied() {
                             Some(timestamp_ms) => block_time_ms
@@ -7662,6 +7699,12 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     warn!(
                         "HFT diff remove lifetime missing same-block status timestamp for {} row(s) coin={} height={}",
                         missing_remove_lifetime, coin, height
+                    );
+                }
+                if missing_remove_terminal_status > 0 {
+                    warn!(
+                        "HFT diff remove missing same-block filled/*canceled status for {} row(s) coin={} height={}",
+                        missing_remove_terminal_status, coin, height
                     );
                 }
             }
@@ -8187,6 +8230,20 @@ mod tests {
         assert_eq!(encode_hft_lifetime(300_001), Some(-5));
         assert_eq!(encode_hft_lifetime(330_000), Some(-6));
         assert_eq!(encode_hft_lifetime(359_999), Some(-6));
+    }
+
+    #[test]
+    fn hft_remove_status_summary_prefers_filled_over_canceled() {
+        let summary = HftRemoveStatusSummary { has_filled: true, canceled_sz: Some(12345) };
+        assert_eq!(classify_hft_remove_from_status_summary(Some(summary)), ("fill", None, false));
+    }
+
+    #[test]
+    fn hft_remove_status_summary_uses_canceled_suffix_case_insensitively() {
+        assert!(hft_status_is_canceled("reduceOnlyCanceled"));
+        assert!(hft_status_is_canceled("scheduledcanceled"));
+        assert!(!hft_status_is_canceled("filled"));
+        assert_eq!(classify_hft_remove_from_status_summary(None), ("cancel", None, true));
     }
 
     #[test]
