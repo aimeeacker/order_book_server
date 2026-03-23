@@ -51,6 +51,7 @@ const STATUS_LIVE_DELAYED_FLUSH_LOOKAHEAD_BLOCKS: u64 = 1_000;
 const STATUS_LIVE_TRIM_EVERY_ROW_GROUPS: u64 = 10;
 const DIFF_ROW_GROUP_BLOCKS: u64 = 10_000;
 const DIFF_DELAYED_FLUSH_LOOKAHEAD_BLOCKS: u64 = 2_000;
+const MAX_HFT_LIFETIME_MS: i64 = 299_999;
 const DIFF_STAGGER_DELAY: Duration = Duration::from_millis(1_500);
 const BLOCKS_FILL_ROTATION_BLOCKS: u64 = 1_000_000;
 const BLOCKS_FILL_ROW_GROUP_BLOCKS: u64 = 250_000;
@@ -1379,6 +1380,7 @@ struct DiffOut {
     event: String,
     tif: String,
     reduce_only: Option<bool>,
+    lifetime: Option<i32>,
     raw_event: String,
 }
 
@@ -1464,6 +1466,7 @@ struct FillOut {
     fee_m: i64,
     mm_rate: Option<i32>,
     mm_share: Option<i64>,
+    filltime: Option<i32>,
     tid: u64,
     start_position: i64,
     dir: String,
@@ -1552,6 +1555,21 @@ fn aggregate_hft_trades(rows: Vec<FillOut>) -> Vec<FillOut> {
         trades.push(taker);
     }
     trades
+}
+
+fn hft_status_keeps_order_live(status: &str) -> bool {
+    status == "open" || status == "triggered"
+}
+
+fn encode_hft_lifetime(lag_ms: i64) -> Option<i32> {
+    if lag_ms < 0 {
+        return None;
+    }
+    if lag_ms <= MAX_HFT_LIFETIME_MS {
+        return i32::try_from(lag_ms).ok();
+    }
+    let rounded_minutes = lag_ms.checked_add(30_000)?.checked_div(60_000)?;
+    i32::try_from(rounded_minutes).ok().and_then(|minutes| minutes.checked_neg())
 }
 
 fn user_fee_feature_cache() -> &'static Mutex<UserFeeFeatureCache> {
@@ -3573,6 +3591,7 @@ fn diff_schema_for(mode: ArchiveMode, scales: ArchiveDecimalScales) -> std::sync
                 REQUIRED BINARY event (UTF8);
                 OPTIONAL BINARY tif (UTF8);
                 OPTIONAL BOOLEAN reduce_only;
+                OPTIONAL INT32 lifetime;
             }}"
         ),
         ArchiveMode::Full => format!(
@@ -3628,6 +3647,7 @@ fn fill_schema_for(mode: ArchiveMode, scales: ArchiveDecimalScales) -> std::sync
                 REQUIRED INT64 fee_m (DECIMAL(18, 6));
                 OPTIONAL INT32 mm_rate;
                 OPTIONAL INT64 mm_share (DECIMAL(4, 2));
+                OPTIONAL INT32 filltime;
                 REQUIRED INT64 tid;
             }}"
         ),
@@ -4414,6 +4434,7 @@ fn read_local_fill_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
     let mut rows = Vec::new();
     for row in iter {
         let row = row.map_err(io_to_parquet_error)?;
+        let column_count = row.get_column_iter().count();
         let mut out = FillOut {
             block_number: row.get_long(0).map_err(io_to_parquet_error)? as u64,
             block_time: format_timestamp_millis(read_row_timestamp_millis(&row, 1)?)?,
@@ -4433,6 +4454,7 @@ fn read_local_fill_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
             fee_m: 0,
             mm_rate: None,
             mm_share: None,
+            filltime: None,
             tid: 0,
             start_position: 0,
             dir: String::new(),
@@ -4462,7 +4484,13 @@ fn read_local_fill_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.fee_m = decimal_to_i64(row.get_decimal(13).map_err(io_to_parquet_error)?)?;
                 out.mm_rate = read_row_optional_i32(&row, 14)?;
                 out.mm_share = read_row_optional_decimal_i64(&row, 15)?;
-                out.tid = row.get_long(16).map_err(io_to_parquet_error)? as u64;
+                if column_count != 18 {
+                    return Err(io_to_parquet_error(io_other(format!(
+                        "obsolete HFT fill local recovery schema with {column_count} columns is unsupported"
+                    ))));
+                }
+                out.filltime = read_row_optional_i32(&row, 16)?;
+                out.tid = row.get_long(17).map_err(io_to_parquet_error)? as u64;
             }
             ArchiveMode::Full => {
                 out.address = row.get_string(3).map_err(io_to_parquet_error)?.clone();
@@ -4502,6 +4530,7 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
     let mut rows = Vec::new();
     for row in iter {
         let row = row.map_err(io_to_parquet_error)?;
+        let column_count = row.get_column_iter().count();
         let mut out = DiffOut {
             block_number: row.get_long(0).map_err(io_to_parquet_error)? as u64,
             block_time: format_timestamp_millis(read_row_timestamp_millis(&row, 1)?)?,
@@ -4516,6 +4545,7 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
             event: String::new(),
             tif: String::new(),
             reduce_only: None,
+            lifetime: None,
             raw_event: String::new(),
         };
         match mode {
@@ -4528,6 +4558,11 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.orig_sz = decimal_to_i64(row.get_decimal(8).map_err(io_to_parquet_error)?)?;
             }
             ArchiveMode::Hft => {
+                if column_count != 14 {
+                    return Err(io_to_parquet_error(io_other(format!(
+                        "obsolete HFT diff local recovery schema with {column_count} columns is unsupported"
+                    ))));
+                }
                 out.user = row.get_string(3).map_err(io_to_parquet_error)?.clone();
                 out.oid = row.get_long(4).map_err(io_to_parquet_error)? as u64;
                 out.side = row.get_string(5).map_err(io_to_parquet_error)?.clone();
@@ -4538,6 +4573,7 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.event = row.get_string(10).map_err(io_to_parquet_error)?.clone();
                 out.tif = read_row_optional_utf8(&row, 11)?.unwrap_or_default();
                 out.reduce_only = read_row_optional_bool(&row, 12)?;
+                out.lifetime = read_row_optional_i32(&row, 13)?;
             }
             ArchiveMode::Full => {
                 out.user = row.get_string(3).map_err(io_to_parquet_error)?.clone();
@@ -6217,6 +6253,8 @@ fn write_diff_rows(
         let (tif_values, tif_def_levels) = parse_optional_utf8_column(&tifs)?;
         let reduce_onlys: Vec<Option<bool>> = rows.iter().map(|r| r.reduce_only).collect();
         let (reduce_only_values, reduce_only_def_levels) = parse_optional_bool_column(&reduce_onlys);
+        let lifetimes: Vec<Option<i32>> = rows.iter().map(|r| r.lifetime).collect();
+        let (lifetime_values, lifetime_def_levels) = parse_optional_i32_column(&lifetimes);
 
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
@@ -6293,6 +6331,12 @@ fn write_diff_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&reduce_only_values, Some(&reduce_only_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&lifetime_values, Some(&lifetime_def_levels), None)?;
             }
             col.close()?;
         }
@@ -6453,6 +6497,8 @@ fn write_fill_rows(
         let (maker_mm_rate_values, maker_mm_rate_def_levels) = parse_optional_i32_column(&maker_mm_rates);
         let maker_mm_shares: Vec<Option<i64>> = rows.iter().map(|r| r.mm_share).collect();
         let (maker_mm_share_values, maker_mm_share_def_levels) = parse_optional_i64_column(&maker_mm_shares);
+        let filltimes: Vec<Option<i32>> = rows.iter().map(|r| r.filltime).collect();
+        let (filltime_values, filltime_def_levels) = parse_optional_i32_column(&filltimes);
         let tids: Vec<i64> = rows.iter().map(|r| r.tid as i64).collect();
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
@@ -6547,6 +6593,12 @@ fn write_fill_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&maker_mm_share_values, Some(&maker_mm_share_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int32ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&filltime_values, Some(&filltime_def_levels), None)?;
             }
             col.close()?;
         }
@@ -6989,6 +7041,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
     let mut start_alignment_wait_logged = false;
     let mut last_input_height: Option<u64> = None;
     let mut replay_skip_log = ReplaySkipLogState::default();
+    let mut hft_order_timestamp_ms_by_oid: HashMap<(String, u64), i64> = HashMap::new();
 
     loop {
         set_archive_phase(last_input_height, "waiting_for_block");
@@ -7027,6 +7080,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             start_alignment_wait_logged = false;
             last_input_height = None;
             replay_skip_log = ReplaySkipLogState::default();
+            hft_order_timestamp_ms_by_oid.clear();
         }
 
         let msg = match rx.recv_timeout(Duration::from_millis(200)) {
@@ -7226,6 +7280,8 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         let mut status_rows: HashMap<String, StatusBlockBatch> = HashMap::new();
         let mut same_block_status_tif_by_oid: HashMap<(String, u64), String> = HashMap::new();
         let mut same_block_status_reduce_only_by_oid: HashMap<(String, u64), bool> = HashMap::new();
+        let mut same_block_status_timestamp_ms_by_oid: HashMap<(String, u64), i64> = HashMap::new();
+        let mut hft_terminal_oids_this_block: Vec<(String, u64)> = Vec::new();
         let mut btc_status_n = 0;
         let mut eth_status_n = 0;
         let block_time_bytes = byte_array_from_str(&block_time);
@@ -7279,6 +7335,23 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             let status_user = status.user.unwrap_or_default();
             same_block_status_tif_by_oid.insert((coin.clone(), oid), tif.clone().unwrap_or_default());
             same_block_status_reduce_only_by_oid.insert((coin.clone(), oid), reduce_only);
+            if mode == ArchiveMode::Hft {
+                match infer_epoch_timestamp_millis(timestamp as i64) {
+                    Ok(timestamp_ms) => {
+                        same_block_status_timestamp_ms_by_oid.insert((coin.clone(), oid), timestamp_ms);
+                        hft_order_timestamp_ms_by_oid.insert((coin.clone(), oid), timestamp_ms);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Skipping HFT trade filltime timestamp for coin={} oid={} height={} due to invalid order timestamp: {}",
+                            coin, oid, height, err
+                        );
+                    }
+                }
+                if !hft_status_keeps_order_live(&status_text) {
+                    hft_terminal_oids_this_block.push((coin.clone(), oid));
+                }
+            }
             let entry = status_rows.entry(coin.clone()).or_insert_with(|| StatusBlockBatch::new(mode));
             match entry {
                 StatusBlockBatch::Lite(columns) => {
@@ -7412,6 +7485,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 event: String::new(),
                 tif: String::new(),
                 reduce_only: None,
+                lifetime: None,
                 raw_event: diff_batch_raw
                     .as_ref()
                     .and_then(|batch| batch.events.get(idx))
@@ -7425,6 +7499,20 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         let mut same_block_trade_sz_by_oid: HashMap<(String, u64), i64> = HashMap::new();
         let mut btc_fill_n = 0;
         let mut eth_fill_n = 0;
+        let block_time_ms = if mode == ArchiveMode::Hft {
+            match parse_timestamp_millis(&block_time) {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    warn!(
+                        "Skipping HFT trade filltime for height={} due to invalid block_time '{}': {}",
+                        height, block_time, err
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         for (idx, fill_event) in fill_batch.events.into_iter().enumerate() {
             let FillEvent(address, fill_data) = fill_event;
             let FillLite {
@@ -7490,6 +7578,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 fee_m: 0,
                 mm_rate: None,
                 mm_share: None,
+                filltime: None,
                 tid,
                 start_position: f_start,
                 dir,
@@ -7503,16 +7592,38 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             fill_rows.entry(coin).or_default().push(out);
         }
         if mode == ArchiveMode::Hft {
-            for rows in fill_rows.values_mut() {
+            for (coin, rows) in &mut fill_rows {
                 let aggregated = aggregate_hft_trades(std::mem::take(rows));
                 let mut aggregated = aggregated;
                 enrich_hft_trade_rows_with_user_fees(&mut aggregated);
+                let mut missing_filltime = 0u64;
+                if let Some(block_time_ms) = block_time_ms {
+                    for trade in &mut aggregated {
+                        match hft_order_timestamp_ms_by_oid.get(&(trade.coin.clone(), trade.oid_m)).copied() {
+                            Some(order_timestamp_ms) => {
+                                trade.filltime =
+                                    block_time_ms.checked_sub(order_timestamp_ms).and_then(encode_hft_lifetime);
+                            }
+                            None => {
+                                missing_filltime += 1;
+                                trade.filltime = None;
+                            }
+                        }
+                    }
+                }
+                if missing_filltime > 0 {
+                    warn!(
+                        "HFT trade filltime missing maker order timestamp for {} row(s) coin={} height={}",
+                        missing_filltime, coin, height
+                    );
+                }
                 for trade in &aggregated {
                     *same_block_trade_sz_by_oid.entry((trade.coin.clone(), trade.oid_m)).or_default() += trade.sz;
                 }
                 *rows = aggregated;
             }
             for (coin, rows) in &mut diff_rows {
+                let mut missing_remove_lifetime = 0u64;
                 for row in rows {
                     let same_block_trade_sz = same_block_trade_sz_by_oid.get(&(coin.clone(), row.oid)).copied();
                     let diff_type = match row.diff_type.as_str() {
@@ -7533,7 +7644,29 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     };
                     row.event =
                         classify_hft_diff_event(diff_type, row.sz, row.orig_sz, same_block_trade_sz).to_string();
+                    row.lifetime = if diff_type == 2 {
+                        match same_block_status_timestamp_ms_by_oid.get(&(coin.clone(), row.oid)).copied() {
+                            Some(timestamp_ms) => block_time_ms
+                                .and_then(|block_ms| block_ms.checked_sub(timestamp_ms))
+                                .and_then(encode_hft_lifetime),
+                            None => {
+                                missing_remove_lifetime += 1;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                 }
+                if missing_remove_lifetime > 0 {
+                    warn!(
+                        "HFT diff remove lifetime missing same-block status timestamp for {} row(s) coin={} height={}",
+                        missing_remove_lifetime, coin, height
+                    );
+                }
+            }
+            for key in hft_terminal_oids_this_block.drain(..) {
+                hft_order_timestamp_ms_by_oid.remove(&key);
             }
         }
 
@@ -7881,6 +8014,7 @@ mod tests {
                 fee_m: 0,
                 mm_rate: None,
                 mm_share: None,
+                filltime: None,
                 tid: 0,
                 start_position: 0,
                 dir: String::new(),
@@ -7907,6 +8041,7 @@ mod tests {
                 fee_m: 0,
                 mm_rate: None,
                 mm_share: None,
+                filltime: None,
                 tid: 0,
                 start_position: 0,
                 dir: String::new(),
@@ -7924,6 +8059,58 @@ mod tests {
         assert_eq!(recovered[0].oid, 33);
         assert_eq!(recovered[1].block_number, 928200010);
         assert_eq!(recovered[1].oid, 77);
+
+        fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn fill_hft_local_reader_round_trips() {
+        let _guard = test_lock();
+        let dir = unique_temp_dir("fill_hft_reader");
+        let path = dir.join("BTC_trade_HFT_928200001_929000000.parquet");
+        let schema = fill_schema_for(ArchiveMode::Hft, ArchiveDecimalScales { px_scale: 2, sz_scale: 5 });
+        let file = fs::File::create(&path).expect("create fill parquet");
+        let mut writer =
+            SerializedFileWriter::new(file, schema, std::sync::Arc::new(WriterProperties::builder().build()))
+                .expect("create writer");
+        let rows = vec![FillOut {
+            block_number: 928200002,
+            block_time: "2026-03-21T07:00:01.000000Z".to_string(),
+            coin: "BTC".to_string(),
+            side: "B".to_string(),
+            px: 7071200,
+            sz: 12345,
+            crossed: true,
+            address: "taker".to_string(),
+            closed_pnl: 101,
+            fee: 22,
+            hash: String::new(),
+            oid: 33,
+            address_m: "maker".to_string(),
+            oid_m: 44,
+            pnl_m: 303,
+            fee_m: 44,
+            mm_rate: Some(-3),
+            mm_share: Some(283),
+            filltime: Some(41290),
+            tid: 55,
+            start_position: 0,
+            dir: String::new(),
+            fee_token: String::new(),
+            twap_id: None,
+            raw_event: String::new(),
+        }];
+        write_fill_rows(&mut writer, ArchiveMode::Hft, &rows).expect("write fill rows");
+        writer.close().expect("close fill writer");
+
+        let recovered = read_local_fill_rows(&path, ArchiveMode::Hft).expect("read fill rows");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].oid, 33);
+        assert_eq!(recovered[0].oid_m, 44);
+        assert_eq!(recovered[0].mm_rate, Some(-3));
+        assert_eq!(recovered[0].mm_share, Some(283));
+        assert_eq!(recovered[0].filltime, Some(41290));
+        assert_eq!(recovered[0].tid, 55);
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
@@ -7953,6 +8140,7 @@ mod tests {
                 event: "add".to_string(),
                 tif: "Alo".to_string(),
                 reduce_only: Some(false),
+                lifetime: None,
                 raw_event: String::new(),
             },
             DiffOut {
@@ -7969,6 +8157,7 @@ mod tests {
                 event: "fill".to_string(),
                 tif: String::new(),
                 reduce_only: None,
+                lifetime: Some(281),
                 raw_event: String::new(),
             },
         ];
@@ -7981,12 +8170,23 @@ mod tests {
         assert_eq!(recovered[0].event, "add");
         assert_eq!(recovered[0].tif, "Alo");
         assert_eq!(recovered[0].reduce_only, Some(false));
+        assert_eq!(recovered[0].lifetime, None);
         assert_eq!(recovered[1].oid, 77);
         assert_eq!(recovered[1].event, "fill");
         assert_eq!(recovered[1].tif, "");
         assert_eq!(recovered[1].reduce_only, None);
+        assert_eq!(recovered[1].lifetime, Some(281));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn encode_hft_lifetime_switches_to_negative_minutes_after_five_minutes() {
+        assert_eq!(encode_hft_lifetime(281), Some(281));
+        assert_eq!(encode_hft_lifetime(299_999), Some(299_999));
+        assert_eq!(encode_hft_lifetime(300_001), Some(-5));
+        assert_eq!(encode_hft_lifetime(330_000), Some(-6));
+        assert_eq!(encode_hft_lifetime(359_999), Some(-6));
     }
 
     #[test]
