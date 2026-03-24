@@ -31,6 +31,8 @@ use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{OffsetDateTime, PrimitiveDateTime, UtcOffset};
 
+use crate::protocol::{OrderDiff as ParsedOrderDiff, ParsedBlock, RejectOrderEvent};
+
 const ARCHIVE_BASE_DIR: &str = "/home/aimee/hl_runtime/hl/dataset";
 const DEFAULT_ARCHIVE_FINALIZE_DIR: &str = "/mnt";
 const DEFAULT_ARCHIVE_SYMBOLS: &[&str] = &["BTC", "ETH"];
@@ -82,7 +84,7 @@ const INPUT_TIMESTAMP_NO_TZ_WITH_SUBSEC: &[time::format_description::FormatItem<
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]");
 const INPUT_TIMESTAMP_NO_TZ_NO_SUBSEC: &[time::format_description::FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
-pub(crate) const ARCHIVE_QUEUE_BLOCKS: usize = 127;
+pub(crate) const ARCHIVE_QUEUE_BLOCKS: usize = 511;
 
 thread_local! {
     static ARCHIVE_THREAD_CONTEXT: RefCell<Option<ArchiveThreadContext>> = const { RefCell::new(None) };
@@ -1001,121 +1003,25 @@ pub(crate) fn dispatch_reject_archive_block(block: RejectArchiveBlock, shutdown:
 #[derive(Debug, Clone)]
 pub(crate) struct ArchiveBlock {
     pub(crate) block_number: u64,
-    pub(crate) fills_line: Vec<u8>,
-    pub(crate) diffs_line: Vec<u8>,
-    pub(crate) order_line: Vec<u8>,
+    pub(crate) payload: Arc<ParsedBlock>,
 }
 
 impl ArchiveBlock {
-    pub(crate) fn new(block_number: u64, fills_line: Vec<u8>, diffs_line: Vec<u8>, order_line: Vec<u8>) -> Self {
-        Self { block_number, fills_line, diffs_line, order_line }
+    pub(crate) fn new(block_number: u64, payload: Arc<ParsedBlock>) -> Self {
+        Self { block_number, payload }
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct RejectArchiveBlock {
     pub(crate) block_number: u64,
-    pub(crate) order_line: Vec<u8>,
+    pub(crate) events: Arc<Vec<RejectOrderEvent>>,
 }
 
 impl RejectArchiveBlock {
-    pub(crate) fn new(block_number: u64, order_line: Vec<u8>) -> Self {
-        Self { block_number, order_line }
+    pub(crate) fn new(block_number: u64, events: Arc<Vec<RejectOrderEvent>>) -> Self {
+        Self { block_number, events }
     }
-}
-
-#[derive(Deserialize)]
-struct BatchLite<T> {
-    #[serde(rename = "local_time")]
-    _local_time: String,
-    #[serde(rename = "block_time")]
-    block_time: String,
-    #[serde(rename = "block_number")]
-    block_number: u64,
-    events: Vec<T>,
-}
-
-#[derive(Deserialize)]
-struct OrderStatusLite {
-    time: String,
-    user: Option<String>,
-    hash: serde_json::Value,
-    builder: serde_json::Value,
-    status: String,
-    order: OrderLite,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OrderLite {
-    coin: String,
-    side: String,
-    limit_px: String,
-    sz: String,
-    oid: u64,
-    timestamp: u64,
-    trigger_condition: String,
-    is_trigger: bool,
-    trigger_px: String,
-    is_position_tpsl: bool,
-    reduce_only: bool,
-    order_type: String,
-    orig_sz: String,
-    tif: Option<String>,
-    cloid: serde_json::Value,
-    #[serde(default)]
-    children: serde_json::Value,
-}
-
-#[derive(Deserialize)]
-struct DiffLite {
-    user: String,
-    oid: u64,
-    coin: String,
-    side: String,
-    px: String,
-    #[serde(rename = "raw_book_diff", alias = "rawBookDiff")]
-    raw_book_diff: RawDiffLite,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum RawDiffLite {
-    #[serde(alias = "New")]
-    New { sz: String },
-    #[serde(alias = "Update")]
-    Update {
-        #[serde(rename = "origSz")]
-        orig_sz: String,
-        #[serde(rename = "newSz")]
-        new_sz: String,
-    },
-    #[serde(alias = "Remove")]
-    Remove,
-}
-
-#[derive(Deserialize)]
-struct FillEvent(String, FillLite);
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FillLite {
-    coin: String,
-    px: String,
-    sz: String,
-    side: String,
-    #[serde(rename = "time")]
-    _time: u64,
-    start_position: String,
-    dir: String,
-    closed_pnl: String,
-    hash: String,
-    oid: u64,
-    crossed: bool,
-    fee: String,
-    tid: u64,
-    fee_token: String,
-    twap_id: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -1214,7 +1120,6 @@ struct StatusFullColumns {
     is_position_tpsl: Vec<bool>,
     reduce_only: Vec<bool>,
     cloid: Vec<ByteArray>,
-    raw_event: Vec<ByteArray>,
 }
 
 impl StatusFullColumns {
@@ -1246,7 +1151,6 @@ impl StatusFullColumns {
         self.is_position_tpsl.extend(other.is_position_tpsl);
         self.reduce_only.extend(other.reduce_only);
         self.cloid.extend(other.cloid);
-        self.raw_event.extend(other.raw_event);
     }
 
     fn trim_to_block(&mut self, max_block: u64) {
@@ -1274,7 +1178,6 @@ impl StatusFullColumns {
         self.is_position_tpsl.truncate(keep);
         self.reduce_only.truncate(keep);
         self.cloid.truncate(keep);
-        self.raw_event.truncate(keep);
     }
 }
 
@@ -1381,7 +1284,6 @@ struct DiffOut {
     tif: String,
     reduce_only: Option<bool>,
     lifetime: Option<i32>,
-    raw_event: String,
 }
 
 impl HasBlockNumber for DiffOut {
@@ -1472,7 +1374,6 @@ struct FillOut {
     dir: String,
     fee_token: String,
     twap_id: Option<i64>,
-    raw_event: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1572,7 +1473,8 @@ fn hft_status_is_filled(status: &str) -> bool {
 }
 
 fn hft_status_is_canceled(status: &str) -> bool {
-    status.to_ascii_lowercase().ends_with("canceled")
+    let normalized = status.to_ascii_lowercase();
+    normalized.ends_with("canceled") || normalized.ends_with("cancel")
 }
 
 fn encode_hft_lifetime(lag_ms: i64) -> Option<i32> {
@@ -1586,7 +1488,9 @@ fn encode_hft_lifetime(lag_ms: i64) -> Option<i32> {
     i32::try_from(rounded_minutes).ok().and_then(|minutes| minutes.checked_neg())
 }
 
-fn classify_hft_remove_from_status_summary(summary: Option<HftRemoveStatusSummary>) -> (&'static str, Option<i64>, bool) {
+fn classify_hft_remove_from_status_summary(
+    summary: Option<HftRemoveStatusSummary>,
+) -> (&'static str, Option<i64>, bool) {
     match summary {
         Some(summary) if summary.has_filled => ("fill", None, false),
         Some(summary) if summary.canceled_sz.is_some() => ("cancel", summary.canceled_sz, false),
@@ -3142,7 +3046,9 @@ impl DiffWorkerHandle {
         let (error_tx, error_rx) = channel();
         let recover_blocks_fill_on_stop = Arc::new(AtomicBool::new(false));
         let worker_recover_blocks_fill_on_stop = recover_blocks_fill_on_stop.clone();
+        let thread_context = archive_thread_context(|ctx| ctx.cloned());
         let handle = thread::spawn(move || {
+            set_archive_thread_context(thread_context);
             let mut writers: HashMap<String, ParquetStreamWriter<DiffOut>> = symbols
                 .iter()
                 .map(|coin| {
@@ -3216,6 +3122,7 @@ impl DiffWorkerHandle {
                     break;
                 }
             }
+            set_archive_thread_context(None);
         });
         Self { tx, error_rx, handle: Some(handle), recover_blocks_fill_on_stop }
     }
@@ -3299,7 +3206,9 @@ impl StatusWorkerHandle {
         let recover_blocks_fill_on_stop = Arc::new(AtomicBool::new(false));
         let worker_recover_blocks_fill_on_stop = recover_blocks_fill_on_stop.clone();
         let worker_coin = coin.clone();
+        let thread_context = archive_thread_context(|ctx| ctx.cloned());
         let handle = thread::spawn(move || {
+            set_archive_thread_context(thread_context);
             let schema = status_schema_for(mode, scales);
             let mut writer = StatusParquetWriter::new(
                 worker_coin.clone(),
@@ -3357,6 +3266,7 @@ impl StatusWorkerHandle {
                     break;
                 }
             }
+            set_archive_thread_context(None);
         });
         Self { coin, tx, ack_rx, error_rx, handle: Some(handle), recover_blocks_fill_on_stop }
     }
@@ -3576,7 +3486,6 @@ fn status_schema_for(mode: ArchiveMode, scales: ArchiveDecimalScales) -> std::sy
                 REQUIRED BOOLEAN is_position_tpsl;
                 REQUIRED BOOLEAN reduce_only;
                 OPTIONAL BINARY cloid (UTF8);
-                REQUIRED BINARY raw_event (UTF8);
             }}"
         ),
     };
@@ -3630,7 +3539,6 @@ fn diff_schema_for(mode: ArchiveMode, scales: ArchiveDecimalScales) -> std::sync
                 REQUIRED BINARY side (UTF8);
                 REQUIRED INT64 px (DECIMAL(18, {p}));
                 REQUIRED INT64 orig_sz (DECIMAL(18, {s}));
-                REQUIRED BINARY raw_event (UTF8);
             }}"
         ),
     };
@@ -3694,7 +3602,6 @@ fn fill_schema_for(mode: ArchiveMode, scales: ArchiveDecimalScales) -> std::sync
                 REQUIRED BINARY dir (UTF8);
                 REQUIRED BINARY fee_token (UTF8);
                 OPTIONAL INT64 twap_id;
-                REQUIRED BINARY raw_event (UTF8);
             }}"
         ),
     };
@@ -4484,7 +4391,6 @@ fn read_local_fill_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
             dir: String::new(),
             fee_token: String::new(),
             twap_id: None,
-            raw_event: String::new(),
         };
         match mode {
             ArchiveMode::Lite => {
@@ -4540,7 +4446,6 @@ fn read_local_fill_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                     }
                     None => None,
                 };
-                out.raw_event = row.get_string(17).map_err(io_to_parquet_error)?.clone();
             }
         }
         rows.push(out);
@@ -4570,7 +4475,6 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
             tif: String::new(),
             reduce_only: None,
             lifetime: None,
-            raw_event: String::new(),
         };
         match mode {
             ArchiveMode::Lite => {
@@ -4607,7 +4511,6 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.side = row.get_string(7).map_err(io_to_parquet_error)?.clone();
                 out.px = decimal_to_i64(row.get_decimal(8).map_err(io_to_parquet_error)?)?;
                 out.orig_sz = decimal_to_i64(row.get_decimal(9).map_err(io_to_parquet_error)?)?;
-                out.raw_event = row.get_string(10).map_err(io_to_parquet_error)?.clone();
             }
         }
         rows.push(out);
@@ -4673,7 +4576,6 @@ fn hft_status_rows_to_batch(rows: Vec<HftStatusRecoveryRow>) -> StatusBlockBatch
         columns.is_position_tpsl.push(row.is_position_tpsl);
         columns.reduce_only.push(row.reduce_only);
         columns.cloid.push(byte_array_from_str(""));
-        columns.raw_event.push(byte_array_from_str(""));
     }
     StatusBlockBatch::Hft(columns)
 }
@@ -5349,35 +5251,6 @@ fn parse_scaled(value: &str, scale: u32) -> Option<i64> {
     Some(value)
 }
 
-fn flatten_to_string(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Null => String::new(),
-        _ => v.to_string(),
-    }
-}
-
-fn extract_hft_child_trigger_px(children: &serde_json::Value) -> (String, String) {
-    let mut tp_trigger_px = String::new();
-    let mut sl_trigger_px = String::new();
-    let Some(items) = children.as_array() else {
-        return (tp_trigger_px, sl_trigger_px);
-    };
-    for child in items {
-        let Some(obj) = child.as_object() else {
-            continue;
-        };
-        let order_type = obj.get("orderType").and_then(|v| v.as_str()).unwrap_or_default();
-        let trigger_px = obj.get("triggerPx").map_or_else(String::new, flatten_to_string);
-        if tp_trigger_px.is_empty() && order_type.starts_with("Take Profit") {
-            tp_trigger_px = trigger_px;
-        } else if sl_trigger_px.is_empty() && order_type.starts_with("Stop") {
-            sl_trigger_px = trigger_px;
-        }
-    }
-    (tp_trigger_px, sl_trigger_px)
-}
-
 fn byte_array_from_string(value: String) -> ByteArray {
     ByteArray::from(value.into_bytes())
 }
@@ -5547,6 +5420,13 @@ fn diff_type_name(diff_type: u8) -> &'static str {
     }
 }
 
+fn protocol_side_str(side: crate::protocol::Side) -> &'static str {
+    match side {
+        crate::protocol::Side::Ask => "A",
+        crate::protocol::Side::Bid => "B",
+    }
+}
+
 fn classify_hft_diff_event(diff_type: u8, sz: i64, orig_sz: i64, same_block_trade_sz: Option<i64>) -> &'static str {
     match diff_type {
         0 => "add",
@@ -5590,15 +5470,12 @@ fn run_reject_archive_writer(rx: Receiver<RejectArchiveBlock>, stop: Arc<AtomicB
     loop {
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(msg) => {
-                set_archive_phase(Some(msg.block_number), "parse_reject_order_batch");
-                let order_batch: BatchLite<OrderStatusLite> = match serde_json::from_slice(&msg.order_line) {
-                    Ok(batch) => batch,
-                    Err(err) => {
-                        warn!("Reject archive dropped malformed order batch at {}: {err}", msg.block_number);
-                        continue;
-                    }
+                set_archive_phase(Some(msg.block_number), "build_reject_status_rows");
+                let reject_events = msg.events.as_ref();
+                let Some(height) = reject_events.first().map(|event| event.block_number).or(Some(msg.block_number))
+                else {
+                    continue;
                 };
-                let height = order_batch.block_number;
                 if !bootstrap_checkpoint_evaluated {
                     if effective_stop_height.is_none() {
                         if let Some(archive_height) = current_archive_height_span() {
@@ -5608,52 +5485,36 @@ fn run_reject_archive_writer(rx: Receiver<RejectArchiveBlock>, stop: Arc<AtomicB
                     bootstrap_checkpoint_evaluated = true;
                 }
 
-                set_archive_phase(Some(height), "build_reject_status_rows");
                 let mut reject_rows = Vec::new();
-                for status in order_batch.events {
+                for status in reject_events {
                     if !is_direct_reject_status(&status.status) {
                         continue;
                     }
-                    let OrderLite {
-                        coin,
-                        side,
-                        limit_px,
-                        sz,
-                        oid: _,
-                        timestamp: _,
-                        trigger_condition,
-                        is_trigger,
-                        trigger_px,
-                        is_position_tpsl,
-                        reduce_only,
-                        order_type,
-                        orig_sz: _,
-                        tif,
-                        ..
-                    } = status.order;
-                    if !symbols_set.contains(&coin) {
+                    if !symbols_set.contains(&status.coin) {
                         continue;
                     }
-                    let s_px = parse_scaled(&limit_px, 5).unwrap_or(0);
-                    let s_sz = parse_scaled(&sz, 5).unwrap_or(0);
-                    let s_trig = parse_scaled(&trigger_px, 5).unwrap_or(0);
+                    let s_px = parse_scaled(&status.limit_px, 5).unwrap_or(0);
+                    let s_sz = parse_scaled(&status.sz, 5).unwrap_or(0);
+                    let s_trig = parse_scaled(&status.trigger_px, 5).unwrap_or(0);
                     reject_rows.push(RejectOut {
                         block_number: height,
-                        block_time: order_batch.block_time.clone(),
-                        coin,
-                        user: status.user.unwrap_or_default(),
-                        // oid,
-                        status: status.status,
-                        side,
+                        block_time: status.block_time.clone(),
+                        coin: status.coin.clone(),
+                        user: status.user.clone(),
+                        status: status.status.clone(),
+                        side: match status.side {
+                            crate::protocol::Side::Ask => "A".to_string(),
+                            crate::protocol::Side::Bid => "B".to_string(),
+                        },
                         limit_px: s_px,
                         sz: s_sz,
-                        is_trigger,
-                        tif: tif.unwrap_or_default(),
-                        trigger_condition,
+                        is_trigger: status.is_trigger,
+                        tif: status.tif.clone().unwrap_or_default(),
+                        trigger_condition: status.trigger_condition.clone(),
                         trigger_px: s_trig,
-                        is_position_tpsl,
-                        reduce_only,
-                        order_type,
+                        is_position_tpsl: status.is_position_tpsl,
+                        reduce_only: status.reduce_only,
+                        order_type: status.order_type.clone(),
                     });
                 }
                 reject_rows.sort_unstable_by(|lhs, rhs| {
@@ -6053,7 +5914,6 @@ fn write_status_full_columns(
         is_position_tpsl,
         reduce_only,
         cloid,
-        raw_event,
         time: _,
         timestamp: _,
     } = rows;
@@ -6179,12 +6039,6 @@ fn write_status_full_columns(
     if let Some(mut col) = row_group.next_column()? {
         if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
             typed.write_batch(&cloid_values, Some(&cloid_def_levels), None)?;
-        }
-        col.close()?;
-    }
-    if let Some(mut col) = row_group.next_column()? {
-        if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-            typed.write_batch(&raw_event, None, None)?;
         }
         col.close()?;
     }
@@ -6366,7 +6220,6 @@ fn write_diff_rows(
         }
     } else {
         let users: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.user.as_bytes())).collect();
-        let raw_events: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.raw_event.as_bytes())).collect();
 
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
@@ -6425,12 +6278,6 @@ fn write_diff_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&orig_szs, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&raw_events, None, None)?;
             }
             col.close()?;
         }
@@ -6642,7 +6489,6 @@ fn write_fill_rows(
         let fee_tokens: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.fee_token.as_bytes())).collect();
         let twap_ids: Vec<Option<i64>> = rows.iter().map(|r| r.twap_id).collect();
         let (twap_id_values, twap_id_def_levels) = parse_optional_i64_column(&twap_ids);
-        let raw_events: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.raw_event.as_bytes())).collect();
 
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
@@ -6746,12 +6592,6 @@ fn write_fill_rows(
             }
             col.close()?;
         }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&raw_events, None, None)?;
-            }
-            col.close()?;
-        }
     }
 
     row_group.close()?;
@@ -6789,7 +6629,6 @@ fn write_status_hft_columns(
         is_position_tpsl,
         reduce_only,
         cloid: _,
-        raw_event: _,
         time: _,
         timestamp: _,
     } = rows;
@@ -7141,68 +6980,14 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         }
 
         set_archive_phase(Some(msg.block_number), "parse_batches");
-        let order_batch: BatchLite<OrderStatusLite> = match serde_json::from_slice(&msg.order_line) {
-            Ok(batch) => batch,
-            Err(err) => {
-                warn!("Archive parse error for order batch at {}: {err}", msg.block_number);
-                continue;
-            }
-        };
-        let order_batch_raw: Option<BatchLite<serde_json::Value>> = if matches!(mode, ArchiveMode::Full) {
-            match serde_json::from_slice(&msg.order_line) {
-                Ok(batch) => Some(batch),
-                Err(err) => {
-                    warn!("Archive parse error for raw order batch at {}: {err}", msg.block_number);
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        let diff_batch: BatchLite<DiffLite> = match serde_json::from_slice(&msg.diffs_line) {
-            Ok(batch) => batch,
-            Err(err) => {
-                warn!("Archive parse error for diff batch at {}: {err}", msg.block_number);
-                continue;
-            }
-        };
-        let diff_batch_raw: Option<BatchLite<serde_json::Value>> = if matches!(mode, ArchiveMode::Full) {
-            match serde_json::from_slice(&msg.diffs_line) {
-                Ok(batch) => Some(batch),
-                Err(err) => {
-                    warn!("Archive parse error for raw diff batch at {}: {err}", msg.block_number);
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        let fill_batch: BatchLite<FillEvent> = match serde_json::from_slice(&msg.fills_line) {
-            Ok(batch) => batch,
-            Err(err) => {
-                warn!("Archive parse error for fill batch at {}: {err}", msg.block_number);
-                continue;
-            }
-        };
-        let fill_batch_raw: Option<BatchLite<serde_json::Value>> = if matches!(mode, ArchiveMode::Full) {
-            match serde_json::from_slice(&msg.fills_line) {
-                Ok(batch) => Some(batch),
-                Err(err) => {
-                    warn!("Archive parse error for raw fill batch at {}: {err}", msg.block_number);
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-
-        let height = order_batch.block_number;
-        if diff_batch.block_number != height || fill_batch.block_number != height {
-            warn!(
-                "Archive height mismatch: order {} diff {} fill {}",
-                height, diff_batch.block_number, fill_batch.block_number
-            );
+        let payload = msg.payload.as_ref();
+        let height = payload.block_number;
+        if msg.block_number != height {
+            warn!("Archive block header mismatch: msg {} payload {}", msg.block_number, height);
             continue;
+        }
+        if !payload.rejects.is_empty() {
+            warn!("Archive payload unexpectedly included reject rows at {}", height);
         }
 
         if last_input_height.is_none() && current_archive_stop_height().is_some_and(|stop_height| stop_height < height)
@@ -7292,14 +7077,14 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     height
                 );
                 let bootstrap_symbols = writers.as_ref().expect("writers checked above").symbols.clone();
-                spawn_mid_window_checkpoint_fetch(height, order_batch.block_time.clone(), bootstrap_symbols);
+                spawn_mid_window_checkpoint_fetch(height, payload.block_time.clone(), bootstrap_symbols);
             }
         }
 
-        let block_time = order_batch.block_time.clone();
-        let order_n = order_batch.events.len() as i32;
-        let diff_n = diff_batch.events.len() as i32;
-        let fill_n = fill_batch.events.len() as i32;
+        let block_time = payload.block_time.clone();
+        let order_n = payload.statuses.len() as i32;
+        let diff_n = payload.diffs.len() as i32;
+        let fill_n = payload.fills.len() as i32;
         set_archive_phase(Some(height), "build_status_rows");
         let mut status_rows: HashMap<String, StatusBlockBatch> = HashMap::new();
         let mut same_block_status_tif_by_oid: HashMap<(String, u64), String> = HashMap::new();
@@ -7310,25 +7095,22 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         let mut btc_status_n = 0;
         let mut eth_status_n = 0;
         let block_time_bytes = byte_array_from_str(&block_time);
-        for (idx, status) in order_batch.events.into_iter().enumerate() {
-            let OrderLite {
-                coin,
-                side,
-                limit_px,
-                sz,
-                oid,
-                timestamp,
-                trigger_condition,
-                is_trigger,
-                trigger_px,
-                is_position_tpsl,
-                reduce_only,
-                order_type,
-                orig_sz,
-                tif,
-                cloid,
-                children,
-            } = status.order;
+        for status in &payload.statuses {
+            let coin = status.coin.clone();
+            let side = protocol_side_str(status.side).to_string();
+            let limit_px = status.limit_px.clone();
+            let sz = status.sz.clone();
+            let oid = status.oid;
+            let timestamp = status.timestamp;
+            let trigger_condition = status.trigger_condition.clone();
+            let is_trigger = status.is_trigger;
+            let trigger_px = status.trigger_px.clone();
+            let is_position_tpsl = status.is_position_tpsl;
+            let reduce_only = status.reduce_only;
+            let order_type = status.order_type.clone();
+            let orig_sz = status.orig_sz.clone();
+            let tif = status.tif.clone();
+            let cloid = status.cloid.clone();
             if coin == "BTC" {
                 btc_status_n += 1;
             } else if coin == "ETH" {
@@ -7353,11 +7135,12 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     parse_scaled(&trigger_px, scales.px_scale).unwrap_or(0),
                 )
             };
-            let (tp_child_trigger_px, sl_child_trigger_px) = extract_hft_child_trigger_px(&children);
-            let tp_child_trigger_px = parse_scaled(&tp_child_trigger_px, scales.px_scale);
-            let sl_child_trigger_px = parse_scaled(&sl_child_trigger_px, scales.px_scale);
-            let status_text = status.status;
-            let status_user = status.user.unwrap_or_default();
+            let tp_child_trigger_px =
+                status.tp_trigger_px.as_deref().and_then(|value| parse_scaled(value, scales.px_scale));
+            let sl_child_trigger_px =
+                status.sl_trigger_px.as_deref().and_then(|value| parse_scaled(value, scales.px_scale));
+            let status_text = status.status.clone();
+            let status_user = status.user.clone();
             same_block_status_tif_by_oid.insert((coin.clone(), oid), tif.clone().unwrap_or_default());
             same_block_status_reduce_only_by_oid.insert((coin.clone(), oid), reduce_only);
             if mode == ArchiveMode::Hft {
@@ -7390,7 +7173,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 StatusBlockBatch::Lite(columns) => {
                     columns.block_number.push(height as i64);
                     columns.block_time.push(block_time_bytes.clone());
-                    columns.time.push(byte_array_from_string(status.time));
+                    columns.time.push(byte_array_from_string(status.time.clone()));
                     columns.user.push(byte_array_from_string(status_user.clone()));
                     columns.status.push(byte_array_from_string(status_text.clone()));
                     columns.oid.push(oid as i64);
@@ -7417,12 +7200,12 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     columns.is_trigger.push(is_trigger);
                     columns.tif.push(byte_array_from_string(tif.unwrap_or_default()));
                     columns.user.push(byte_array_from_string(status_user.clone()));
-                    columns.hash.push(byte_array_from_string(flatten_to_string(&status.hash)));
+                    columns.hash.push(byte_array_from_string(status.hash.clone()));
                     columns.order_type.push(byte_array_from_string(order_type));
                     columns.sz.push(s_sz);
                     columns.orig_sz.push(s_orig);
-                    columns.time.push(byte_array_from_string(status.time));
-                    columns.builder.push(byte_array_from_string(flatten_to_string(&status.builder)));
+                    columns.time.push(byte_array_from_string(status.time.clone()));
+                    columns.builder.push(byte_array_from_string(status.builder.clone()));
                     columns.timestamp.push(timestamp as i64);
                     columns.trigger_condition.push(byte_array_from_string(trigger_condition));
                     columns.trigger_px.push(s_trig);
@@ -7430,13 +7213,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     columns.sl_trigger_px.push(None);
                     columns.is_position_tpsl.push(is_position_tpsl);
                     columns.reduce_only.push(reduce_only);
-                    columns.cloid.push(byte_array_from_string(flatten_to_string(&cloid)));
-                    columns.raw_event.push(byte_array_from_string(
-                        order_batch_raw
-                            .as_ref()
-                            .and_then(|batch| batch.events.get(idx))
-                            .map_or_else(String::new, serde_json::Value::to_string),
-                    ));
+                    columns.cloid.push(byte_array_from_string(cloid.unwrap_or_default()));
                 }
                 StatusBlockBatch::Hft(columns) => {
                     columns.block_number.push(height as i64);
@@ -7448,12 +7225,12 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     columns.is_trigger.push(is_trigger);
                     columns.tif.push(byte_array_from_string(tif.unwrap_or_default()));
                     columns.user.push(byte_array_from_string(status_user));
-                    columns.hash.push(byte_array_from_string(flatten_to_string(&status.hash)));
+                    columns.hash.push(byte_array_from_string(status.hash.clone()));
                     columns.order_type.push(byte_array_from_string(order_type));
                     columns.sz.push(s_sz);
                     columns.orig_sz.push(s_orig);
-                    columns.time.push(byte_array_from_string(status.time));
-                    columns.builder.push(byte_array_from_string(flatten_to_string(&status.builder)));
+                    columns.time.push(byte_array_from_string(status.time.clone()));
+                    columns.builder.push(byte_array_from_string(status.builder.clone()));
                     columns.timestamp.push(timestamp as i64);
                     columns.trigger_condition.push(byte_array_from_string(trigger_condition));
                     columns.trigger_px.push(s_trig);
@@ -7461,7 +7238,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                     columns.sl_trigger_px.push(sl_child_trigger_px);
                     columns.is_position_tpsl.push(is_position_tpsl);
                     columns.reduce_only.push(reduce_only);
-                    columns.raw_event.push(ByteArray::from(Vec::<u8>::new()));
+                    columns.cloid.push(byte_array_from_string(cloid.unwrap_or_default()));
                 }
             }
         }
@@ -7470,8 +7247,12 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         let mut diff_rows: HashMap<String, Vec<DiffOut>> = HashMap::new();
         let mut btc_diff_n = 0;
         let mut eth_diff_n = 0;
-        for (idx, diff) in diff_batch.events.into_iter().enumerate() {
-            let DiffLite { user, oid, coin, side, px, raw_book_diff } = diff;
+        for diff in &payload.diffs {
+            let user = diff.user.clone();
+            let oid = diff.oid;
+            let coin = diff.coin.clone();
+            let side = protocol_side_str(diff.side).to_string();
+            let px = diff.px.clone();
             if coin == "BTC" {
                 btc_diff_n += 1;
             } else if coin == "ETH" {
@@ -7482,25 +7263,25 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             }
             let scales = current_archive_coin_decimal_scales(&coin);
             let (d_px, d_sz, d_orig, diff_type) = if mode.uses_full_scaling() {
-                let (dt, sz, osz) = match raw_book_diff {
-                    RawDiffLite::New { sz } => (0u8, parse_scaled(&sz, scales.sz_scale).unwrap_or(0), 0i64),
-                    RawDiffLite::Update { orig_sz, new_sz } => (
+                let (dt, sz, osz) = match &diff.raw_book_diff {
+                    ParsedOrderDiff::New { sz } => (0u8, parse_scaled(sz, scales.sz_scale).unwrap_or(0), 0i64),
+                    ParsedOrderDiff::Update { orig_sz, new_sz } => (
                         1u8,
-                        parse_scaled(&new_sz, scales.sz_scale).unwrap_or(0),
-                        parse_scaled(&orig_sz, scales.sz_scale).unwrap_or(0),
+                        parse_scaled(new_sz, scales.sz_scale).unwrap_or(0),
+                        parse_scaled(orig_sz, scales.sz_scale).unwrap_or(0),
                     ),
-                    RawDiffLite::Remove => (2u8, 0, 0),
+                    ParsedOrderDiff::Remove => (2u8, 0, 0),
                 };
                 (parse_scaled(&px, scales.px_scale).unwrap_or(0), sz, osz, dt)
             } else {
-                let (dt, sz, osz) = match raw_book_diff {
-                    RawDiffLite::New { sz } => (0u8, parse_scaled(&sz, scales.sz_scale).unwrap_or(0), 0i64),
-                    RawDiffLite::Update { orig_sz, new_sz } => (
+                let (dt, sz, osz) = match &diff.raw_book_diff {
+                    ParsedOrderDiff::New { sz } => (0u8, parse_scaled(sz, scales.sz_scale).unwrap_or(0), 0i64),
+                    ParsedOrderDiff::Update { orig_sz, new_sz } => (
                         1u8,
-                        parse_scaled(&new_sz, scales.sz_scale).unwrap_or(0),
-                        parse_scaled(&orig_sz, scales.sz_scale).unwrap_or(0),
+                        parse_scaled(new_sz, scales.sz_scale).unwrap_or(0),
+                        parse_scaled(orig_sz, scales.sz_scale).unwrap_or(0),
                     ),
-                    RawDiffLite::Remove => (2u8, 0, 0),
+                    ParsedOrderDiff::Remove => (2u8, 0, 0),
                 };
                 (parse_scaled(&px, scales.px_scale).unwrap_or(0), sz, osz, dt)
             };
@@ -7519,10 +7300,6 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 tif: String::new(),
                 reduce_only: None,
                 lifetime: None,
-                raw_event: diff_batch_raw
-                    .as_ref()
-                    .and_then(|batch| batch.events.get(idx))
-                    .map_or_else(String::new, serde_json::Value::to_string),
             };
             diff_rows.entry(coin).or_default().push(out);
         }
@@ -7546,26 +7323,21 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         } else {
             None
         };
-        for (idx, fill_event) in fill_batch.events.into_iter().enumerate() {
-            let FillEvent(address, fill_data) = fill_event;
-            let FillLite {
-                coin,
-                px,
-                sz,
-                side,
-                _time: _,
-                start_position,
-                dir,
-                closed_pnl,
-                hash,
-                oid,
-                crossed,
-                fee,
-                tid,
-                fee_token,
-                twap_id,
-                ..
-            } = fill_data;
+        for fill_event in &payload.fills {
+            let coin = fill_event.coin.clone();
+            let px = fill_event.px.clone();
+            let sz = fill_event.sz.clone();
+            let side = protocol_side_str(fill_event.side).to_string();
+            let start_position = fill_event.start_position.clone();
+            let dir = fill_event.dir.clone();
+            let closed_pnl = fill_event.closed_pnl.clone();
+            let hash = fill_event.hash.clone();
+            let oid = fill_event.oid;
+            let crossed = fill_event.crossed;
+            let fee = fill_event.fee.clone();
+            let tid = fill_event.tid;
+            let fee_token = fill_event.fee_token.clone();
+            let twap_id = fill_event.twap_id;
             if coin == "BTC" {
                 btc_fill_n += 1;
             } else if coin == "ETH" {
@@ -7600,7 +7372,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 px: f_px,
                 sz: f_sz,
                 crossed,
-                address,
+                address: fill_event.user.clone(),
                 closed_pnl: f_pnl,
                 fee: f_fee,
                 hash,
@@ -7617,10 +7389,6 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 dir,
                 fee_token,
                 twap_id: twap_id.map(|value| value as i64),
-                raw_event: fill_batch_raw
-                    .as_ref()
-                    .and_then(|batch| batch.events.get(idx))
-                    .map_or_else(String::new, serde_json::Value::to_string),
             };
             fill_rows.entry(coin).or_default().push(out);
         }
@@ -7854,6 +7622,8 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::channel;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -7978,10 +7748,10 @@ mod tests {
         writer
             .append_rows("blocks", ArchiveMode::Lite, 1001, vec![make_row(1001)], write_block_rows)
             .expect("append 1001");
-        writer.advance_block(ArchiveMode::Lite, 1002, write_block_rows).expect("advance 1002");
+        writer.advance_block(ArchiveMode::Lite, 6000, write_block_rows).expect("advance 6000");
         writer
-            .append_rows("blocks", ArchiveMode::Lite, 1002, vec![make_row(1002)], write_block_rows)
-            .expect("append 1002");
+            .append_rows("blocks", ArchiveMode::Lite, 6000, vec![make_row(6000)], write_block_rows)
+            .expect("append 6000");
         writer.close_with_flush(ArchiveMode::Lite, write_block_rows).expect("close first writer");
 
         let mut recovered = ParquetStreamWriter::new(
@@ -7995,16 +7765,16 @@ mod tests {
         recovered
             .append_rows("blocks", ArchiveMode::Lite, 1001, vec![make_row(1001)], write_block_rows)
             .expect("re-append 1001");
-        recovered.advance_block(ArchiveMode::Lite, 1003, write_block_rows).expect("advance 1003");
+        recovered.advance_block(ArchiveMode::Lite, 6001, write_block_rows).expect("advance 6001");
         recovered
-            .append_rows("blocks", ArchiveMode::Lite, 1003, vec![make_row(1003)], write_block_rows)
-            .expect("append 1003");
+            .append_rows("blocks", ArchiveMode::Lite, 6001, vec![make_row(6001)], write_block_rows)
+            .expect("append 6001");
         recovered.close_with_flush(ArchiveMode::Lite, write_block_rows).expect("close recovered writer");
 
         let final_path = base_dir.join("blocks_1001_1000000.parquet.0");
         let rows = read_local_blocks_rows(&final_path).expect("read recovered blocks parquet");
         let heights: Vec<u64> = rows.iter().map(|row| row.block_number).collect();
-        assert_eq!(heights, vec![1001, 1002, 1003]);
+        assert_eq!(heights, vec![1001, 6000, 6001]);
 
         set_archive_handoff_config(previous_handoff);
         set_archive_recover_blocks_fill_on_stop(previous_recovery);
@@ -8018,21 +7788,7 @@ mod tests {
         let _guard = test_lock();
         let dir = unique_temp_dir("fill_reader");
         let path = dir.join("BTC_fill_928200001_929000000.parquet");
-        let schema = std::sync::Arc::new(
-            parse_message_type(
-                "message fill_schema {\n\
-                    REQUIRED INT64 block_number;\n\
-                    REQUIRED INT64 block_time (TIMESTAMP(MILLIS,true));\n\
-                    REQUIRED BINARY coin (UTF8);\n\
-                    REQUIRED BINARY side (UTF8);\n\
-                    REQUIRED INT64 px (DECIMAL(18, 8));\n\
-                    REQUIRED INT64 sz (DECIMAL(18, 8));\n\
-                    REQUIRED BOOLEAN crossed;\n\
-                    REQUIRED INT64 oid;\n\
-                }",
-            )
-            .expect("invalid fill schema"),
-        );
+        let schema = fill_schema_for(ArchiveMode::Lite, ArchiveDecimalScales { px_scale: 8, sz_scale: 8 });
         let file = fs::File::create(&path).expect("create fill parquet");
         let mut writer =
             SerializedFileWriter::new(file, schema, std::sync::Arc::new(WriterProperties::builder().build()))
@@ -8063,7 +7819,6 @@ mod tests {
                 dir: String::new(),
                 fee_token: String::new(),
                 twap_id: None,
-                raw_event: String::new(),
             },
             FillOut {
                 block_number: 928200010,
@@ -8090,7 +7845,6 @@ mod tests {
                 dir: String::new(),
                 fee_token: String::new(),
                 twap_id: None,
-                raw_event: String::new(),
             },
         ];
         write_fill_rows(&mut writer, ArchiveMode::Lite, &rows).expect("write fill rows");
@@ -8141,7 +7895,6 @@ mod tests {
             dir: String::new(),
             fee_token: String::new(),
             twap_id: None,
-            raw_event: String::new(),
         }];
         write_fill_rows(&mut writer, ArchiveMode::Hft, &rows).expect("write fill rows");
         writer.close().expect("close fill writer");
@@ -8184,7 +7937,6 @@ mod tests {
                 tif: "Alo".to_string(),
                 reduce_only: Some(false),
                 lifetime: None,
-                raw_event: String::new(),
             },
             DiffOut {
                 block_number: 928200010,
@@ -8201,7 +7953,6 @@ mod tests {
                 tif: String::new(),
                 reduce_only: None,
                 lifetime: Some(281),
-                raw_event: String::new(),
             },
         ];
         write_diff_rows(&mut writer, ArchiveMode::Hft, &rows).expect("write diff rows");
@@ -8242,6 +7993,7 @@ mod tests {
     fn hft_remove_status_summary_uses_canceled_suffix_case_insensitively() {
         assert!(hft_status_is_canceled("reduceOnlyCanceled"));
         assert!(hft_status_is_canceled("scheduledcanceled"));
+        assert!(hft_status_is_canceled("scheduledCancel"));
         assert!(!hft_status_is_canceled("filled"));
         assert_eq!(classify_hft_remove_from_status_summary(None), ("cancel", None, true));
     }
@@ -8291,6 +8043,60 @@ mod tests {
         assert_eq!(recovered[1].sl_trigger_px, Some(7069900));
 
         fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn worker_threads_inherit_session_rotation_blocks() {
+        let _guard = test_lock();
+        let previous_base_dir = current_archive_base_dir();
+        let previous_handoff = current_archive_handoff_config();
+        let base_dir = unique_temp_dir("rotation_ctx");
+        set_archive_base_dir(Some(base_dir.clone()));
+        set_archive_handoff_config(ArchiveHandoffConfig::new(false, Some(base_dir.clone()), false, None));
+        set_rotation_blocks(500_000);
+
+        let enabled = Arc::new(AtomicBool::new(true));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let phase_state = Arc::new(Mutex::new(ArchivePhaseState::default()));
+        let recover_blocks_fill_on_stop = Arc::new(AtomicBool::new(false));
+        let options = ArchiveSessionOptions {
+            mode: ArchiveMode::Hft,
+            rotation_blocks: 250_000,
+            output_dir: base_dir.clone(),
+            symbols: vec!["BTC".to_string()],
+            symbol_decimals: HashMap::new(),
+            archive_height: None,
+            stop_height: None,
+            align_start_to_10k_boundary: true,
+            align_output_to_1000_boundary: true,
+            handoff: current_archive_handoff_config(),
+        };
+        let thread_context = ArchiveThreadContext::from_options(
+            &options,
+            base_dir.clone(),
+            enabled,
+            stop_requested,
+            phase_state,
+            recover_blocks_fill_on_stop,
+        );
+        set_archive_thread_context(Some(thread_context.clone()));
+
+        let inherited = archive_thread_context(|ctx| ctx.cloned());
+        let worker_rotation = std::thread::spawn(move || {
+            set_archive_thread_context(inherited);
+            let rotation = current_rotation_blocks();
+            set_archive_thread_context(None);
+            rotation
+        })
+        .join()
+        .expect("worker join");
+
+        set_archive_thread_context(None);
+        set_archive_handoff_config(previous_handoff);
+        set_archive_base_dir(Some(previous_base_dir));
+        fs::remove_dir_all(&base_dir).expect("cleanup temp dir");
+
+        assert_eq!(worker_rotation, 250_000);
     }
 
     #[test]

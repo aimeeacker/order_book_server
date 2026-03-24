@@ -10,6 +10,7 @@ use crate::{
     types::node_data::{NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
 };
 
+pub(crate) mod binary_protocol;
 pub(crate) mod inner;
 pub(crate) mod node_data;
 pub(crate) mod subscription;

@@ -16,7 +16,7 @@ use alloy::primitives::Address;
 use log::{error, info, warn};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io::{BufRead, BufReader},
+    io::BufReader,
     mem::size_of,
     os::unix::{io::AsRawFd, net::UnixStream},
     path::PathBuf,
@@ -528,10 +528,22 @@ const INITIAL_SNAPSHOT_PREFETCH_MS: u64 = 200;
 
 type AlignedTriple = (Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>, Batch<NodeDataFill>);
 
+/// Message containing aligned block data from UDS
+/// Now holds pre-parsed batches from binary protocol (no JSON re-parsing needed)
 struct AlignedMessage {
-    fills_line: String,
-    diffs_line: String,
-    order_line: String,
+    status_batch: Batch<NodeDataOrderStatus>,
+    diff_batch: Batch<NodeDataOrderDiff>,
+    fill_batch: Batch<NodeDataFill>,
+}
+
+impl AlignedMessage {
+    fn from_batches(
+        status_batch: Batch<NodeDataOrderStatus>,
+        diff_batch: Batch<NodeDataOrderDiff>,
+        fill_batch: Batch<NodeDataFill>,
+    ) -> Self {
+        Self { status_batch, diff_batch, fill_batch }
+    }
 }
 
 impl OrderBookListener {
@@ -683,39 +695,10 @@ impl OrderBookListener {
         }
         self.last_event_time = Some(Instant::now());
 
-        let order_statuses = match serde_json::from_str::<Batch<NodeDataOrderStatus>>(&message.order_line) {
-            Ok(batch) => batch,
-            Err(err) => {
-                warn!(
-                    "OrderStatuses serialization error {err}, height: {:?}, drop bad stream: {:?}",
-                    self.order_book_state.as_ref().map(OrderBookState::height),
-                    &message.order_line[..message.order_line.len().min(100)],
-                );
-                return Ok(());
-            }
-        };
-        let order_diffs = match serde_json::from_str::<Batch<NodeDataOrderDiff>>(&message.diffs_line) {
-            Ok(batch) => batch,
-            Err(err) => {
-                warn!(
-                    "OrderDiffs serialization error {err}, height: {:?}, drop bad stream: {:?}",
-                    self.order_book_state.as_ref().map(OrderBookState::height),
-                    &message.diffs_line[..message.diffs_line.len().min(100)],
-                );
-                return Ok(());
-            }
-        };
-        let fills = match serde_json::from_str::<Batch<NodeDataFill>>(&message.fills_line) {
-            Ok(batch) => batch,
-            Err(err) => {
-                warn!(
-                    "Fills serialization error {err}, height: {:?}, drop bad stream: {:?}",
-                    self.order_book_state.as_ref().map(OrderBookState::height),
-                    &message.fills_line[..message.fills_line.len().min(100)],
-                );
-                return Ok(());
-            }
-        };
+        // Batches are already parsed from binary protocol
+        let order_statuses = message.status_batch;
+        let order_diffs = message.diff_batch;
+        let fills = message.fill_batch;
 
         let height = order_statuses.block_number();
         if order_diffs.block_number() != height || fills.block_number() != height {
@@ -1270,67 +1253,6 @@ fn now_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_else(|_| Duration::from_secs(0)).as_millis() as u64
 }
 
-fn split_merged_array(payload: &[u8]) -> Option<[&[u8]; 3]> {
-    let mut idx = 0;
-    while idx < payload.len() && payload[idx].is_ascii_whitespace() {
-        idx += 1;
-    }
-    if idx >= payload.len() || payload[idx] != b'[' {
-        return None;
-    }
-    idx += 1;
-    let mut parts: Vec<&[u8]> = Vec::with_capacity(3);
-    while parts.len() < 3 {
-        while idx < payload.len() && (payload[idx].is_ascii_whitespace() || payload[idx] == b',') {
-            idx += 1;
-        }
-        if idx >= payload.len() || payload[idx] != b'{' {
-            return None;
-        }
-        let start = idx;
-        let mut depth = 0i32;
-        let mut in_str = false;
-        let mut escaped = false;
-        while idx < payload.len() {
-            let b = payload[idx];
-            if in_str {
-                if escaped {
-                    escaped = false;
-                } else if b == b'\\' {
-                    escaped = true;
-                } else if b == b'"' {
-                    in_str = false;
-                }
-                idx += 1;
-                continue;
-            }
-            match b {
-                b'"' => {
-                    in_str = true;
-                    idx += 1;
-                }
-                b'{' => {
-                    depth += 1;
-                    idx += 1;
-                }
-                b'}' => {
-                    depth -= 1;
-                    idx += 1;
-                    if depth == 0 {
-                        parts.push(&payload[start..idx]);
-                        break;
-                    }
-                }
-                _ => idx += 1,
-            }
-        }
-        if depth != 0 {
-            return None;
-        }
-    }
-    if parts.len() == 3 { Some([parts[0], parts[1], parts[2]]) } else { None }
-}
-
 #[allow(unsafe_code)]
 fn spawn_uds_reader(tx: MpscSender<AlignedMessage>, dropped_updates: Arc<AtomicBool>, warmup_deadline: Arc<AtomicU64>) {
     thread::spawn(move || {
@@ -1360,30 +1282,40 @@ fn spawn_uds_reader(tx: MpscSender<AlignedMessage>, dropped_updates: Arc<AtomicB
                 libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, buf_ptr, buf_len);
             }
 
-            info!("Connected to merged stream at {UDS_PATH}");
+            info!("Connected to merged stream at {UDS_PATH} (binary protocol)");
 
             let mut reader = BufReader::new(stream);
-            let mut line_buffer = Vec::new();
 
-            // 3. Reader Loop
+            // 3. Reader Loop - Binary framed protocol (length-prefix + msgpack)
             loop {
                 // Check warmup deadline
                 let is_warmup = now_millis() < warmup_deadline.load(AtomicOrdering::SeqCst);
 
-                line_buffer.clear();
-                match reader.read_until(b'\n', &mut line_buffer) {
-                    Ok(0) => {
+                // Read 4-byte length prefix
+                let mut len_buf = [0u8; 4];
+                if let Err(e) = std::io::Read::read_exact(&mut reader, &mut len_buf) {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
                         warn!("UDS connection closed (EOF); reconnecting");
-                        break;
+                    } else {
+                        error!("UDS read length error: {e}");
                     }
-                    Ok(_) => {
-                        process_message(&line_buffer, &tx, &dropped_updates, is_warmup);
-                    }
-                    Err(e) => {
-                        error!("UDS read error: {e}");
-                        break;
-                    }
+                    break;
                 }
+
+                let msg_len = u32::from_le_bytes(len_buf) as usize;
+                if msg_len == 0 || msg_len > 64 * 1024 * 1024 {
+                    warn!("Invalid message length: {msg_len}; reconnecting");
+                    break;
+                }
+
+                // Read message body
+                let mut msg_buf = vec![0u8; msg_len];
+                if let Err(e) = std::io::Read::read_exact(&mut reader, &mut msg_buf) {
+                    error!("UDS read body error: {e}");
+                    break;
+                }
+
+                process_binary_message(&msg_buf, &tx, &dropped_updates, is_warmup);
             }
 
             thread::sleep(Duration::from_secs(1));
@@ -1391,36 +1323,35 @@ fn spawn_uds_reader(tx: MpscSender<AlignedMessage>, dropped_updates: Arc<AtomicB
     });
 }
 
-fn process_message(buffer: &[u8], tx: &MpscSender<AlignedMessage>, dropped_updates: &Arc<AtomicBool>, is_warmup: bool) {
-    // Remove trailing newline if present for parsing
-    let payload = if buffer.ends_with(&[b'\n']) { &buffer[..buffer.len() - 1] } else { buffer };
+fn process_binary_message(
+    payload: &[u8],
+    tx: &MpscSender<AlignedMessage>,
+    dropped_updates: &Arc<AtomicBool>,
+    is_warmup: bool,
+) {
+    use crate::types::binary_protocol::AlignedBlockPayload;
 
-    if payload.is_empty() {
-        return;
-    }
-
-    let Some(parts) = split_merged_array(payload) else {
-        // Log only if it's not a trivial empty line or something, acts as filter
-        if payload.len() > 10 {
-            warn!("Failed to split merged payload (len={})", payload.len());
+    // Decode MessagePack payload
+    let block = match AlignedBlockPayload::decode(payload) {
+        Ok(block) => block,
+        Err(err) => {
+            warn!("Failed to decode binary payload (len={}): {err}", payload.len());
+            return;
         }
-        return;
     };
 
-    let message = AlignedMessage {
-        fills_line: String::from_utf8_lossy(parts[0]).to_string(),
-        diffs_line: String::from_utf8_lossy(parts[1]).to_string(),
-        order_line: String::from_utf8_lossy(parts[2]).to_string(),
+    // Convert to batches and create AlignedMessage
+    let message = match block.into_batches() {
+        Ok((status_batch, diff_batch, fill_batch)) => {
+            AlignedMessage::from_batches(status_batch, diff_batch, fill_batch)
+        }
+        Err(err) => {
+            warn!("Failed to convert binary payload to batches: {err}");
+            return;
+        }
     };
 
     if !is_warmup {
-        // Optimization: check drop flag loosely before trying (already present in original logic)
-        if dropped_updates.load(AtomicOrdering::SeqCst) {
-            // In original logic, once dropped, it seemed to persist?
-            // Or maybe it was just a transient aligned batch drop.
-            // We'll mimic sending attempt which can update the flag.
-        }
-
         if let Err(err) = tx.try_send(message) {
             if !dropped_updates.swap(true, AtomicOrdering::SeqCst) {
                 warn!("UDS queue full; dropping aligned batch: {err}");

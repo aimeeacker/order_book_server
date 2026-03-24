@@ -186,7 +186,7 @@ impl SubscriptionManager {
 
 #[cfg(test)]
 mod test {
-    use crate::types::subscription::Subscription;
+    use crate::types::subscription::{SubscribePayload, Subscription};
 
     use super::{ClientMessage, ServerResponse};
 

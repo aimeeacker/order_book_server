@@ -12,8 +12,6 @@ use std::time::Duration;
 
 use log::{info, warn};
 use memchr::{memchr, memmem};
-use serde_json::Value;
-use simd_json::serde::from_slice as simd_from_slice;
 
 use crate::archive::{
     ArchiveBlock, RejectArchiveBlock, dispatch_archive_block, dispatch_reject_archive_block, has_archive_sessions,
@@ -29,6 +27,7 @@ pub use crate::archive::{
     stop_all_reject_archive_sessions as stop_all_reject_archive_sessions_api, stop_archive_session,
     stop_reject_archive_session,
 };
+use crate::protocol::{ParsedOrderBatch, RejectOrderEvent, parse_diffs_json, parse_fills_json, parse_order_json};
 
 const FIFO_BASE_DIR: &str = "/home/aimee/hl_runtime/hl_book/runtime_fifo";
 const ORDER_PIPE_CAPACITY: i32 = 16 * 1024 * 1024;
@@ -48,6 +47,11 @@ pub type HeightCallback = Arc<dyn Fn(u64) + Send + Sync + 'static>;
 
 fn is_checkpoint_probe_height(height: u64) -> bool {
     height % CHECKPOINT_DEBUG_BLOCKS == 1
+}
+
+fn split_rejects_from_order_batch(mut batch: ParsedOrderBatch) -> (ParsedOrderBatch, Option<Vec<RejectOrderEvent>>) {
+    let rejects = (!batch.rejects.is_empty()).then(|| std::mem::take(&mut batch.rejects));
+    (batch, rejects)
 }
 
 fn rollback_buffer_span(rollback_buffer: &VecDeque<StreamLine>) -> (usize, Option<u64>, Option<u64>) {
@@ -154,6 +158,7 @@ struct StreamLine {
     source: FifoSource,
     block_number: u64,
     line: Vec<u8>,
+    parsed_order: Option<ParsedOrderBatch>,
 }
 
 struct StreamQueues {
@@ -629,39 +634,6 @@ fn flush_rollback_buffer(
     true
 }
 
-fn split_reject_order_line(line: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
-    let mut owned = line.to_vec();
-    let value: Value = simd_from_slice(&mut owned).map_err(|err| err.to_string())?;
-    let Value::Object(mut object) = value else {
-        return Err("order line is not a json object".to_string());
-    };
-    let Some(Value::Array(events)) = object.remove("events") else {
-        return Err("order line missing events array".to_string());
-    };
-
-    let mut live_events = Vec::with_capacity(events.len());
-    let mut reject_events = Vec::new();
-    for event in events {
-        let is_reject = event.get("status").and_then(Value::as_str).is_some_and(|status| status.ends_with("Rejected"));
-        if is_reject {
-            reject_events.push(event);
-        } else {
-            live_events.push(event);
-        }
-    }
-
-    if reject_events.is_empty() {
-        return Ok((line.to_vec(), None));
-    }
-
-    let mut live_object = object.clone();
-    live_object.insert("events".to_string(), Value::Array(live_events));
-    object.insert("events".to_string(), Value::Array(reject_events));
-    let live_line = serde_json::to_vec(&Value::Object(live_object)).map_err(|err| err.to_string())?;
-    let reject_line = serde_json::to_vec(&Value::Object(object)).map_err(|err| err.to_string())?;
-    Ok((live_line, Some(reject_line)))
-}
-
 fn run_order_splitter_inner(
     rx: Receiver<StreamLine>,
     tx: SyncSender<StreamLine>,
@@ -675,24 +647,34 @@ fn run_order_splitter_inner(
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(msg) => {
                 let shutdown = stop.load(Ordering::SeqCst);
-                let (live_line, reject_line) = match split_reject_order_line(&msg.line) {
-                    Ok(lines) => lines,
+                let (parsed_order, reject_line) = match parse_order_json(&msg.line) {
+                    Ok(batch) => {
+                        let (batch, rejects) = split_rejects_from_order_batch(batch);
+                        (Some(batch), rejects)
+                    }
                     Err(err) => {
                         warn!(
                             "Order splitter failed to parse block {}: {}; forwarding raw line",
                             msg.block_number, err
                         );
-                        (msg.line.clone(), None)
+                        (None, None)
                     }
                 };
-                if tx.send(StreamLine { source: msg.source, block_number: msg.block_number, line: live_line }).is_err()
+                if tx
+                    .send(StreamLine {
+                        source: msg.source,
+                        block_number: msg.block_number,
+                        line: msg.line,
+                        parsed_order,
+                    })
+                    .is_err()
                 {
                     warn!("Aggregator dropped; exiting order splitter");
                     return;
                 }
-                if let Some(reject_line) = reject_line.filter(|_| has_reject_archive_sessions()) {
+                if let Some(reject_events) = reject_line.filter(|_| has_reject_archive_sessions()) {
                     if let Some(reject_tx) = &reject_tx {
-                        let block = RejectArchiveBlock::new(msg.block_number, reject_line);
+                        let block = RejectArchiveBlock::new(msg.block_number, Arc::new(reject_events));
                         if shutdown {
                             if reject_tx.send(block).is_err() {
                                 warn!("Reject dispatch thread dropped; continuing without reject archive");
@@ -887,7 +869,12 @@ fn listen_fifo(
                                         rollback_buffer.len()
                                     );
                                 }
-                                rollback_buffer.push_back(StreamLine { source, block_number: height, line });
+                                rollback_buffer.push_back(StreamLine {
+                                    source,
+                                    block_number: height,
+                                    line,
+                                    parsed_order: None,
+                                });
                                 continue;
                             }
                             let (count, first_height, last_height_in_buffer) = rollback_buffer_span(&rollback_buffer);
@@ -920,7 +907,12 @@ fn listen_fifo(
                                     rollback_buffer.pop_front();
                                 }
                             }
-                            rollback_buffer.push_back(StreamLine { source, block_number: height, line });
+                            rollback_buffer.push_back(StreamLine {
+                                source,
+                                block_number: height,
+                                line,
+                                parsed_order: None,
+                            });
                             if let Some(generation) = rollback.record_rollback(source) {
                                 if generation != rollback_generation {
                                     let (count, first_height, last_height_in_buffer) =
@@ -946,7 +938,7 @@ fn listen_fifo(
                         }
                         last_height = Some(height);
                         rollback.clear_rollback(source);
-                        let msg = StreamLine { source, block_number: height, line };
+                        let msg = StreamLine { source, block_number: height, line, parsed_order: None };
                         if tx.send(msg).is_err() {
                             warn!("Aggregator dropped; exiting {source:?} listener");
                             return;
@@ -1046,21 +1038,50 @@ fn run_aggregator(rx: Receiver<StreamLine>, stop: Arc<AtomicBool>, callback: Opt
             let height = order.block_number;
             let fills_line = fills.line;
             let diffs_line = diffs.line;
-            let order_line = order.line;
+            let parsed_order = match order.parsed_order {
+                Some(parsed_order) => parsed_order,
+                None => match parse_order_json(&order.line) {
+                    Ok(parsed_order) => split_rejects_from_order_batch(parsed_order).0,
+                    Err(err) => {
+                        warn!("Failed to parse order block {} JSON: {err}; skipping UDS/archive dispatch", height);
+                        continue;
+                    }
+                },
+            };
+            let parsed_fills = match parse_fills_json(&fills_line) {
+                Ok(parsed_fills) => parsed_fills,
+                Err(err) => {
+                    warn!("Failed to parse fills block {} JSON: {err}; skipping UDS/archive dispatch", height);
+                    continue;
+                }
+            };
+            let parsed_diffs = match parse_diffs_json(&diffs_line) {
+                Ok(parsed_diffs) => parsed_diffs,
+                Err(err) => {
+                    warn!("Failed to parse diffs block {} JSON: {err}; skipping UDS/archive dispatch", height);
+                    continue;
+                }
+            };
+            let parsed_block = match crate::protocol::ParsedBlock::from_parts(parsed_order, parsed_diffs, parsed_fills)
+            {
+                Ok(parsed_block) => Arc::new(parsed_block),
+                Err(err) => {
+                    warn!("Failed to combine aligned block {}: {err}; skipping UDS/archive dispatch", height);
+                    continue;
+                }
+            };
 
-            let mut merged = Vec::with_capacity(fills_line.len() + diffs_line.len() + order_line.len() + 3);
-            merged.push(b'[');
-            merged.extend_from_slice(&fills_line);
-            merged.push(b',');
-            merged.extend_from_slice(&diffs_line);
-            merged.push(b',');
-            merged.extend_from_slice(&order_line);
-            merged.push(b']');
-            merged.push(b'\n'); // Newline delimiter for stream mode
-
-            if let Some(server) = uds.as_mut() {
-                server.try_accept();
-                server.send(&merged);
+            let payload = parsed_block.to_aligned_payload();
+            match payload.encode() {
+                Ok(binary_payload) => {
+                    if let Some(server) = uds.as_mut() {
+                        server.try_accept();
+                        server.send(&binary_payload);
+                    }
+                }
+                Err(err) => {
+                    warn!("Failed to encode block {} to MessagePack: {err}", height);
+                }
             }
 
             // Preserve pre-archive callback timing: notify Python immediately after the merged block
@@ -1072,10 +1093,7 @@ fn run_aggregator(rx: Receiver<StreamLine>, stop: Arc<AtomicBool>, callback: Opt
             }
 
             if has_archive_sessions() {
-                dispatch_archive_block(
-                    ArchiveBlock::new(height, fills_line, diffs_line, order_line),
-                    stop.load(Ordering::SeqCst),
-                );
+                dispatch_archive_block(ArchiveBlock::new(height, parsed_block), stop.load(Ordering::SeqCst));
             }
 
             if height % 2000 == 0 {
@@ -1192,7 +1210,8 @@ pub fn start_listener(callback: Option<HeightCallback>) -> std::io::Result<Liste
 
 #[cfg(test)]
 mod tests {
-    use super::parse_block_number;
+    use super::{parse_block_number, split_rejects_from_order_batch};
+    use crate::protocol::{ParsedOrderBatch, RejectOrderEvent, Side};
 
     #[test]
     fn parse_block_number_accepts_complete_json_object() {
@@ -1216,5 +1235,41 @@ mod tests {
     fn parse_block_number_rejects_missing_block_number() {
         let line = br#"{ "data": [] }"#;
         assert_eq!(parse_block_number(line), Err("missing block_number"));
+    }
+
+    #[test]
+    fn split_rejects_from_order_batch_removes_rejects_from_main_payload() {
+        let batch = ParsedOrderBatch {
+            block_number: 123,
+            block_time: "2026-03-24T11:57:23.000Z".to_string(),
+            local_time: "2026-03-24T11:57:23.001Z".to_string(),
+            statuses: Vec::new(),
+            rejects: vec![RejectOrderEvent {
+                block_number: 123,
+                block_time: "2026-03-24T11:57:23.000Z".to_string(),
+                time: "2026-03-24T11:57:23.000Z".to_string(),
+                user: "0x1".to_string(),
+                status: "TickRejected".to_string(),
+                coin: "BTC".to_string(),
+                side: Side::Bid,
+                limit_px: "100000".to_string(),
+                sz: "1".to_string(),
+                oid: 1,
+                timestamp: 1,
+                trigger_condition: "N/A".to_string(),
+                is_trigger: false,
+                trigger_px: "0".to_string(),
+                is_position_tpsl: false,
+                reduce_only: false,
+                order_type: "Limit".to_string(),
+                orig_sz: "1".to_string(),
+                tif: Some("Gtc".to_string()),
+                cloid: None,
+            }],
+        };
+
+        let (batch, rejects) = split_rejects_from_order_batch(batch);
+        assert!(batch.rejects.is_empty());
+        assert_eq!(rejects.expect("missing rejects").len(), 1);
     }
 }

@@ -79,7 +79,7 @@ impl<O: Send + Sync + InnerOrder> OrderBooks<O> {
 #[cfg(test)]
 pub(crate) fn load_snapshots_from_str<O, R>(str: &str) -> Result<(u64, Snapshots<O>)>
 where
-    O: TryFrom<R, Error = Error>,
+    O: TryFrom<R, Error = Error> + Clone,
     R: Serialize + for<'a> Deserialize<'a> + Send,
 {
     #[allow(clippy::type_complexity)]

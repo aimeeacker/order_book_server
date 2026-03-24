@@ -3,6 +3,7 @@
 
 mod archive;
 mod listener;
+pub mod protocol;
 
 pub use archive::ArchiveDecimalScales;
 pub use listener::{
