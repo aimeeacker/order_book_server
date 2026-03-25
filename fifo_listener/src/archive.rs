@@ -1281,10 +1281,7 @@ struct DiffOut {
     px: i64,
     orig_sz: i64,
     event: String,
-    status: Option<String>,
-    limit_px: Option<i64>,
-    _sz: Option<i64>,
-    _orig_sz: Option<i64>,
+    raw_sz: Option<i64>,
     is_trigger: Option<bool>,
     tif: String,
     reduce_only: Option<bool>,
@@ -1294,6 +1291,7 @@ struct DiffOut {
     is_position_tpsl: Option<bool>,
     tp_trigger_px: Option<i64>,
     sl_trigger_px: Option<i64>,
+    status: Option<String>,
     lifetime: Option<i32>,
 }
 
@@ -1537,10 +1535,7 @@ fn encode_hft_lifetime(lag_ms: i64) -> Option<i32> {
 }
 
 fn apply_hft_status_to_diff_row(row: &mut DiffOut, status: &HftStatusArchiveRow) {
-    row.status = Some(status.status.clone());
-    row.limit_px = Some(status.limit_px);
-    row._sz = Some(status.sz);
-    row._orig_sz = Some(status.orig_sz);
+    row.raw_sz = (status.orig_sz != row.sz).then_some(status.orig_sz);
     row.is_trigger = Some(status.is_trigger);
     row.tif = status.tif.clone();
     row.reduce_only = Some(status.reduce_only);
@@ -1550,6 +1545,7 @@ fn apply_hft_status_to_diff_row(row: &mut DiffOut, status: &HftStatusArchiveRow)
     row.is_position_tpsl = Some(status.is_position_tpsl);
     row.tp_trigger_px = status.tp_trigger_px;
     row.sl_trigger_px = status.sl_trigger_px;
+    row.status = Some(status.status.clone());
 }
 
 fn resolve_hft_new_candidate_indices(
@@ -3729,13 +3725,10 @@ fn diff_schema_for(mode: ArchiveMode, scales: ArchiveDecimalScales) -> std::sync
                 REQUIRED BINARY side (UTF8);
                 REQUIRED INT64 px (DECIMAL(18, {p}));
                 REQUIRED BINARY diff_type (UTF8);
+                REQUIRED BINARY event (UTF8);
                 REQUIRED INT64 sz (DECIMAL(18, {s}));
                 REQUIRED INT64 orig_sz (DECIMAL(18, {s}));
-                REQUIRED BINARY event (UTF8);
-                OPTIONAL BINARY status (UTF8);
-                OPTIONAL INT64 limit_px (DECIMAL(18, {p}));
-                OPTIONAL INT64 _sz (DECIMAL(18, {s}));
-                OPTIONAL INT64 _orig_sz (DECIMAL(18, {s}));
+                OPTIONAL INT64 raw_sz (DECIMAL(18, {s}));
                 OPTIONAL BOOLEAN is_trigger;
                 OPTIONAL BINARY tif (UTF8);
                 OPTIONAL BOOLEAN reduce_only;
@@ -3745,6 +3738,7 @@ fn diff_schema_for(mode: ArchiveMode, scales: ArchiveDecimalScales) -> std::sync
                 OPTIONAL BOOLEAN is_position_tpsl;
                 OPTIONAL INT64 tp_trigger_px (DECIMAL(18, {p}));
                 OPTIONAL INT64 sl_trigger_px (DECIMAL(18, {p}));
+                OPTIONAL BINARY status (UTF8);
                 OPTIONAL INT32 lifetime;
             }}"
         ),
@@ -4693,10 +4687,7 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
             px: 0,
             orig_sz: 0,
             event: String::new(),
-            status: None,
-            limit_px: None,
-            _sz: None,
-            _orig_sz: None,
+            raw_sz: None,
             is_trigger: None,
             tif: String::new(),
             reduce_only: None,
@@ -4706,6 +4697,7 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
             is_position_tpsl: None,
             tp_trigger_px: None,
             sl_trigger_px: None,
+            status: None,
             lifetime: None,
         };
         match mode {
@@ -4718,7 +4710,7 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.orig_sz = decimal_to_i64(row.get_decimal(8).map_err(io_to_parquet_error)?)?;
             }
             ArchiveMode::Hft => {
-                if column_count != 25 {
+                if column_count != 23 {
                     return Err(io_to_parquet_error(io_other(format!(
                         "obsolete HFT diff local recovery schema with {column_count} columns is unsupported"
                     ))));
@@ -4728,23 +4720,21 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.side = row.get_string(5).map_err(io_to_parquet_error)?.clone();
                 out.px = decimal_to_i64(row.get_decimal(6).map_err(io_to_parquet_error)?)?;
                 out.diff_type = row.get_string(7).map_err(io_to_parquet_error)?.clone();
-                out.sz = decimal_to_i64(row.get_decimal(8).map_err(io_to_parquet_error)?)?;
-                out.orig_sz = decimal_to_i64(row.get_decimal(9).map_err(io_to_parquet_error)?)?;
-                out.event = row.get_string(10).map_err(io_to_parquet_error)?.clone();
-                out.status = read_row_optional_utf8(&row, 11)?;
-                out.limit_px = read_row_optional_decimal_i64(&row, 12)?;
-                out._sz = read_row_optional_decimal_i64(&row, 13)?;
-                out._orig_sz = read_row_optional_decimal_i64(&row, 14)?;
-                out.is_trigger = read_row_optional_bool(&row, 15)?;
-                out.tif = read_row_optional_utf8(&row, 16)?.unwrap_or_default();
-                out.reduce_only = read_row_optional_bool(&row, 17)?;
-                out.order_type = read_row_optional_utf8(&row, 18)?;
-                out.trigger_condition = read_row_optional_utf8(&row, 19)?;
-                out.trigger_px = read_row_optional_decimal_i64(&row, 20)?;
-                out.is_position_tpsl = read_row_optional_bool(&row, 21)?;
-                out.tp_trigger_px = read_row_optional_decimal_i64(&row, 22)?;
-                out.sl_trigger_px = read_row_optional_decimal_i64(&row, 23)?;
-                out.lifetime = read_row_optional_i32(&row, 24)?;
+                out.event = row.get_string(8).map_err(io_to_parquet_error)?.clone();
+                out.sz = decimal_to_i64(row.get_decimal(9).map_err(io_to_parquet_error)?)?;
+                out.orig_sz = decimal_to_i64(row.get_decimal(10).map_err(io_to_parquet_error)?)?;
+                out.raw_sz = read_row_optional_decimal_i64(&row, 11)?;
+                out.is_trigger = read_row_optional_bool(&row, 12)?;
+                out.tif = read_row_optional_utf8(&row, 13)?.unwrap_or_default();
+                out.reduce_only = read_row_optional_bool(&row, 14)?;
+                out.order_type = read_row_optional_utf8(&row, 15)?;
+                out.trigger_condition = read_row_optional_utf8(&row, 16)?;
+                out.trigger_px = read_row_optional_decimal_i64(&row, 17)?;
+                out.is_position_tpsl = read_row_optional_bool(&row, 18)?;
+                out.tp_trigger_px = read_row_optional_decimal_i64(&row, 19)?;
+                out.sl_trigger_px = read_row_optional_decimal_i64(&row, 20)?;
+                out.status = read_row_optional_utf8(&row, 21)?;
+                out.lifetime = read_row_optional_i32(&row, 22)?;
             }
             ArchiveMode::Full => {
                 out.user = row.get_string(3).map_err(io_to_parquet_error)?.clone();
@@ -6384,15 +6374,8 @@ fn write_diff_rows(
     } else if mode == ArchiveMode::Hft {
         let users: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.user.as_bytes())).collect();
         let events: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.event.as_bytes())).collect();
-        let statuses: Vec<Option<ByteArray>> =
-            rows.iter().map(|r| r.status.as_ref().map(|value| ByteArray::from(value.as_bytes()))).collect();
-        let (status_values, status_def_levels) = parse_optional_byte_array_column(&statuses);
-        let limit_pxs: Vec<Option<i64>> = rows.iter().map(|r| r.limit_px).collect();
-        let (limit_px_values, limit_px_def_levels) = parse_optional_i64_column(&limit_pxs);
-        let status_szs: Vec<Option<i64>> = rows.iter().map(|r| r._sz).collect();
-        let (status_sz_values, status_sz_def_levels) = parse_optional_i64_column(&status_szs);
-        let status_orig_szs: Vec<Option<i64>> = rows.iter().map(|r| r._orig_sz).collect();
-        let (status_orig_sz_values, status_orig_sz_def_levels) = parse_optional_i64_column(&status_orig_szs);
+        let sparse_raw_szs: Vec<Option<i64>> = rows.iter().map(|r| r.raw_sz.filter(|raw_sz| *raw_sz != r.sz)).collect();
+        let (raw_sz_values, raw_sz_def_levels) = parse_optional_i64_column(&sparse_raw_szs);
         let is_triggers: Vec<Option<bool>> = rows.iter().map(|r| r.is_trigger).collect();
         let (is_trigger_values, is_trigger_def_levels) = parse_optional_bool_column(&is_triggers);
         let tifs: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.tif.as_bytes())).collect();
@@ -6414,6 +6397,9 @@ fn write_diff_rows(
         let (tp_trigger_px_values, tp_trigger_px_def_levels) = parse_optional_i64_column(&tp_trigger_pxs);
         let sl_trigger_pxs: Vec<Option<i64>> = rows.iter().map(|r| r.sl_trigger_px).collect();
         let (sl_trigger_px_values, sl_trigger_px_def_levels) = parse_optional_i64_column(&sl_trigger_pxs);
+        let statuses: Vec<Option<ByteArray>> =
+            rows.iter().map(|r| r.status.as_ref().map(|value| ByteArray::from(value.as_bytes()))).collect();
+        let (status_values, status_def_levels) = parse_optional_byte_array_column(&statuses);
         let lifetimes: Vec<Option<i32>> = rows.iter().map(|r| r.lifetime).collect();
         let (lifetime_values, lifetime_def_levels) = parse_optional_i32_column(&lifetimes);
 
@@ -6466,6 +6452,12 @@ fn write_diff_rows(
             col.close()?;
         }
         if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&events, None, None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&sizes, None, None)?;
             }
@@ -6478,32 +6470,8 @@ fn write_diff_rows(
             col.close()?;
         }
         if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&events, None, None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&status_values, Some(&status_def_levels), None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&limit_px_values, Some(&limit_px_def_levels), None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&status_sz_values, Some(&status_sz_def_levels), None)?;
-            }
-            col.close()?;
-        }
-        if let Some(mut col) = row_group.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&status_orig_sz_values, Some(&status_orig_sz_def_levels), None)?;
+                typed.write_batch(&raw_sz_values, Some(&raw_sz_def_levels), None)?;
             }
             col.close()?;
         }
@@ -6558,6 +6526,12 @@ fn write_diff_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&sl_trigger_px_values, Some(&sl_trigger_px_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&status_values, Some(&status_def_levels), None)?;
             }
             col.close()?;
         }
@@ -7664,10 +7638,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 px: d_px,
                 orig_sz: d_orig,
                 event: String::new(),
-                status: None,
-                limit_px: None,
-                _sz: None,
-                _orig_sz: None,
+                raw_sz: None,
                 is_trigger: None,
                 tif: String::new(),
                 reduce_only: None,
@@ -7677,6 +7648,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 is_position_tpsl: None,
                 tp_trigger_px: None,
                 sl_trigger_px: None,
+                status: None,
                 lifetime: None,
             };
             diff_rows.entry(coin).or_default().push(out);
@@ -8312,10 +8284,7 @@ mod tests {
                 px: 7071200,
                 orig_sz: 0,
                 event: "add".to_string(),
-                status: Some("open".to_string()),
-                limit_px: Some(7071200),
-                _sz: Some(12345),
-                _orig_sz: Some(12345),
+                raw_sz: Some(12345),
                 is_trigger: Some(false),
                 tif: "Alo".to_string(),
                 reduce_only: Some(false),
@@ -8325,6 +8294,7 @@ mod tests {
                 is_position_tpsl: Some(false),
                 tp_trigger_px: Some(7075000),
                 sl_trigger_px: None,
+                status: Some("open".to_string()),
                 lifetime: None,
             },
             DiffOut {
@@ -8339,10 +8309,7 @@ mod tests {
                 px: 7071500,
                 orig_sz: 12000,
                 event: "fill".to_string(),
-                status: None,
-                limit_px: None,
-                _sz: None,
-                _orig_sz: None,
+                raw_sz: None,
                 is_trigger: None,
                 tif: String::new(),
                 reduce_only: None,
@@ -8352,6 +8319,7 @@ mod tests {
                 is_position_tpsl: None,
                 tp_trigger_px: None,
                 sl_trigger_px: None,
+                status: None,
                 lifetime: Some(281),
             },
         ];
@@ -8362,10 +8330,7 @@ mod tests {
         assert_eq!(recovered.len(), 2);
         assert_eq!(recovered[0].oid, 33);
         assert_eq!(recovered[0].event, "add");
-        assert_eq!(recovered[0].status.as_deref(), Some("open"));
-        assert_eq!(recovered[0].limit_px, Some(7071200));
-        assert_eq!(recovered[0]._sz, Some(12345));
-        assert_eq!(recovered[0]._orig_sz, Some(12345));
+        assert_eq!(recovered[0].raw_sz, None);
         assert_eq!(recovered[0].is_trigger, Some(false));
         assert_eq!(recovered[0].tif, "Alo");
         assert_eq!(recovered[0].reduce_only, Some(false));
@@ -8375,6 +8340,7 @@ mod tests {
         assert_eq!(recovered[0].is_position_tpsl, Some(false));
         assert_eq!(recovered[0].tp_trigger_px, Some(7075000));
         assert_eq!(recovered[0].sl_trigger_px, None);
+        assert_eq!(recovered[0].status.as_deref(), Some("open"));
         assert_eq!(recovered[0].lifetime, None);
         assert_eq!(recovered[1].oid, 77);
         assert_eq!(recovered[1].event, "fill");
@@ -8471,10 +8437,7 @@ mod tests {
                     sz: 12345,
                     orig_sz: 0,
                     event: "add".to_string(),
-                    status: None,
-                    limit_px: None,
-                    _sz: None,
-                    _orig_sz: None,
+                    raw_sz: None,
                     is_trigger: None,
                     tif: String::new(),
                     reduce_only: None,
@@ -8484,6 +8447,7 @@ mod tests {
                     is_position_tpsl: None,
                     tp_trigger_px: None,
                     sl_trigger_px: None,
+                    status: None,
                     lifetime: None,
                 },
                 DiffOut {
@@ -8498,10 +8462,7 @@ mod tests {
                     sz: 0,
                     orig_sz: 12345,
                     event: "cancel".to_string(),
-                    status: None,
-                    limit_px: None,
-                    _sz: None,
-                    _orig_sz: None,
+                    raw_sz: None,
                     is_trigger: None,
                     tif: String::new(),
                     reduce_only: None,
@@ -8511,6 +8472,7 @@ mod tests {
                     is_position_tpsl: None,
                     tp_trigger_px: None,
                     sl_trigger_px: None,
+                    status: None,
                     lifetime: None,
                 },
             ],
@@ -8521,13 +8483,11 @@ mod tests {
         assert!(residual.is_empty());
         assert!(warnings.is_empty());
         let rows = diff_rows.get("BTC").expect("btc rows");
-        assert_eq!(rows[0].status.as_deref(), Some("open"));
-        assert_eq!(rows[0].limit_px, Some(7071200));
-        assert_eq!(rows[0]._sz, Some(12345));
-        assert_eq!(rows[0]._orig_sz, Some(12345));
+        assert_eq!(rows[0].raw_sz, None);
         assert_eq!(rows[0].tif, "Alo");
+        assert_eq!(rows[0].status.as_deref(), Some("open"));
         assert_eq!(rows[1].status.as_deref(), Some("canceled"));
-        assert_eq!(rows[1]._orig_sz, Some(12345));
+        assert_eq!(rows[1].raw_sz, Some(12345));
     }
 
     #[test]
@@ -8590,10 +8550,7 @@ mod tests {
                 sz: 100,
                 orig_sz: 0,
                 event: "add".to_string(),
-                status: None,
-                limit_px: None,
-                _sz: None,
-                _orig_sz: None,
+                raw_sz: None,
                 is_trigger: None,
                 tif: String::new(),
                 reduce_only: None,
@@ -8603,6 +8560,7 @@ mod tests {
                 is_position_tpsl: None,
                 tp_trigger_px: None,
                 sl_trigger_px: None,
+                status: None,
                 lifetime: None,
             }],
         )]);
@@ -8613,7 +8571,6 @@ mod tests {
         assert!(residual.is_empty());
         let row = &diff_rows.get("BTC").expect("btc rows")[0];
         assert_eq!(row.status.as_deref(), Some("open"));
-        assert_eq!(row.limit_px, Some(7071200));
         assert_eq!(row.tif, "Alo");
     }
 
@@ -8677,10 +8634,7 @@ mod tests {
                 sz: 100,
                 orig_sz: 0,
                 event: "add".to_string(),
-                status: None,
-                limit_px: None,
-                _sz: None,
-                _orig_sz: None,
+                raw_sz: None,
                 is_trigger: None,
                 tif: String::new(),
                 reduce_only: None,
@@ -8690,6 +8644,7 @@ mod tests {
                 is_position_tpsl: None,
                 tp_trigger_px: None,
                 sl_trigger_px: None,
+                status: None,
                 lifetime: None,
             }],
         )]);
@@ -8702,7 +8657,6 @@ mod tests {
         assert_eq!(warnings[0].statuses, vec!["open".to_string(), "open".to_string()]);
         let row = &diff_rows.get("BTC").expect("btc rows")[0];
         assert_eq!(row.status, None);
-        assert_eq!(row.limit_px, None);
         assert_eq!(row.tif, "");
     }
 
