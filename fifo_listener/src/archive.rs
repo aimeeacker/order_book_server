@@ -1281,8 +1281,19 @@ struct DiffOut {
     px: i64,
     orig_sz: i64,
     event: String,
+    status: Option<String>,
+    limit_px: Option<i64>,
+    _sz: Option<i64>,
+    _orig_sz: Option<i64>,
+    is_trigger: Option<bool>,
     tif: String,
     reduce_only: Option<bool>,
+    order_type: Option<String>,
+    trigger_condition: Option<String>,
+    trigger_px: Option<i64>,
+    is_position_tpsl: Option<bool>,
+    tp_trigger_px: Option<i64>,
+    sl_trigger_px: Option<i64>,
     lifetime: Option<i32>,
 }
 
@@ -1312,6 +1323,39 @@ struct HftStatusRecoveryRow {
     order_type: String,
     tp_trigger_px: Option<i64>,
     sl_trigger_px: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct HftStatusArchiveRow {
+    block_number: u64,
+    block_time: String,
+    coin: String,
+    user: String,
+    oid: u64,
+    status: String,
+    side: String,
+    limit_px: i64,
+    sz: i64,
+    orig_sz: i64,
+    is_trigger: bool,
+    tif: String,
+    trigger_condition: String,
+    trigger_px: i64,
+    is_position_tpsl: bool,
+    reduce_only: bool,
+    order_type: String,
+    tp_trigger_px: Option<i64>,
+    sl_trigger_px: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HftStatusMigrationWarning {
+    block_number: u64,
+    coin: String,
+    user: String,
+    oid: u64,
+    diff_type: String,
+    statuses: Vec<String>,
 }
 
 impl HasBlockNumber for HftStatusRecoveryRow {
@@ -1464,10 +1508,6 @@ fn aggregate_hft_trades(rows: Vec<FillOut>) -> Vec<FillOut> {
     trades
 }
 
-fn hft_status_keeps_order_live(status: &str) -> bool {
-    status == "open" || status == "triggered"
-}
-
 fn hft_status_is_filled(status: &str) -> bool {
     status.eq_ignore_ascii_case("filled")
 }
@@ -1475,6 +1515,14 @@ fn hft_status_is_filled(status: &str) -> bool {
 fn hft_status_is_canceled(status: &str) -> bool {
     let normalized = status.to_ascii_lowercase();
     normalized.ends_with("canceled") || normalized.ends_with("cancel")
+}
+
+fn hft_status_matches_new(status: &str) -> bool {
+    status.eq_ignore_ascii_case("open") || status.eq_ignore_ascii_case("triggered")
+}
+
+fn hft_status_matches_remove(status: &str) -> bool {
+    hft_status_is_filled(status) || hft_status_is_canceled(status)
 }
 
 fn encode_hft_lifetime(lag_ms: i64) -> Option<i32> {
@@ -1486,6 +1534,169 @@ fn encode_hft_lifetime(lag_ms: i64) -> Option<i32> {
     }
     let rounded_minutes = lag_ms.checked_add(30_000)?.checked_div(60_000)?;
     i32::try_from(rounded_minutes).ok().and_then(|minutes| minutes.checked_neg())
+}
+
+fn apply_hft_status_to_diff_row(row: &mut DiffOut, status: &HftStatusArchiveRow) {
+    row.status = Some(status.status.clone());
+    row.limit_px = Some(status.limit_px);
+    row._sz = Some(status.sz);
+    row._orig_sz = Some(status.orig_sz);
+    row.is_trigger = Some(status.is_trigger);
+    row.tif = status.tif.clone();
+    row.reduce_only = Some(status.reduce_only);
+    row.order_type = Some(status.order_type.clone());
+    row.trigger_condition = Some(status.trigger_condition.clone());
+    row.trigger_px = Some(status.trigger_px);
+    row.is_position_tpsl = Some(status.is_position_tpsl);
+    row.tp_trigger_px = status.tp_trigger_px;
+    row.sl_trigger_px = status.sl_trigger_px;
+}
+
+fn resolve_hft_new_candidate_indices(
+    candidate_indices: &[usize],
+    statuses: &[HftStatusArchiveRow],
+) -> Option<(usize, Vec<usize>)> {
+    if candidate_indices.len() != 2 {
+        return None;
+    }
+    let mut open_idx = None;
+    let mut triggered_idx = None;
+    for idx in candidate_indices {
+        let status = statuses[*idx].status.as_str();
+        if status.eq_ignore_ascii_case("open") {
+            open_idx = Some(*idx);
+        } else if status.eq_ignore_ascii_case("triggered") {
+            triggered_idx = Some(*idx);
+        }
+    }
+    match (open_idx, triggered_idx) {
+        (Some(open_idx), Some(triggered_idx)) => Some((open_idx, vec![open_idx, triggered_idx])),
+        _ => None,
+    }
+}
+
+fn push_hft_status_row(columns: &mut StatusFullColumns, row: HftStatusArchiveRow) {
+    columns.block_number.push(row.block_number as i64);
+    columns.block_time.push(byte_array_from_string(row.block_time));
+    columns.status.push(byte_array_from_string(row.status));
+    columns.oid.push(row.oid as i64);
+    columns.side.push(byte_array_from_string(row.side));
+    columns.limit_px.push(row.limit_px);
+    columns.is_trigger.push(row.is_trigger);
+    columns.tif.push(byte_array_from_string(row.tif));
+    columns.user.push(byte_array_from_string(row.user));
+    columns.hash.push(byte_array_from_str(""));
+    columns.order_type.push(byte_array_from_string(row.order_type));
+    columns.sz.push(row.sz);
+    columns.orig_sz.push(row.orig_sz);
+    columns.time.push(byte_array_from_str(""));
+    columns.builder.push(byte_array_from_str(""));
+    columns.timestamp.push(0);
+    columns.trigger_condition.push(byte_array_from_string(row.trigger_condition));
+    columns.trigger_px.push(row.trigger_px);
+    columns.tp_trigger_px.push(row.tp_trigger_px);
+    columns.sl_trigger_px.push(row.sl_trigger_px);
+    columns.is_position_tpsl.push(row.is_position_tpsl);
+    columns.reduce_only.push(row.reduce_only);
+    columns.cloid.push(byte_array_from_str(""));
+}
+
+fn migrate_hft_status_into_diffs(
+    statuses: Vec<HftStatusArchiveRow>,
+    diff_rows: &mut HashMap<String, Vec<DiffOut>>,
+) -> (Vec<HftStatusArchiveRow>, Vec<HftStatusMigrationWarning>) {
+    let mut new_candidates: HashMap<(String, String, u64), Vec<usize>> = HashMap::new();
+    let mut remove_candidates: HashMap<(String, String, u64), Vec<usize>> = HashMap::new();
+    for (idx, status) in statuses.iter().enumerate() {
+        let key = (status.coin.clone(), status.user.clone(), status.oid);
+        if hft_status_matches_new(&status.status) {
+            new_candidates.entry(key.clone()).or_default().push(idx);
+        }
+        if hft_status_matches_remove(&status.status) {
+            remove_candidates.entry(key).or_default().push(idx);
+        }
+    }
+
+    let mut migrated = vec![false; statuses.len()];
+    let mut warnings = Vec::new();
+    for (coin, rows) in diff_rows.iter_mut() {
+        for row in rows.iter_mut() {
+            let key = (coin.clone(), row.user.clone(), row.oid);
+            let (candidate_indices, diff_type) = match row.diff_type.as_str() {
+                "new" => (new_candidates.get(&key), "new"),
+                "remove" => (remove_candidates.get(&key), "remove"),
+                _ => (None, ""),
+            };
+            let Some(candidate_indices) = candidate_indices else {
+                continue;
+            };
+            if diff_type == "new" {
+                if let Some((selected_idx, consumed_indices)) =
+                    resolve_hft_new_candidate_indices(candidate_indices, &statuses)
+                {
+                    if consumed_indices.iter().all(|idx| !migrated[*idx]) {
+                        apply_hft_status_to_diff_row(row, &statuses[selected_idx]);
+                        for idx in consumed_indices {
+                            migrated[idx] = true;
+                        }
+                        continue;
+                    }
+                }
+            }
+            match candidate_indices.as_slice() {
+                [idx] if !migrated[*idx] => {
+                    apply_hft_status_to_diff_row(row, &statuses[*idx]);
+                    migrated[*idx] = true;
+                }
+                [idx] => warnings.push(HftStatusMigrationWarning {
+                    block_number: statuses[*idx].block_number,
+                    coin: coin.clone(),
+                    user: row.user.clone(),
+                    oid: row.oid,
+                    diff_type: diff_type.to_string(),
+                    statuses: vec![statuses[*idx].status.clone()],
+                }),
+                indices => warnings.push(HftStatusMigrationWarning {
+                    block_number: indices.first().map(|idx| statuses[*idx].block_number).unwrap_or(row.block_number),
+                    coin: coin.clone(),
+                    user: row.user.clone(),
+                    oid: row.oid,
+                    diff_type: diff_type.to_string(),
+                    statuses: indices.iter().map(|idx| statuses[*idx].status.clone()).collect(),
+                }),
+            }
+        }
+    }
+
+    let residual =
+        statuses.into_iter().enumerate().filter_map(|(idx, status)| (!migrated[idx]).then_some(status)).collect();
+    (residual, warnings)
+}
+
+fn assign_hft_trade_filltimes(
+    trades: &mut [FillOut],
+    block_time_ms: Option<i64>,
+    same_block_filled_timestamp_ms_by_oid: &HashMap<(String, u64), i64>,
+) {
+    for trade in trades.iter_mut() {
+        trade.filltime = None;
+    }
+
+    let Some(block_time_ms) = block_time_ms else {
+        return;
+    };
+
+    let mut last_trade_idx_by_maker_oid: HashMap<(String, u64), usize> = HashMap::new();
+    for (idx, trade) in trades.iter().enumerate() {
+        last_trade_idx_by_maker_oid.insert((trade.coin.clone(), trade.oid_m), idx);
+    }
+
+    for ((coin, oid), idx) in last_trade_idx_by_maker_oid {
+        let Some(order_timestamp_ms) = same_block_filled_timestamp_ms_by_oid.get(&(coin, oid)).copied() else {
+            continue;
+        };
+        trades[idx].filltime = block_time_ms.checked_sub(order_timestamp_ms).and_then(encode_hft_lifetime);
+    }
 }
 
 fn classify_hft_remove_from_status_summary(
@@ -1947,8 +2158,7 @@ fn archive_relative_dir(stream: StreamKind, mode: ArchiveMode, coin: &str) -> Pa
     match stream {
         StreamKind::Blocks => PathBuf::new(),
         StreamKind::StatusReject => PathBuf::from("reject"),
-        StreamKind::Fill => archive_coin_dir(mode, coin),
-        StreamKind::Diff | StreamKind::Status => archive_coin_dir(mode, coin).join(archive_stream_name(stream, mode)),
+        StreamKind::Fill | StreamKind::Diff | StreamKind::Status => archive_coin_dir(mode, coin),
     }
 }
 
@@ -3522,8 +3732,19 @@ fn diff_schema_for(mode: ArchiveMode, scales: ArchiveDecimalScales) -> std::sync
                 REQUIRED INT64 sz (DECIMAL(18, {s}));
                 REQUIRED INT64 orig_sz (DECIMAL(18, {s}));
                 REQUIRED BINARY event (UTF8);
+                OPTIONAL BINARY status (UTF8);
+                OPTIONAL INT64 limit_px (DECIMAL(18, {p}));
+                OPTIONAL INT64 _sz (DECIMAL(18, {s}));
+                OPTIONAL INT64 _orig_sz (DECIMAL(18, {s}));
+                OPTIONAL BOOLEAN is_trigger;
                 OPTIONAL BINARY tif (UTF8);
                 OPTIONAL BOOLEAN reduce_only;
+                OPTIONAL BINARY order_type (UTF8);
+                OPTIONAL BINARY trigger_condition (UTF8);
+                OPTIONAL INT64 trigger_px (DECIMAL(18, {p}));
+                OPTIONAL BOOLEAN is_position_tpsl;
+                OPTIONAL INT64 tp_trigger_px (DECIMAL(18, {p}));
+                OPTIONAL INT64 sl_trigger_px (DECIMAL(18, {p}));
                 OPTIONAL INT32 lifetime;
             }}"
         ),
@@ -4472,8 +4693,19 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
             px: 0,
             orig_sz: 0,
             event: String::new(),
+            status: None,
+            limit_px: None,
+            _sz: None,
+            _orig_sz: None,
+            is_trigger: None,
             tif: String::new(),
             reduce_only: None,
+            order_type: None,
+            trigger_condition: None,
+            trigger_px: None,
+            is_position_tpsl: None,
+            tp_trigger_px: None,
+            sl_trigger_px: None,
             lifetime: None,
         };
         match mode {
@@ -4486,7 +4718,7 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.orig_sz = decimal_to_i64(row.get_decimal(8).map_err(io_to_parquet_error)?)?;
             }
             ArchiveMode::Hft => {
-                if column_count != 14 {
+                if column_count != 25 {
                     return Err(io_to_parquet_error(io_other(format!(
                         "obsolete HFT diff local recovery schema with {column_count} columns is unsupported"
                     ))));
@@ -4499,9 +4731,20 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.sz = decimal_to_i64(row.get_decimal(8).map_err(io_to_parquet_error)?)?;
                 out.orig_sz = decimal_to_i64(row.get_decimal(9).map_err(io_to_parquet_error)?)?;
                 out.event = row.get_string(10).map_err(io_to_parquet_error)?.clone();
-                out.tif = read_row_optional_utf8(&row, 11)?.unwrap_or_default();
-                out.reduce_only = read_row_optional_bool(&row, 12)?;
-                out.lifetime = read_row_optional_i32(&row, 13)?;
+                out.status = read_row_optional_utf8(&row, 11)?;
+                out.limit_px = read_row_optional_decimal_i64(&row, 12)?;
+                out._sz = read_row_optional_decimal_i64(&row, 13)?;
+                out._orig_sz = read_row_optional_decimal_i64(&row, 14)?;
+                out.is_trigger = read_row_optional_bool(&row, 15)?;
+                out.tif = read_row_optional_utf8(&row, 16)?.unwrap_or_default();
+                out.reduce_only = read_row_optional_bool(&row, 17)?;
+                out.order_type = read_row_optional_utf8(&row, 18)?;
+                out.trigger_condition = read_row_optional_utf8(&row, 19)?;
+                out.trigger_px = read_row_optional_decimal_i64(&row, 20)?;
+                out.is_position_tpsl = read_row_optional_bool(&row, 21)?;
+                out.tp_trigger_px = read_row_optional_decimal_i64(&row, 22)?;
+                out.sl_trigger_px = read_row_optional_decimal_i64(&row, 23)?;
+                out.lifetime = read_row_optional_i32(&row, 24)?;
             }
             ArchiveMode::Full => {
                 out.user = row.get_string(3).map_err(io_to_parquet_error)?.clone();
@@ -5411,6 +5654,20 @@ fn parse_optional_utf8_column(values: &[ByteArray]) -> parquet::errors::Result<(
     Ok((parsed, def_levels))
 }
 
+fn parse_optional_byte_array_column(values: &[Option<ByteArray>]) -> (Vec<ByteArray>, Vec<i16>) {
+    let mut parsed = Vec::new();
+    let mut def_levels = Vec::with_capacity(values.len());
+    for value in values {
+        if let Some(value) = value {
+            parsed.push(value.clone());
+            def_levels.push(1);
+        } else {
+            def_levels.push(0);
+        }
+    }
+    (parsed, def_levels)
+}
+
 fn diff_type_name(diff_type: u8) -> &'static str {
     match diff_type {
         0 => "new",
@@ -6127,10 +6384,36 @@ fn write_diff_rows(
     } else if mode == ArchiveMode::Hft {
         let users: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.user.as_bytes())).collect();
         let events: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.event.as_bytes())).collect();
+        let statuses: Vec<Option<ByteArray>> =
+            rows.iter().map(|r| r.status.as_ref().map(|value| ByteArray::from(value.as_bytes()))).collect();
+        let (status_values, status_def_levels) = parse_optional_byte_array_column(&statuses);
+        let limit_pxs: Vec<Option<i64>> = rows.iter().map(|r| r.limit_px).collect();
+        let (limit_px_values, limit_px_def_levels) = parse_optional_i64_column(&limit_pxs);
+        let status_szs: Vec<Option<i64>> = rows.iter().map(|r| r._sz).collect();
+        let (status_sz_values, status_sz_def_levels) = parse_optional_i64_column(&status_szs);
+        let status_orig_szs: Vec<Option<i64>> = rows.iter().map(|r| r._orig_sz).collect();
+        let (status_orig_sz_values, status_orig_sz_def_levels) = parse_optional_i64_column(&status_orig_szs);
+        let is_triggers: Vec<Option<bool>> = rows.iter().map(|r| r.is_trigger).collect();
+        let (is_trigger_values, is_trigger_def_levels) = parse_optional_bool_column(&is_triggers);
         let tifs: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.tif.as_bytes())).collect();
         let (tif_values, tif_def_levels) = parse_optional_utf8_column(&tifs)?;
         let reduce_onlys: Vec<Option<bool>> = rows.iter().map(|r| r.reduce_only).collect();
         let (reduce_only_values, reduce_only_def_levels) = parse_optional_bool_column(&reduce_onlys);
+        let order_types: Vec<Option<ByteArray>> =
+            rows.iter().map(|r| r.order_type.as_ref().map(|value| ByteArray::from(value.as_bytes()))).collect();
+        let (order_type_values, order_type_def_levels) = parse_optional_byte_array_column(&order_types);
+        let trigger_conditions: Vec<Option<ByteArray>> =
+            rows.iter().map(|r| r.trigger_condition.as_ref().map(|value| ByteArray::from(value.as_bytes()))).collect();
+        let (trigger_condition_values, trigger_condition_def_levels) =
+            parse_optional_byte_array_column(&trigger_conditions);
+        let trigger_pxs: Vec<Option<i64>> = rows.iter().map(|r| r.trigger_px).collect();
+        let (trigger_px_values, trigger_px_def_levels) = parse_optional_i64_column(&trigger_pxs);
+        let is_position_tpsls: Vec<Option<bool>> = rows.iter().map(|r| r.is_position_tpsl).collect();
+        let (is_position_tpsl_values, is_position_tpsl_def_levels) = parse_optional_bool_column(&is_position_tpsls);
+        let tp_trigger_pxs: Vec<Option<i64>> = rows.iter().map(|r| r.tp_trigger_px).collect();
+        let (tp_trigger_px_values, tp_trigger_px_def_levels) = parse_optional_i64_column(&tp_trigger_pxs);
+        let sl_trigger_pxs: Vec<Option<i64>> = rows.iter().map(|r| r.sl_trigger_px).collect();
+        let (sl_trigger_px_values, sl_trigger_px_def_levels) = parse_optional_i64_column(&sl_trigger_pxs);
         let lifetimes: Vec<Option<i32>> = rows.iter().map(|r| r.lifetime).collect();
         let (lifetime_values, lifetime_def_levels) = parse_optional_i32_column(&lifetimes);
 
@@ -6202,6 +6485,36 @@ fn write_diff_rows(
         }
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&status_values, Some(&status_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&limit_px_values, Some(&limit_px_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&status_sz_values, Some(&status_sz_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&status_orig_sz_values, Some(&status_orig_sz_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&is_trigger_values, Some(&is_trigger_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&tif_values, Some(&tif_def_levels), None)?;
             }
             col.close()?;
@@ -6209,6 +6522,42 @@ fn write_diff_rows(
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
                 typed.write_batch(&reduce_only_values, Some(&reduce_only_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&order_type_values, Some(&order_type_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&trigger_condition_values, Some(&trigger_condition_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&trigger_px_values, Some(&trigger_px_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::BoolColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&is_position_tpsl_values, Some(&is_position_tpsl_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&tp_trigger_px_values, Some(&tp_trigger_px_def_levels), None)?;
+            }
+            col.close()?;
+        }
+        if let Some(mut col) = row_group.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
+                typed.write_batch(&sl_trigger_px_values, Some(&sl_trigger_px_def_levels), None)?;
             }
             col.close()?;
         }
@@ -6904,7 +7253,6 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
     let mut start_alignment_wait_logged = false;
     let mut last_input_height: Option<u64> = None;
     let mut replay_skip_log = ReplaySkipLogState::default();
-    let mut hft_order_timestamp_ms_by_oid: HashMap<(String, u64), i64> = HashMap::new();
 
     loop {
         set_archive_phase(last_input_height, "waiting_for_block");
@@ -6943,7 +7291,6 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
             start_alignment_wait_logged = false;
             last_input_height = None;
             replay_skip_log = ReplaySkipLogState::default();
-            hft_order_timestamp_ms_by_oid.clear();
         }
 
         let msg = match rx.recv_timeout(Duration::from_millis(200)) {
@@ -7087,11 +7434,10 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
         let fill_n = payload.fills.len() as i32;
         set_archive_phase(Some(height), "build_status_rows");
         let mut status_rows: HashMap<String, StatusBlockBatch> = HashMap::new();
-        let mut same_block_status_tif_by_oid: HashMap<(String, u64), String> = HashMap::new();
-        let mut same_block_status_reduce_only_by_oid: HashMap<(String, u64), bool> = HashMap::new();
+        let mut hft_status_rows = Vec::new();
         let mut same_block_status_timestamp_ms_by_oid: HashMap<(String, u64), i64> = HashMap::new();
+        let mut same_block_filled_timestamp_ms_by_oid: HashMap<(String, u64), i64> = HashMap::new();
         let mut same_block_remove_status_by_oid: HashMap<(String, u64), HftRemoveStatusSummary> = HashMap::new();
-        let mut hft_terminal_oids_this_block: Vec<(String, u64)> = Vec::new();
         let mut btc_status_n = 0;
         let mut eth_status_n = 0;
         let block_time_bytes = byte_array_from_str(&block_time);
@@ -7141,8 +7487,6 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 status.sl_trigger_px.as_deref().and_then(|value| parse_scaled(value, scales.px_scale));
             let status_text = status.status.clone();
             let status_user = status.user.clone();
-            same_block_status_tif_by_oid.insert((coin.clone(), oid), tif.clone().unwrap_or_default());
-            same_block_status_reduce_only_by_oid.insert((coin.clone(), oid), reduce_only);
             if mode == ArchiveMode::Hft {
                 let summary = same_block_remove_status_by_oid.entry((coin.clone(), oid)).or_default();
                 if hft_status_is_filled(&status_text) {
@@ -7155,18 +7499,41 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 match infer_epoch_timestamp_millis(timestamp as i64) {
                     Ok(timestamp_ms) => {
                         same_block_status_timestamp_ms_by_oid.insert((coin.clone(), oid), timestamp_ms);
-                        hft_order_timestamp_ms_by_oid.insert((coin.clone(), oid), timestamp_ms);
+                        if hft_status_is_filled(&status_text) {
+                            same_block_filled_timestamp_ms_by_oid.insert((coin.clone(), oid), timestamp_ms);
+                        }
                     }
                     Err(err) => {
                         warn!(
-                            "Skipping HFT trade filltime timestamp for coin={} oid={} height={} due to invalid order timestamp: {}",
+                            "Skipping HFT same-block status timestamp for coin={} oid={} height={} due to invalid order timestamp: {}",
                             coin, oid, height, err
                         );
                     }
                 }
-                if !hft_status_keeps_order_live(&status_text) {
-                    hft_terminal_oids_this_block.push((coin.clone(), oid));
-                }
+            }
+            if mode == ArchiveMode::Hft {
+                hft_status_rows.push(HftStatusArchiveRow {
+                    block_number: height,
+                    block_time: block_time.clone(),
+                    coin,
+                    user: status_user,
+                    oid,
+                    status: status_text,
+                    side,
+                    limit_px: s_px,
+                    sz: s_sz,
+                    orig_sz: s_orig,
+                    is_trigger,
+                    tif: tif.unwrap_or_default(),
+                    trigger_condition,
+                    trigger_px: s_trig,
+                    is_position_tpsl,
+                    reduce_only,
+                    order_type,
+                    tp_trigger_px: tp_child_trigger_px,
+                    sl_trigger_px: sl_child_trigger_px,
+                });
+                continue;
             }
             let entry = status_rows.entry(coin.clone()).or_insert_with(|| StatusBlockBatch::new(mode));
             match entry {
@@ -7297,11 +7664,45 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 px: d_px,
                 orig_sz: d_orig,
                 event: String::new(),
+                status: None,
+                limit_px: None,
+                _sz: None,
+                _orig_sz: None,
+                is_trigger: None,
                 tif: String::new(),
                 reduce_only: None,
+                order_type: None,
+                trigger_condition: None,
+                trigger_px: None,
+                is_position_tpsl: None,
+                tp_trigger_px: None,
+                sl_trigger_px: None,
                 lifetime: None,
             };
             diff_rows.entry(coin).or_default().push(out);
+        }
+
+        if mode == ArchiveMode::Hft {
+            let (residual_status_rows, migration_warnings) =
+                migrate_hft_status_into_diffs(hft_status_rows, &mut diff_rows);
+            for warning in migration_warnings {
+                warn!(
+                    "Skipping HFT status-to-diff migration for diff_type={} coin={} oid={} user={} height={} due to multiple matching status rows: {}",
+                    warning.diff_type,
+                    warning.coin,
+                    warning.oid,
+                    warning.user,
+                    warning.block_number,
+                    warning.statuses.join(",")
+                );
+            }
+            for row in residual_status_rows {
+                let entry = status_rows.entry(row.coin.clone()).or_insert_with(|| StatusBlockBatch::new(mode));
+                match entry {
+                    StatusBlockBatch::Hft(columns) => push_hft_status_row(columns, row),
+                    _ => unreachable!("HFT residual status rows must target HFT status batch"),
+                }
+            }
         }
 
         set_archive_phase(Some(height), "build_fill_rows");
@@ -7397,17 +7798,7 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                 let aggregated = aggregate_hft_trades(std::mem::take(rows));
                 let mut aggregated = aggregated;
                 enrich_hft_trade_rows_with_user_fees(&mut aggregated);
-                if let Some(block_time_ms) = block_time_ms {
-                    for trade in &mut aggregated {
-                        match hft_order_timestamp_ms_by_oid.get(&(trade.coin.clone(), trade.oid_m)).copied() {
-                            Some(order_timestamp_ms) => {
-                                trade.filltime =
-                                    block_time_ms.checked_sub(order_timestamp_ms).and_then(encode_hft_lifetime);
-                            }
-                            None => trade.filltime = None,
-                        }
-                    }
-                }
+                assign_hft_trade_filltimes(&mut aggregated, block_time_ms, &same_block_filled_timestamp_ms_by_oid);
                 for trade in &aggregated {
                     *same_block_trade_sz_by_oid.entry((trade.coin.clone(), trade.oid_m)).or_default() += trade.sz;
                 }
@@ -7423,16 +7814,6 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                         "update" => 1,
                         "remove" => 2,
                         _ => 255,
-                    };
-                    row.reduce_only = if diff_type == 0 {
-                        same_block_status_reduce_only_by_oid.get(&(coin.clone(), row.oid)).copied()
-                    } else {
-                        None
-                    };
-                    row.tif = if diff_type == 0 {
-                        same_block_status_tif_by_oid.get(&(coin.clone(), row.oid)).cloned().unwrap_or_default()
-                    } else {
-                        String::new()
                     };
                     if diff_type == 2 {
                         let (event, canceled_orig_sz, should_warn) = classify_hft_remove_from_status_summary(
@@ -7475,9 +7856,6 @@ pub(crate) fn run_archive_writer(rx: Receiver<ArchiveBlock>, stop: Arc<AtomicBoo
                         missing_remove_terminal_status, coin, height
                     );
                 }
-            }
-            for key in hft_terminal_oids_this_block.drain(..) {
-                hft_order_timestamp_ms_by_oid.remove(&key);
             }
         }
 
@@ -7934,8 +8312,19 @@ mod tests {
                 px: 7071200,
                 orig_sz: 0,
                 event: "add".to_string(),
+                status: Some("open".to_string()),
+                limit_px: Some(7071200),
+                _sz: Some(12345),
+                _orig_sz: Some(12345),
+                is_trigger: Some(false),
                 tif: "Alo".to_string(),
                 reduce_only: Some(false),
+                order_type: Some("Limit".to_string()),
+                trigger_condition: Some("N/A".to_string()),
+                trigger_px: Some(0),
+                is_position_tpsl: Some(false),
+                tp_trigger_px: Some(7075000),
+                sl_trigger_px: None,
                 lifetime: None,
             },
             DiffOut {
@@ -7950,8 +8339,19 @@ mod tests {
                 px: 7071500,
                 orig_sz: 12000,
                 event: "fill".to_string(),
+                status: None,
+                limit_px: None,
+                _sz: None,
+                _orig_sz: None,
+                is_trigger: None,
                 tif: String::new(),
                 reduce_only: None,
+                order_type: None,
+                trigger_condition: None,
+                trigger_px: None,
+                is_position_tpsl: None,
+                tp_trigger_px: None,
+                sl_trigger_px: None,
                 lifetime: Some(281),
             },
         ];
@@ -7962,11 +8362,23 @@ mod tests {
         assert_eq!(recovered.len(), 2);
         assert_eq!(recovered[0].oid, 33);
         assert_eq!(recovered[0].event, "add");
+        assert_eq!(recovered[0].status.as_deref(), Some("open"));
+        assert_eq!(recovered[0].limit_px, Some(7071200));
+        assert_eq!(recovered[0]._sz, Some(12345));
+        assert_eq!(recovered[0]._orig_sz, Some(12345));
+        assert_eq!(recovered[0].is_trigger, Some(false));
         assert_eq!(recovered[0].tif, "Alo");
         assert_eq!(recovered[0].reduce_only, Some(false));
+        assert_eq!(recovered[0].order_type.as_deref(), Some("Limit"));
+        assert_eq!(recovered[0].trigger_condition.as_deref(), Some("N/A"));
+        assert_eq!(recovered[0].trigger_px, Some(0));
+        assert_eq!(recovered[0].is_position_tpsl, Some(false));
+        assert_eq!(recovered[0].tp_trigger_px, Some(7075000));
+        assert_eq!(recovered[0].sl_trigger_px, None);
         assert_eq!(recovered[0].lifetime, None);
         assert_eq!(recovered[1].oid, 77);
         assert_eq!(recovered[1].event, "fill");
+        assert_eq!(recovered[1].status, None);
         assert_eq!(recovered[1].tif, "");
         assert_eq!(recovered[1].reduce_only, None);
         assert_eq!(recovered[1].lifetime, Some(281));
@@ -7996,6 +8408,394 @@ mod tests {
         assert!(hft_status_is_canceled("scheduledCancel"));
         assert!(!hft_status_is_canceled("filled"));
         assert_eq!(classify_hft_remove_from_status_summary(None), ("cancel", None, true));
+    }
+
+    #[test]
+    fn migrate_hft_status_into_diffs_moves_unique_new_and_remove_rows() {
+        let statuses = vec![
+            HftStatusArchiveRow {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                user: "u1".to_string(),
+                oid: 11,
+                status: "open".to_string(),
+                side: "B".to_string(),
+                limit_px: 7071200,
+                sz: 12345,
+                orig_sz: 12345,
+                is_trigger: false,
+                tif: "Alo".to_string(),
+                trigger_condition: "N/A".to_string(),
+                trigger_px: 0,
+                is_position_tpsl: false,
+                reduce_only: false,
+                order_type: "Limit".to_string(),
+                tp_trigger_px: None,
+                sl_trigger_px: None,
+            },
+            HftStatusArchiveRow {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                user: "u1".to_string(),
+                oid: 11,
+                status: "canceled".to_string(),
+                side: "B".to_string(),
+                limit_px: 7071200,
+                sz: 0,
+                orig_sz: 12345,
+                is_trigger: false,
+                tif: "Alo".to_string(),
+                trigger_condition: "N/A".to_string(),
+                trigger_px: 0,
+                is_position_tpsl: false,
+                reduce_only: false,
+                order_type: "Limit".to_string(),
+                tp_trigger_px: None,
+                sl_trigger_px: None,
+            },
+        ];
+        let mut diff_rows = HashMap::from([(
+            "BTC".to_string(),
+            vec![
+                DiffOut {
+                    block_number: 1,
+                    block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                    coin: "BTC".to_string(),
+                    user: "u1".to_string(),
+                    oid: 11,
+                    side: "B".to_string(),
+                    px: 7071200,
+                    diff_type: "new".to_string(),
+                    sz: 12345,
+                    orig_sz: 0,
+                    event: "add".to_string(),
+                    status: None,
+                    limit_px: None,
+                    _sz: None,
+                    _orig_sz: None,
+                    is_trigger: None,
+                    tif: String::new(),
+                    reduce_only: None,
+                    order_type: None,
+                    trigger_condition: None,
+                    trigger_px: None,
+                    is_position_tpsl: None,
+                    tp_trigger_px: None,
+                    sl_trigger_px: None,
+                    lifetime: None,
+                },
+                DiffOut {
+                    block_number: 1,
+                    block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                    coin: "BTC".to_string(),
+                    user: "u1".to_string(),
+                    oid: 11,
+                    side: "B".to_string(),
+                    px: 7071200,
+                    diff_type: "remove".to_string(),
+                    sz: 0,
+                    orig_sz: 12345,
+                    event: "cancel".to_string(),
+                    status: None,
+                    limit_px: None,
+                    _sz: None,
+                    _orig_sz: None,
+                    is_trigger: None,
+                    tif: String::new(),
+                    reduce_only: None,
+                    order_type: None,
+                    trigger_condition: None,
+                    trigger_px: None,
+                    is_position_tpsl: None,
+                    tp_trigger_px: None,
+                    sl_trigger_px: None,
+                    lifetime: None,
+                },
+            ],
+        )]);
+
+        let (residual, warnings) = migrate_hft_status_into_diffs(statuses, &mut diff_rows);
+
+        assert!(residual.is_empty());
+        assert!(warnings.is_empty());
+        let rows = diff_rows.get("BTC").expect("btc rows");
+        assert_eq!(rows[0].status.as_deref(), Some("open"));
+        assert_eq!(rows[0].limit_px, Some(7071200));
+        assert_eq!(rows[0]._sz, Some(12345));
+        assert_eq!(rows[0]._orig_sz, Some(12345));
+        assert_eq!(rows[0].tif, "Alo");
+        assert_eq!(rows[1].status.as_deref(), Some("canceled"));
+        assert_eq!(rows[1]._orig_sz, Some(12345));
+    }
+
+    #[test]
+    fn migrate_hft_status_into_diffs_prefers_open_over_triggered_for_new() {
+        let statuses = vec![
+            HftStatusArchiveRow {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                user: "u1".to_string(),
+                oid: 11,
+                status: "open".to_string(),
+                side: "B".to_string(),
+                limit_px: 7071200,
+                sz: 100,
+                orig_sz: 100,
+                is_trigger: false,
+                tif: "Alo".to_string(),
+                trigger_condition: "N/A".to_string(),
+                trigger_px: 0,
+                is_position_tpsl: false,
+                reduce_only: false,
+                order_type: "Limit".to_string(),
+                tp_trigger_px: None,
+                sl_trigger_px: None,
+            },
+            HftStatusArchiveRow {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                user: "u1".to_string(),
+                oid: 11,
+                status: "triggered".to_string(),
+                side: "B".to_string(),
+                limit_px: 7071200,
+                sz: 100,
+                orig_sz: 100,
+                is_trigger: true,
+                tif: String::new(),
+                trigger_condition: "triggered".to_string(),
+                trigger_px: 7071200,
+                is_position_tpsl: false,
+                reduce_only: false,
+                order_type: "Stop Limit".to_string(),
+                tp_trigger_px: None,
+                sl_trigger_px: None,
+            },
+        ];
+        let mut diff_rows = HashMap::from([(
+            "BTC".to_string(),
+            vec![DiffOut {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                user: "u1".to_string(),
+                oid: 11,
+                side: "B".to_string(),
+                px: 7071200,
+                diff_type: "new".to_string(),
+                sz: 100,
+                orig_sz: 0,
+                event: "add".to_string(),
+                status: None,
+                limit_px: None,
+                _sz: None,
+                _orig_sz: None,
+                is_trigger: None,
+                tif: String::new(),
+                reduce_only: None,
+                order_type: None,
+                trigger_condition: None,
+                trigger_px: None,
+                is_position_tpsl: None,
+                tp_trigger_px: None,
+                sl_trigger_px: None,
+                lifetime: None,
+            }],
+        )]);
+
+        let (residual, warnings) = migrate_hft_status_into_diffs(statuses, &mut diff_rows);
+
+        assert!(warnings.is_empty());
+        assert!(residual.is_empty());
+        let row = &diff_rows.get("BTC").expect("btc rows")[0];
+        assert_eq!(row.status.as_deref(), Some("open"));
+        assert_eq!(row.limit_px, Some(7071200));
+        assert_eq!(row.tif, "Alo");
+    }
+
+    #[test]
+    fn migrate_hft_status_into_diffs_warns_and_keeps_rows_when_new_has_multiple_open_candidates() {
+        let statuses = vec![
+            HftStatusArchiveRow {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                user: "u1".to_string(),
+                oid: 11,
+                status: "open".to_string(),
+                side: "B".to_string(),
+                limit_px: 7071200,
+                sz: 100,
+                orig_sz: 100,
+                is_trigger: false,
+                tif: "Alo".to_string(),
+                trigger_condition: "N/A".to_string(),
+                trigger_px: 0,
+                is_position_tpsl: false,
+                reduce_only: false,
+                order_type: "Limit".to_string(),
+                tp_trigger_px: None,
+                sl_trigger_px: None,
+            },
+            HftStatusArchiveRow {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                user: "u1".to_string(),
+                oid: 11,
+                status: "open".to_string(),
+                side: "B".to_string(),
+                limit_px: 7071200,
+                sz: 100,
+                orig_sz: 100,
+                is_trigger: false,
+                tif: "Alo".to_string(),
+                trigger_condition: "N/A".to_string(),
+                trigger_px: 0,
+                is_position_tpsl: false,
+                reduce_only: false,
+                order_type: "Limit".to_string(),
+                tp_trigger_px: None,
+                sl_trigger_px: None,
+            },
+        ];
+        let mut diff_rows = HashMap::from([(
+            "BTC".to_string(),
+            vec![DiffOut {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                user: "u1".to_string(),
+                oid: 11,
+                side: "B".to_string(),
+                px: 7071200,
+                diff_type: "new".to_string(),
+                sz: 100,
+                orig_sz: 0,
+                event: "add".to_string(),
+                status: None,
+                limit_px: None,
+                _sz: None,
+                _orig_sz: None,
+                is_trigger: None,
+                tif: String::new(),
+                reduce_only: None,
+                order_type: None,
+                trigger_condition: None,
+                trigger_px: None,
+                is_position_tpsl: None,
+                tp_trigger_px: None,
+                sl_trigger_px: None,
+                lifetime: None,
+            }],
+        )]);
+
+        let (residual, warnings) = migrate_hft_status_into_diffs(statuses, &mut diff_rows);
+
+        assert_eq!(residual.len(), 2);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].diff_type, "new");
+        assert_eq!(warnings[0].statuses, vec!["open".to_string(), "open".to_string()]);
+        let row = &diff_rows.get("BTC").expect("btc rows")[0];
+        assert_eq!(row.status, None);
+        assert_eq!(row.limit_px, None);
+        assert_eq!(row.tif, "");
+    }
+
+    #[test]
+    fn assign_hft_trade_filltimes_only_marks_last_same_block_filled_trade() {
+        let mut trades = vec![
+            FillOut {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                side: "B".to_string(),
+                px: 100,
+                sz: 1,
+                crossed: true,
+                address: "taker_a".to_string(),
+                closed_pnl: 0,
+                fee: 0,
+                hash: String::new(),
+                oid: 11,
+                address_m: "maker".to_string(),
+                oid_m: 77,
+                pnl_m: 0,
+                fee_m: 0,
+                mm_rate: None,
+                mm_share: None,
+                filltime: Some(123),
+                tid: 1,
+                start_position: 0,
+                dir: String::new(),
+                fee_token: String::new(),
+                twap_id: None,
+            },
+            FillOut {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                side: "B".to_string(),
+                px: 101,
+                sz: 2,
+                crossed: true,
+                address: "taker_b".to_string(),
+                closed_pnl: 0,
+                fee: 0,
+                hash: String::new(),
+                oid: 12,
+                address_m: "maker".to_string(),
+                oid_m: 77,
+                pnl_m: 0,
+                fee_m: 0,
+                mm_rate: None,
+                mm_share: None,
+                filltime: Some(456),
+                tid: 2,
+                start_position: 0,
+                dir: String::new(),
+                fee_token: String::new(),
+                twap_id: None,
+            },
+            FillOut {
+                block_number: 1,
+                block_time: "2026-03-25T00:00:10.000Z".to_string(),
+                coin: "BTC".to_string(),
+                side: "B".to_string(),
+                px: 102,
+                sz: 3,
+                crossed: true,
+                address: "taker_c".to_string(),
+                closed_pnl: 0,
+                fee: 0,
+                hash: String::new(),
+                oid: 13,
+                address_m: "maker".to_string(),
+                oid_m: 88,
+                pnl_m: 0,
+                fee_m: 0,
+                mm_rate: None,
+                mm_share: None,
+                filltime: Some(789),
+                tid: 3,
+                start_position: 0,
+                dir: String::new(),
+                fee_token: String::new(),
+                twap_id: None,
+            },
+        ];
+        let same_block_filled_timestamp_ms_by_oid =
+            HashMap::from([(("BTC".to_string(), 77_u64), 9_000_i64), (("BTC".to_string(), 88_u64), 8_500_i64)]);
+
+        assign_hft_trade_filltimes(&mut trades, Some(10_000), &same_block_filled_timestamp_ms_by_oid);
+
+        assert_eq!(trades[0].filltime, None);
+        assert_eq!(trades[1].filltime, Some(1_000));
+        assert_eq!(trades[2].filltime, Some(1_500));
     }
 
     #[test]
