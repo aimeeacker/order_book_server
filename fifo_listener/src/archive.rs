@@ -59,6 +59,7 @@ const BLOCKS_FILL_ROTATION_BLOCKS: u64 = 1_000_000;
 const BLOCKS_FILL_ROW_GROUP_BLOCKS: u64 = 250_000;
 const BLOCKS_FILL_DELAYED_FLUSH_LOOKAHEAD_BLOCKS: u64 = 2_000;
 const MIN_HANDOFF_BLOCK_SPAN: u64 = 5_000;
+const MAX_HFT_DIFF_LOCAL_RECOVERY_SPAN: u64 = 50_000;
 const MIN_ARCHIVE_FREE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_DISK_USED_BPS: u64 = 9_500;
 const MAX_CONCURRENT_HANDOFF_TASKS: usize = 15;
@@ -2115,6 +2116,10 @@ struct ParquetFile {
     final_filename_suffix: String,
 }
 
+fn should_keep_hft_diff_local_recovery(span_blocks: u64) -> bool {
+    span_blocks <= MAX_HFT_DIFF_LOCAL_RECOVERY_SPAN
+}
+
 fn status_live_row_group_blocks() -> u64 {
     STATUS_ROW_GROUP_BLOCKS_DEFAULT
 }
@@ -2356,8 +2361,15 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
         self.local_recovery_enabled
     }
 
-    fn keep_local_on_close(&self) -> bool {
-        self.supports_local_recovery() && self.recover_blocks_fill_on_stop
+    fn keep_local_on_close(&self, file: &ParquetFile) -> bool {
+        if !(self.supports_local_recovery() && self.recover_blocks_fill_on_stop) {
+            return false;
+        }
+        if matches!(self.stream, StreamKind::Diff) {
+            let span_blocks = file.name_end_block.saturating_sub(file.name_start_block).saturating_add(1);
+            return should_keep_hft_diff_local_recovery(span_blocks);
+        }
+        true
     }
 
     fn set_local_recovery_enabled(&mut self, enabled: bool) {
@@ -2508,13 +2520,14 @@ impl<R: HasBlockNumber + RecoverableArchiveRow> ParquetStreamWriter<R> {
                 "{}_{}_{}{}",
                 file.final_filename_prefix, file.name_start_block, file.name_end_block, file.final_filename_suffix
             ));
+            let keep_local_on_close = self.keep_local_on_close(&file) && file.name_end_block < file.window_end_block;
             file.writer.close()?;
             fs::rename(&tmp_path, &final_path).map_err(io_to_parquet_error)?;
             let span_blocks = file.name_end_block.saturating_sub(file.name_start_block) + 1;
             if span_blocks < MIN_HANDOFF_BLOCK_SPAN {
                 info!("Archive finalized but dropping short parquet {} span={}", log_label, span_blocks);
                 fs::remove_file(&final_path).map_err(io_to_parquet_error)?;
-            } else if self.keep_local_on_close() && file.name_end_block < file.window_end_block {
+            } else if keep_local_on_close {
                 info!("Archive finalized locally without handoff for {} span={}", log_label, span_blocks);
             } else {
                 enqueue_handoff_task(&self.handoff_tx, &self.handoff_config, final_path, relative_path)?;
@@ -3727,7 +3740,7 @@ fn diff_schema_for(mode: ArchiveMode, scales: ArchiveDecimalScales) -> std::sync
                 REQUIRED BINARY diff_type (UTF8);
                 REQUIRED BINARY event (UTF8);
                 REQUIRED INT64 sz (DECIMAL(18, {s}));
-                REQUIRED INT64 orig_sz (DECIMAL(18, {s}));
+                OPTIONAL INT64 orig_sz (DECIMAL(18, {s}));
                 OPTIONAL INT64 raw_sz (DECIMAL(18, {s}));
                 OPTIONAL BOOLEAN is_trigger;
                 OPTIONAL BINARY tif (UTF8);
@@ -4722,7 +4735,7 @@ fn read_local_diff_rows(path: &Path, mode: ArchiveMode) -> parquet::errors::Resu
                 out.diff_type = row.get_string(7).map_err(io_to_parquet_error)?.clone();
                 out.event = row.get_string(8).map_err(io_to_parquet_error)?.clone();
                 out.sz = decimal_to_i64(row.get_decimal(9).map_err(io_to_parquet_error)?)?;
-                out.orig_sz = decimal_to_i64(row.get_decimal(10).map_err(io_to_parquet_error)?)?;
+                out.orig_sz = read_row_optional_decimal_i64(&row, 10)?.unwrap_or(0);
                 out.raw_sz = read_row_optional_decimal_i64(&row, 11)?;
                 out.is_trigger = read_row_optional_bool(&row, 12)?;
                 out.tif = read_row_optional_utf8(&row, 13)?.unwrap_or_default();
@@ -6374,7 +6387,10 @@ fn write_diff_rows(
     } else if mode == ArchiveMode::Hft {
         let users: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.user.as_bytes())).collect();
         let events: Vec<ByteArray> = rows.iter().map(|r| ByteArray::from(r.event.as_bytes())).collect();
-        let sparse_raw_szs: Vec<Option<i64>> = rows.iter().map(|r| r.raw_sz.filter(|raw_sz| *raw_sz != r.sz)).collect();
+        let sparse_orig_szs: Vec<Option<i64>> = rows.iter().map(|r| (r.orig_sz != 0).then_some(r.orig_sz)).collect();
+        let (orig_sz_values, orig_sz_def_levels) = parse_optional_i64_column(&sparse_orig_szs);
+        let sparse_raw_szs: Vec<Option<i64>> =
+            rows.iter().map(|r| r.raw_sz.filter(|raw_sz| *raw_sz != r.orig_sz)).collect();
         let (raw_sz_values, raw_sz_def_levels) = parse_optional_i64_column(&sparse_raw_szs);
         let is_triggers: Vec<Option<bool>> = rows.iter().map(|r| r.is_trigger).collect();
         let (is_trigger_values, is_trigger_def_levels) = parse_optional_bool_column(&is_triggers);
@@ -6465,7 +6481,7 @@ fn write_diff_rows(
         }
         if let Some(mut col) = row_group.next_column()? {
             if let ColumnWriter::Int64ColumnWriter(typed) = col.untyped() {
-                typed.write_batch(&orig_szs, None, None)?;
+                typed.write_batch(&orig_sz_values, Some(&orig_sz_def_levels), None)?;
             }
             col.close()?;
         }
@@ -8330,7 +8346,8 @@ mod tests {
         assert_eq!(recovered.len(), 2);
         assert_eq!(recovered[0].oid, 33);
         assert_eq!(recovered[0].event, "add");
-        assert_eq!(recovered[0].raw_sz, None);
+        assert_eq!(recovered[0].orig_sz, 0);
+        assert_eq!(recovered[0].raw_sz, Some(12345));
         assert_eq!(recovered[0].is_trigger, Some(false));
         assert_eq!(recovered[0].tif, "Alo");
         assert_eq!(recovered[0].reduce_only, Some(false));
@@ -8359,6 +8376,12 @@ mod tests {
         assert_eq!(encode_hft_lifetime(300_001), Some(-5));
         assert_eq!(encode_hft_lifetime(330_000), Some(-6));
         assert_eq!(encode_hft_lifetime(359_999), Some(-6));
+    }
+
+    #[test]
+    fn hft_diff_local_recovery_keeps_only_small_signal_stop_spans() {
+        assert!(should_keep_hft_diff_local_recovery(50_000));
+        assert!(!should_keep_hft_diff_local_recovery(50_001));
     }
 
     #[test]
