@@ -18,9 +18,12 @@ chrono = "0.4"
 lz4 = "1.28.1"
 parquet = { version = "54.2.1", features = ["arrow"] }
 rust_decimal = "1.39.0"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "=1.0.219", features = ["derive"] }
 serde_json = "1.0"
 simd-json = { version = "0.14", features = ["serde_impl"] }
+aws-config = "1.8.8"
+aws-sdk-s3 = "1.108.0"
+async-compression = { version = "0.4.19", features = ["tokio", "lz4"] }
 
 [lints]
 workspace = true
