@@ -150,6 +150,8 @@ struct ResponseItem {
 #[derive(Debug, Default, Deserialize)]
 struct ResponseResult {
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
     response: Value,
 }
 
@@ -269,6 +271,17 @@ enum CmdEvent {
         raw_sz: Option<Decimal>,
         meta: OrderMeta,
     },
+    TrackTriggerAdd {
+        user: String,
+        oid: u64,
+        cloid: Option<String>,
+    },
+    TrackTriggerModify {
+        user: String,
+        old_order_ref: OrderRef,
+        new_oid: Option<u64>,
+        new_cloid: Option<String>,
+    },
     Skipped {
         user: Option<String>,
         oid: Option<u64>,
@@ -294,6 +307,12 @@ struct OrderState {
     is_position_tpsl: Option<bool>,
     tp_trigger_px: Option<Decimal>,
     sl_trigger_px: Option<Decimal>,
+}
+
+#[derive(Debug, Default)]
+struct TriggerOrderRefs {
+    oid_to_cloid: HashMap<u64, Option<UserCloidKey>>,
+    cloid_to_oid: HashMap<UserCloidKey, u64>,
 }
 
 #[derive(Debug)]
@@ -611,6 +630,31 @@ fn parse_statuses(response: &Value) -> &[Value] {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[])
+}
+
+fn response_type(response: &Value) -> Option<&str> {
+    response.get("type").and_then(Value::as_str)
+}
+
+fn is_dead_order_error(raw: &str) -> bool {
+    raw.contains("Cannot modify canceled or filled order")
+}
+
+fn is_dead_order_modify_response(result: &ResponseResult) -> bool {
+    if result.status.as_deref().is_some_and(is_dead_order_error) {
+        return true;
+    }
+
+    if let Some(raw) = result.response.as_str() {
+        return is_dead_order_error(raw);
+    }
+
+    parse_statuses(&result.response).iter().any(|status| {
+        status
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(is_dead_order_error)
+    })
 }
 
 fn is_success_status(status: Option<&Value>) -> bool {
@@ -1355,9 +1399,6 @@ impl ReplicaCmdsReader {
                                 if asset != BTC_ASSET_ID {
                                     continue;
                                 }
-                                if meta.is_trigger {
-                                    continue;
-                                }
                                 let Some(user) = response_item.user.clone() else {
                                     continue;
                                 };
@@ -1372,6 +1413,10 @@ impl ReplicaCmdsReader {
                                 let Some(oid) = oid else {
                                     continue;
                                 };
+                                if meta.is_trigger {
+                                    events.push(CmdEvent::TrackTriggerAdd { user, oid, cloid });
+                                    continue;
+                                }
 
                                 if !has_resting && !is_gtc {
                                     continue;
@@ -1455,21 +1500,34 @@ impl ReplicaCmdsReader {
                             let Some(old_order_ref) = get_order_ref(action, &["oid", "cloid"]) else {
                                 continue;
                             };
+                            if is_dead_order_modify_response(&response_item.res) {
+                                continue;
+                            }
 
                             let statuses = parse_statuses(&response_item.res.response);
                             let Some(status) = statuses.first() else {
-                                eprintln!(
-                                    "[warn] block={} user={} modify returned no statuses; treating as cancel-only old_ref={:?} response_type={:?}",
-                                    block_number,
-                                    user,
-                                    old_order_ref,
-                                    response_item.res.response.get("type").and_then(Value::as_str)
-                                );
-                                events.push(CmdEvent::Cancel {
-                                    user: Some(user.clone()),
-                                    order_ref: old_order_ref,
-                                    fallback_on_missing: true,
-                                });
+                                if meta.is_trigger {
+                                    eprintln!(
+                                        "[warn] block={} user={} trigger modify returned no statuses; skipping old_ref={:?} response_type={:?}",
+                                        block_number,
+                                        user,
+                                        old_order_ref,
+                                        response_type(&response_item.res.response)
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[warn] block={} user={} modify returned no statuses; treating as cancel-only old_ref={:?} response_type={:?}",
+                                        block_number,
+                                        user,
+                                        old_order_ref,
+                                        response_type(&response_item.res.response)
+                                    );
+                                    events.push(CmdEvent::Cancel {
+                                        user: Some(user.clone()),
+                                        order_ref: old_order_ref,
+                                        fallback_on_missing: true,
+                                    });
+                                }
                                 continue;
                             };
                             let is_gtc =
@@ -1477,6 +1535,17 @@ impl ReplicaCmdsReader {
                             let oid_from_resting =
                                 status.get("resting").and_then(|resting| get_u64(resting, &["oid"]));
                             let oid_from_filled = status.get("filled").and_then(|filled| get_u64(filled, &["oid"]));
+                            if meta.is_trigger {
+                                let new_oid =
+                                    oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
+                                events.push(CmdEvent::TrackTriggerModify {
+                                    user,
+                                    old_order_ref,
+                                    new_oid,
+                                    new_cloid,
+                                });
+                                continue;
+                            }
 
                             let (new_sz, raw_sz, invalid_filled_total_sz) = match parse_booked_and_raw_sz(sz, status) {
                                 BookedSzDecision::Booked { booked_sz, raw_sz } => (booked_sz, raw_sz, false),
@@ -1529,14 +1598,26 @@ impl ReplicaCmdsReader {
                                 let Some(old_order_ref) = get_order_ref(modify, &["oid", "cloid"]) else {
                                     continue;
                                 };
-                                let Some(status) = statuses.get(idx) else {
+                                let status = statuses.get(idx);
+                                if status.is_none() && meta.is_trigger {
+                                    eprintln!(
+                                        "[warn] block={} user={} trigger batchModify item={} returned no statuses; skipping old_ref={:?} response_type={:?}",
+                                        block_number,
+                                        user,
+                                        idx,
+                                        old_order_ref,
+                                        response_type(&response_item.res.response)
+                                    );
+                                    continue;
+                                }
+                                if status.is_none() && !meta.is_trigger {
                                     eprintln!(
                                         "[warn] block={} user={} batchModify item={} returned no statuses; treating as cancel-only old_ref={:?} response_type={:?}",
                                         block_number,
                                         user,
                                         idx,
                                         old_order_ref,
-                                        response_item.res.response.get("type").and_then(Value::as_str)
+                                        response_type(&response_item.res.response)
                                     );
                                     events.push(CmdEvent::Cancel {
                                         user: Some(user),
@@ -1544,13 +1625,31 @@ impl ReplicaCmdsReader {
                                         fallback_on_missing: true,
                                     });
                                     continue;
-                                };
+                                }
+                                if status
+                                    .and_then(|status| status.get("error").and_then(Value::as_str))
+                                    .is_some_and(is_dead_order_error)
+                                {
+                                    continue;
+                                }
+                                let status = status.unwrap();
                                 let is_gtc =
                                     meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
                                 let oid_from_resting =
                                     status.get("resting").and_then(|resting| get_u64(resting, &["oid"]));
                                 let oid_from_filled =
                                     status.get("filled").and_then(|filled| get_u64(filled, &["oid"]));
+                                if meta.is_trigger {
+                                    let new_oid =
+                                        oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
+                                    events.push(CmdEvent::TrackTriggerModify {
+                                        user,
+                                        old_order_ref,
+                                        new_oid,
+                                        new_cloid,
+                                    });
+                                    continue;
+                                }
 
                                 let (new_sz, raw_sz, invalid_filled_total_sz) =
                                     match parse_booked_and_raw_sz(sz, status) {
@@ -1650,6 +1749,48 @@ fn resolve_order_ref(
                 .copied()
         }
     }
+}
+
+fn resolve_trigger_ref(
+    order_ref: &OrderRef,
+    user: Option<&str>,
+    trigger_refs: &TriggerOrderRefs,
+) -> Option<u64> {
+    match order_ref {
+        OrderRef::Oid(oid) => trigger_refs.oid_to_cloid.contains_key(oid).then_some(*oid),
+        OrderRef::Cloid(cloid) => {
+            let user = user?;
+            trigger_refs
+                .cloid_to_oid
+                .get(&UserCloidKey {
+                    user: user.to_owned(),
+                    cloid: cloid.clone(),
+                })
+                .copied()
+        }
+    }
+}
+
+fn remove_trigger_ref(trigger_refs: &mut TriggerOrderRefs, oid: u64) -> bool {
+    let Some(cloid_key) = trigger_refs.oid_to_cloid.remove(&oid) else {
+        return false;
+    };
+    if let Some(cloid_key) = cloid_key {
+        trigger_refs.cloid_to_oid.remove(&cloid_key);
+    }
+    true
+}
+
+fn insert_trigger_ref(trigger_refs: &mut TriggerOrderRefs, user: &str, oid: u64, cloid: Option<&str>) {
+    remove_trigger_ref(trigger_refs, oid);
+    let cloid_key = cloid.map(|cloid| UserCloidKey {
+        user: user.to_owned(),
+        cloid: cloid.to_owned(),
+    });
+    if let Some(cloid_key) = &cloid_key {
+        trigger_refs.cloid_to_oid.insert(cloid_key.clone(), oid);
+    }
+    trigger_refs.oid_to_cloid.insert(oid, cloid_key);
 }
 
 fn remove_live_order(
@@ -1759,6 +1900,7 @@ fn process_block(
     rows: &mut RowBuffer,
     orders: &mut HashMap<u64, OrderState>,
     cloid_to_oid: &mut HashMap<UserCloidKey, u64>,
+    trigger_refs: &mut TriggerOrderRefs,
     writer: &mut ArrowWriter<File>,
     schema: &Arc<Schema>,
 ) -> Result<()> {
@@ -1789,6 +1931,10 @@ fn process_block(
                     order_ref,
                     fallback_on_missing,
                 } => {
+                    if let Some(trigger_oid) = resolve_trigger_ref(order_ref, user.as_deref(), trigger_refs) {
+                        remove_trigger_ref(trigger_refs, trigger_oid);
+                        continue;
+                    }
                     let resolved_oid = resolve_order_ref(order_ref, user.as_deref(), cloid_to_oid);
                     if resolved_oid.is_none()
                         && matches!(order_ref, OrderRef::Cloid(_))
@@ -1980,6 +2126,22 @@ fn process_block(
                         }
                     }
                 }
+                CmdEvent::TrackTriggerAdd { user, oid, cloid } => {
+                    insert_trigger_ref(trigger_refs, user, *oid, cloid.as_deref());
+                }
+                CmdEvent::TrackTriggerModify {
+                    user,
+                    old_order_ref,
+                    new_oid,
+                    new_cloid,
+                } => {
+                    if let Some(old_oid) = resolve_trigger_ref(old_order_ref, Some(user.as_str()), trigger_refs) {
+                        remove_trigger_ref(trigger_refs, old_oid);
+                    }
+                    if let Some(new_oid) = new_oid {
+                        insert_trigger_ref(trigger_refs, user, *new_oid, new_cloid.as_deref());
+                    }
+                }
                 CmdEvent::Skipped { user, oid, event, status } => {
                     if emit_rows {
                         let oid = oid.map(i64::try_from).transpose()?;
@@ -2020,6 +2182,10 @@ fn process_block(
         }
 
         for (user, order_ref, fallback_on_missing) in deferred_cancels.drain(..) {
+            if let Some(trigger_oid) = resolve_trigger_ref(&order_ref, user.as_deref(), trigger_refs) {
+                remove_trigger_ref(trigger_refs, trigger_oid);
+                continue;
+            }
             let resolved_oid = resolve_order_ref(&order_ref, user.as_deref(), cloid_to_oid);
             let mut emitted_remove = false;
 
@@ -2327,6 +2493,7 @@ async fn main() -> Result<()> {
     let mut rows = RowBuffer::default();
     let mut orders: HashMap<u64, OrderState> = HashMap::new();
     let mut cloid_to_oid: HashMap<UserCloidKey, u64> = HashMap::new();
+    let mut trigger_refs = TriggerOrderRefs::default();
     let started_at = Instant::now();
     let mut processed_blocks: u64 = 0;
     eprintln!("[phase] processing blocks ...");
@@ -2363,6 +2530,7 @@ async fn main() -> Result<()> {
                     &mut rows,
                     &mut orders,
                     &mut cloid_to_oid,
+                    &mut trigger_refs,
                     writer.as_mut().unwrap(),
                     &schema,
                 )?;
@@ -2394,6 +2562,7 @@ async fn main() -> Result<()> {
                     &mut rows,
                     &mut orders,
                     &mut cloid_to_oid,
+                    &mut trigger_refs,
                     writer.as_mut().unwrap(),
                     &schema,
                 )?;
@@ -2424,6 +2593,7 @@ async fn main() -> Result<()> {
                     &mut rows,
                     &mut orders,
                     &mut cloid_to_oid,
+                    &mut trigger_refs,
                     writer.as_mut().unwrap(),
                     &schema,
                 )?;
