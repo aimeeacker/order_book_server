@@ -1,21 +1,21 @@
 #![allow(unused_crate_dependencies)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use async_compression::tokio::bufread::Lz4Decoder;
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::builder::{
     BooleanBuilder, Decimal128Builder, Int32Builder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use async_compression::tokio::bufread::Lz4Decoder;
+use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::RequestPayer;
-use aws_sdk_s3::Client as S3Client;
 use chrono::{Datelike, NaiveDateTime, Timelike};
 use clap::Parser;
 use parquet::arrow::ArrowWriter;
@@ -66,10 +66,7 @@ struct Args {
 #[derive(Debug, Clone)]
 enum InputSource {
     LocalFile(PathBuf),
-    S3Prefix {
-        bucket: String,
-        prefix: String,
-    },
+    S3Prefix { bucket: String, prefix: String },
 }
 
 impl InputSource {
@@ -81,10 +78,7 @@ impl InputSource {
             if bucket.is_empty() || prefix.is_empty() {
                 bail!("invalid S3 URI: {raw}. expected format: s3://bucket/prefix");
             }
-            return Ok(Self::S3Prefix {
-                bucket: bucket.to_owned(),
-                prefix: prefix.to_owned(),
-            });
+            return Ok(Self::S3Prefix { bucket: bucket.to_owned(), prefix: prefix.to_owned() });
         }
 
         Ok(Self::LocalFile(PathBuf::from(raw)))
@@ -98,15 +92,8 @@ impl InputSource {
 #[derive(Debug, Clone)]
 enum ReaderSource {
     LocalFile(PathBuf),
-    S3Keys {
-        bucket: String,
-        keys: Vec<String>,
-    },
-    S3HourlyFrom {
-        bucket: String,
-        prefix: String,
-        next_hour_ms: i64,
-    },
+    S3Keys { bucket: String, keys: Vec<String> },
+    S3HourlyFrom { bucket: String, prefix: String, next_hour_ms: i64 },
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,6 +263,10 @@ enum CmdEvent {
         oid: u64,
         cloid: Option<String>,
     },
+    TrackTriggerPending {
+        user: String,
+        cloid: Option<String>,
+    },
     TrackTriggerModify {
         user: String,
         old_order_ref: OrderRef,
@@ -313,6 +304,7 @@ struct OrderState {
 struct TriggerOrderRefs {
     oid_to_cloid: HashMap<u64, Option<UserCloidKey>>,
     cloid_to_oid: HashMap<UserCloidKey, u64>,
+    pending_by_user: HashMap<String, VecDeque<Option<String>>>,
 }
 
 #[derive(Debug)]
@@ -649,25 +641,25 @@ fn is_dead_order_modify_response(result: &ResponseResult) -> bool {
         return is_dead_order_error(raw);
     }
 
-    parse_statuses(&result.response).iter().any(|status| {
-        status
-            .get("error")
-            .and_then(Value::as_str)
-            .is_some_and(is_dead_order_error)
-    })
+    parse_statuses(&result.response)
+        .iter()
+        .any(|status| status.get("error").and_then(Value::as_str).is_some_and(is_dead_order_error))
 }
 
 fn is_success_status(status: Option<&Value>) -> bool {
+    status.and_then(Value::as_str).is_some_and(|raw| raw.eq_ignore_ascii_case("success"))
+}
+
+fn is_pending_trigger_status(status: &Value) -> bool {
     status
-        .and_then(Value::as_str)
-        .is_some_and(|raw| raw.eq_ignore_ascii_case("success"))
+        .as_str()
+        .is_some_and(|raw| raw.eq_ignore_ascii_case("waitingForTrigger") || raw.eq_ignore_ascii_case("waitingForFill"))
+        || status.get("waitingForTrigger").and_then(Value::as_bool).unwrap_or(false)
+        || status.get("waitingForFill").and_then(Value::as_bool).unwrap_or(false)
 }
 
 enum BookedSzDecision {
-    Booked {
-        booked_sz: Decimal,
-        raw_sz: Option<Decimal>,
-    },
+    Booked { booked_sz: Decimal, raw_sz: Option<Decimal> },
     FullyFilled,
     InvalidFilledTotalSz,
 }
@@ -735,9 +727,7 @@ async fn list_lz4_keys(client: &S3Client, bucket: &str, prefix: &str, requester_
                     && !requester_pays
                     && service_error.code().is_some_and(|code| code == "AccessDenied")
                 {
-                    bail!(
-                        "failed to list s3://{bucket}/{prefix}: AccessDenied"
-                    );
+                    bail!("failed to list s3://{bucket}/{prefix}: AccessDenied");
                 }
                 bail!("failed to list s3://{bucket}/{prefix}: {err}");
             }
@@ -765,7 +755,12 @@ async fn list_lz4_keys(client: &S3Client, bucket: &str, prefix: &str, requester_
     Ok(keys)
 }
 
-async fn list_child_prefixes(client: &S3Client, bucket: &str, prefix: &str, requester_pays: bool) -> Result<Vec<String>> {
+async fn list_child_prefixes(
+    client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+    requester_pays: bool,
+) -> Result<Vec<String>> {
     let normalized_prefix = prefix.trim_matches('/');
     let list_prefix = format!("{normalized_prefix}/");
 
@@ -773,11 +768,7 @@ async fn list_child_prefixes(client: &S3Client, bucket: &str, prefix: &str, requ
     let mut prefixes = Vec::new();
 
     loop {
-        let mut request = client
-            .list_objects_v2()
-            .bucket(bucket)
-            .prefix(&list_prefix)
-            .delimiter("/");
+        let mut request = client.list_objects_v2().bucket(bucket).prefix(&list_prefix).delimiter("/");
         if requester_pays {
             request = request.request_payer(RequestPayer::Requester);
         }
@@ -833,9 +824,7 @@ async fn head_object_exists(client: &S3Client, bucket: &str, key: &str, requeste
         Err(err) => {
             if let Some(service_error) = err.as_service_error() {
                 let not_found = service_error.is_not_found()
-                    || service_error
-                        .code()
-                        .is_some_and(|code| matches!(code, "NotFound" | "NoSuchKey" | "404"));
+                    || service_error.code().is_some_and(|code| matches!(code, "NotFound" | "NoSuchKey" | "404"));
                 if not_found {
                     return Ok(false);
                 }
@@ -902,9 +891,7 @@ fn replica_chunk_starts_for_range(start_height: u64, height_span: u64) -> Result
     let mut chunks = Vec::new();
     while chunk <= end_chunk {
         chunks.push(chunk);
-        chunk = chunk
-            .checked_add(10_000)
-            .ok_or_else(|| anyhow!("replica chunk overflow while covering range"))?;
+        chunk = chunk.checked_add(10_000).ok_or_else(|| anyhow!("replica chunk overflow while covering range"))?;
     }
     Ok(chunks)
 }
@@ -967,13 +954,7 @@ async fn resolve_replica_keys_for_range(
 fn build_node_fills_hourly_key(prefix: &str, hour_start_ms: i64) -> Result<String> {
     let dt = chrono::DateTime::from_timestamp_millis(hour_start_ms)
         .ok_or_else(|| anyhow!("invalid hour timestamp millis: {hour_start_ms}"))?;
-    Ok(format!(
-        "{prefix}/hourly/{:04}{:02}{:02}/{}.lz4",
-        dt.year(),
-        dt.month(),
-        dt.day(),
-        dt.hour()
-    ))
+    Ok(format!("{prefix}/hourly/{:04}{:02}{:02}/{}.lz4", dt.year(), dt.month(), dt.day(), dt.hour()))
 }
 
 async fn first_replica_timestamp_ms(
@@ -1000,9 +981,7 @@ struct Lz4JsonLineReader {
 
 impl Lz4JsonLineReader {
     async fn new(source: ReaderSource, s3_client: Option<Arc<S3Client>>, requester_pays: bool) -> Result<Self> {
-        if matches!(source, ReaderSource::S3Keys { .. } | ReaderSource::S3HourlyFrom { .. })
-            && s3_client.is_none()
-        {
+        if matches!(source, ReaderSource::S3Keys { .. } | ReaderSource::S3HourlyFrom { .. }) && s3_client.is_none() {
             bail!("S3 input requires initialized S3 client");
         }
         Ok(Self {
@@ -1051,12 +1030,8 @@ impl Lz4JsonLineReader {
                         return Ok(None);
                     }
 
-                    if !self.requester_pays
-                        && service_error.code().is_some_and(|code| code == "AccessDenied")
-                    {
-                        bail!(
-                            "failed to fetch s3://{bucket}/{key}: AccessDenied"
-                        );
+                    if !self.requester_pays && service_error.code().is_some_and(|code| code == "AccessDenied") {
+                        bail!("failed to fetch s3://{bucket}/{key}: AccessDenied");
                     }
                 }
 
@@ -1070,12 +1045,7 @@ impl Lz4JsonLineReader {
     async fn open_next_reader(&mut self) -> Result<bool> {
         enum OpenPlan {
             Local(PathBuf),
-            S3Key {
-                bucket: String,
-                key: String,
-                allow_missing: bool,
-                advance_hour: bool,
-            },
+            S3Key { bucket: String, key: String, allow_missing: bool, advance_hour: bool },
             End,
         }
 
@@ -1094,51 +1064,29 @@ impl Lz4JsonLineReader {
                 } else {
                     let key = keys[self.next_key_idx].clone();
                     self.next_key_idx += 1;
-                    OpenPlan::S3Key {
-                        bucket: bucket.clone(),
-                        key,
-                        allow_missing: false,
-                        advance_hour: false,
-                    }
+                    OpenPlan::S3Key { bucket: bucket.clone(), key, allow_missing: false, advance_hour: false }
                 }
             }
-            ReaderSource::S3HourlyFrom {
-                bucket,
-                prefix,
-                next_hour_ms,
-            } => {
+            ReaderSource::S3HourlyFrom { bucket, prefix, next_hour_ms } => {
                 let key = build_node_fills_hourly_key(prefix, *next_hour_ms)?;
-                OpenPlan::S3Key {
-                    bucket: bucket.clone(),
-                    key,
-                    allow_missing: true,
-                    advance_hour: true,
-                }
+                OpenPlan::S3Key { bucket: bucket.clone(), key, allow_missing: true, advance_hour: true }
             }
         };
 
         match plan {
             OpenPlan::End => Ok(false),
             OpenPlan::Local(path) => {
-                let file = tokio::fs::File::open(&path)
-                    .await
-                    .with_context(|| format!("failed to open {}", path.display()))?;
+                let file =
+                    tokio::fs::File::open(&path).await.with_context(|| format!("failed to open {}", path.display()))?;
                 self.current_reader = Some(Self::make_lz4_reader(file));
                 Ok(true)
             }
-            OpenPlan::S3Key {
-                bucket,
-                key,
-                allow_missing,
-                advance_hour,
-            } => {
+            OpenPlan::S3Key { bucket, key, allow_missing, advance_hour } => {
                 let maybe_reader = self.fetch_s3_reader(&bucket, &key, allow_missing).await?;
                 let Some(reader) = maybe_reader else {
                     return Ok(false);
                 };
-                if advance_hour
-                    && let ReaderSource::S3HourlyFrom { next_hour_ms, .. } = &mut self.source
-                {
+                if advance_hour && let ReaderSource::S3HourlyFrom { next_hour_ms, .. } = &mut self.source {
                     *next_hour_ms += HOUR_MS;
                 }
                 self.current_reader = Some(reader);
@@ -1157,12 +1105,8 @@ impl Lz4JsonLineReader {
             }
 
             self.line.clear();
-            let bytes_read = self
-                .current_reader
-                .as_mut()
-                .expect("current_reader checked")
-                .read_until(b'\n', &mut self.line)
-                .await?;
+            let bytes_read =
+                self.current_reader.as_mut().expect("current_reader checked").read_until(b'\n', &mut self.line).await?;
             if bytes_read == 0 {
                 self.current_reader = None;
                 continue;
@@ -1185,10 +1129,7 @@ impl NodeFillsReader {
         requester_pays: bool,
         block_range: Option<(u64, u64)>,
     ) -> Result<Self> {
-        Ok(Self {
-            reader: Lz4JsonLineReader::new(source, s3_client, requester_pays).await?,
-            block_range,
-        })
+        Ok(Self { reader: Lz4JsonLineReader::new(source, s3_client, requester_pays).await?, block_range })
     }
 
     async fn next_batch(&mut self) -> Result<Option<NodeFillsBatch>> {
@@ -1282,10 +1223,7 @@ impl FillsTimeCursor {
             }
 
             let ts_ns = parse_timestamp_ns(&block.block_time)?;
-            return Ok(Some(BlockIndex {
-                ts_ns,
-                block_number: block.block_number,
-            }));
+            return Ok(Some(BlockIndex { ts_ns, block_number: block.block_number }));
         }
     }
 
@@ -1312,10 +1250,7 @@ impl FillsTimeCursor {
 
         if self.exhausted
             && self.curr.is_none()
-            && self
-                .prev
-                .as_ref()
-                .is_some_and(|last| ts_ns > last.ts_ns.saturating_add(tolerance_ns))
+            && self.prev.as_ref().is_some_and(|last| ts_ns > last.ts_ns.saturating_add(tolerance_ns))
         {
             return Ok(BlockMatch::PastEnd);
         }
@@ -1342,13 +1277,7 @@ impl ReplicaCmdsReader {
     ) -> Result<Self> {
         Ok(Self {
             reader: Lz4JsonLineReader::new(source, s3_client.clone(), requester_pays).await?,
-            fills_time_cursor: FillsTimeCursor::new(
-                fills_time_source,
-                s3_client,
-                requester_pays,
-                block_range,
-            )
-            .await?,
+            fills_time_cursor: FillsTimeCursor::new(fills_time_source, s3_client, requester_pays, block_range).await?,
             tolerance_ns,
             block_range,
         })
@@ -1404,19 +1333,22 @@ impl ReplicaCmdsReader {
                                 };
 
                                 let has_resting = status.get("resting").is_some();
-                                let is_gtc =
-                                    meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
+                                let is_gtc = meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
                                 let oid_from_resting =
                                     status.get("resting").and_then(|resting| get_u64(resting, &["oid"]));
                                 let oid_from_filled = status.get("filled").and_then(|filled| get_u64(filled, &["oid"]));
                                 let oid = oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
+                                if meta.is_trigger {
+                                    if let Some(oid) = oid {
+                                        events.push(CmdEvent::TrackTriggerAdd { user, oid, cloid });
+                                    } else if is_pending_trigger_status(status) {
+                                        events.push(CmdEvent::TrackTriggerPending { user, cloid });
+                                    }
+                                    continue;
+                                }
                                 let Some(oid) = oid else {
                                     continue;
                                 };
-                                if meta.is_trigger {
-                                    events.push(CmdEvent::TrackTriggerAdd { user, oid, cloid });
-                                    continue;
-                                }
 
                                 if !has_resting && !is_gtc {
                                     continue;
@@ -1530,20 +1462,12 @@ impl ReplicaCmdsReader {
                                 }
                                 continue;
                             };
-                            let is_gtc =
-                                meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
-                            let oid_from_resting =
-                                status.get("resting").and_then(|resting| get_u64(resting, &["oid"]));
+                            let is_gtc = meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
+                            let oid_from_resting = status.get("resting").and_then(|resting| get_u64(resting, &["oid"]));
                             let oid_from_filled = status.get("filled").and_then(|filled| get_u64(filled, &["oid"]));
                             if meta.is_trigger {
-                                let new_oid =
-                                    oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
-                                events.push(CmdEvent::TrackTriggerModify {
-                                    user,
-                                    old_order_ref,
-                                    new_oid,
-                                    new_cloid,
-                                });
+                                let new_oid = oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
+                                events.push(CmdEvent::TrackTriggerModify { user, old_order_ref, new_oid, new_cloid });
                                 continue;
                             }
 
@@ -1633,12 +1557,10 @@ impl ReplicaCmdsReader {
                                     continue;
                                 }
                                 let status = status.unwrap();
-                                let is_gtc =
-                                    meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
+                                let is_gtc = meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
                                 let oid_from_resting =
                                     status.get("resting").and_then(|resting| get_u64(resting, &["oid"]));
-                                let oid_from_filled =
-                                    status.get("filled").and_then(|filled| get_u64(filled, &["oid"]));
+                                let oid_from_filled = status.get("filled").and_then(|filled| get_u64(filled, &["oid"]));
                                 if meta.is_trigger {
                                     let new_oid =
                                         oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
@@ -1741,32 +1663,17 @@ fn resolve_order_ref(
         OrderRef::Oid(oid) => Some(*oid),
         OrderRef::Cloid(cloid) => {
             let user = user?;
-            cloid_to_oid
-                .get(&UserCloidKey {
-                    user: user.to_owned(),
-                    cloid: cloid.clone(),
-                })
-                .copied()
+            cloid_to_oid.get(&UserCloidKey { user: user.to_owned(), cloid: cloid.clone() }).copied()
         }
     }
 }
 
-fn resolve_trigger_ref(
-    order_ref: &OrderRef,
-    user: Option<&str>,
-    trigger_refs: &TriggerOrderRefs,
-) -> Option<u64> {
+fn resolve_trigger_ref(order_ref: &OrderRef, user: Option<&str>, trigger_refs: &TriggerOrderRefs) -> Option<u64> {
     match order_ref {
         OrderRef::Oid(oid) => trigger_refs.oid_to_cloid.contains_key(oid).then_some(*oid),
         OrderRef::Cloid(cloid) => {
             let user = user?;
-            trigger_refs
-                .cloid_to_oid
-                .get(&UserCloidKey {
-                    user: user.to_owned(),
-                    cloid: cloid.clone(),
-                })
-                .copied()
+            trigger_refs.cloid_to_oid.get(&UserCloidKey { user: user.to_owned(), cloid: cloid.clone() }).copied()
         }
     }
 }
@@ -1775,18 +1682,53 @@ fn remove_trigger_ref(trigger_refs: &mut TriggerOrderRefs, oid: u64) -> bool {
     let Some(cloid_key) = trigger_refs.oid_to_cloid.remove(&oid) else {
         return false;
     };
-    if let Some(cloid_key) = cloid_key {
+    if let Some(ref cloid_key) = cloid_key {
         trigger_refs.cloid_to_oid.remove(&cloid_key);
+    }
+    true
+}
+
+fn insert_pending_trigger_ref(trigger_refs: &mut TriggerOrderRefs, user: &str, cloid: Option<&str>) {
+    trigger_refs
+        .pending_by_user
+        .entry(user.to_owned())
+        .or_default()
+        .push_back(cloid.map(ToOwned::to_owned));
+}
+
+fn remove_pending_trigger_ref_by_cloid(trigger_refs: &mut TriggerOrderRefs, user: &str, cloid: &str) -> bool {
+    let Some(pending) = trigger_refs.pending_by_user.get_mut(user) else {
+        return false;
+    };
+    let Some(idx) = pending.iter().position(|pending_cloid| pending_cloid.as_deref() == Some(cloid)) else {
+        return false;
+    };
+    pending.remove(idx);
+    if pending.is_empty() {
+        trigger_refs.pending_by_user.remove(user);
+    }
+    true
+}
+
+fn consume_pending_trigger_ref_for_user(trigger_refs: &mut TriggerOrderRefs, user: &str) -> bool {
+    let Some(pending) = trigger_refs.pending_by_user.get_mut(user) else {
+        return false;
+    };
+    if pending.pop_front().is_none() {
+        return false;
+    }
+    if pending.is_empty() {
+        trigger_refs.pending_by_user.remove(user);
     }
     true
 }
 
 fn insert_trigger_ref(trigger_refs: &mut TriggerOrderRefs, user: &str, oid: u64, cloid: Option<&str>) {
     remove_trigger_ref(trigger_refs, oid);
-    let cloid_key = cloid.map(|cloid| UserCloidKey {
-        user: user.to_owned(),
-        cloid: cloid.to_owned(),
-    });
+    if let Some(cloid) = cloid {
+        remove_pending_trigger_ref_by_cloid(trigger_refs, user, cloid);
+    }
+    let cloid_key = cloid.map(|cloid| UserCloidKey { user: user.to_owned(), cloid: cloid.to_owned() });
     if let Some(cloid_key) = &cloid_key {
         trigger_refs.cloid_to_oid.insert(cloid_key.clone(), oid);
     }
@@ -1800,10 +1742,7 @@ fn remove_live_order(
 ) -> Option<OrderState> {
     let state = orders.remove(&oid)?;
     if let Some(cloid) = &state.cloid {
-        cloid_to_oid.remove(&UserCloidKey {
-            user: state.user.clone(),
-            cloid: cloid.clone(),
-        });
+        cloid_to_oid.remove(&UserCloidKey { user: state.user.clone(), cloid: cloid.clone() });
     }
     Some(state)
 }
@@ -1821,13 +1760,7 @@ fn insert_live_order(
     meta: &OrderMeta,
 ) {
     if let Some(cloid) = cloid {
-        cloid_to_oid.insert(
-            UserCloidKey {
-                user: user.to_owned(),
-                cloid: cloid.to_owned(),
-            },
-            oid,
-        );
+        cloid_to_oid.insert(UserCloidKey { user: user.to_owned(), cloid: cloid.to_owned() }, oid);
     }
     orders.insert(
         oid,
@@ -1901,6 +1834,7 @@ fn process_block(
     orders: &mut HashMap<u64, OrderState>,
     cloid_to_oid: &mut HashMap<UserCloidKey, u64>,
     trigger_refs: &mut TriggerOrderRefs,
+    known_non_trigger_oids: &mut HashSet<u64>,
     writer: &mut ArrowWriter<File>,
     schema: &Arc<Schema>,
 ) -> Result<()> {
@@ -1910,6 +1844,7 @@ fn process_block(
         for event in &events {
             match event {
                 CmdEvent::Add { user, oid, cloid, side, px, sz, raw_sz, meta } => {
+                    known_non_trigger_oids.insert(*oid);
                     insert_live_order(
                         orders,
                         cloid_to_oid,
@@ -1926,20 +1861,18 @@ fn process_block(
                         push_add_row(rows, block_number, block_time_ms, user, *oid, side, *px, *sz, *raw_sz, meta)?;
                     }
                 }
-                CmdEvent::Cancel {
-                    user,
-                    order_ref,
-                    fallback_on_missing,
-                } => {
+                CmdEvent::Cancel { user, order_ref, fallback_on_missing } => {
                     if let Some(trigger_oid) = resolve_trigger_ref(order_ref, user.as_deref(), trigger_refs) {
                         remove_trigger_ref(trigger_refs, trigger_oid);
                         continue;
                     }
-                    let resolved_oid = resolve_order_ref(order_ref, user.as_deref(), cloid_to_oid);
-                    if resolved_oid.is_none()
-                        && matches!(order_ref, OrderRef::Cloid(_))
-                        && user.is_some()
+                    if let (Some(user), OrderRef::Cloid(cloid)) = (user.as_deref(), order_ref)
+                        && remove_pending_trigger_ref_by_cloid(trigger_refs, user, cloid)
                     {
+                        continue;
+                    }
+                    let resolved_oid = resolve_order_ref(order_ref, user.as_deref(), cloid_to_oid);
+                    if resolved_oid.is_none() && matches!(order_ref, OrderRef::Cloid(_)) && user.is_some() {
                         deferred_cancels.push((user.clone(), order_ref.clone(), *fallback_on_missing));
                         continue;
                     }
@@ -1982,6 +1915,15 @@ fn process_block(
                         }
                     }
 
+                    if !emitted_remove && *fallback_on_missing {
+                        if let (Some(user), OrderRef::Oid(oid)) = (user.as_deref(), order_ref)
+                            && !known_non_trigger_oids.contains(oid)
+                            && consume_pending_trigger_ref_for_user(trigger_refs, user)
+                        {
+                            continue;
+                        }
+                    }
+
                     if emit_rows && !emitted_remove && *fallback_on_missing {
                         let fallback_oid = match order_ref {
                             OrderRef::Oid(oid) => Some(i64::try_from(*oid)?),
@@ -2017,17 +1959,7 @@ fn process_block(
                         });
                     }
                 }
-                CmdEvent::Modify {
-                    user,
-                    old_order_ref,
-                    new_oid,
-                    new_cloid,
-                    side,
-                    px,
-                    sz,
-                    raw_sz,
-                    meta,
-                } => {
+                CmdEvent::Modify { user, old_order_ref, new_oid, new_cloid, side, px, sz, raw_sz, meta } => {
                     let mut emitted_remove = false;
 
                     if let Some(old_oid) = resolve_order_ref(old_order_ref, Some(user.as_str()), cloid_to_oid) {
@@ -2097,6 +2029,7 @@ fn process_block(
 
                     if !meta.is_trigger {
                         if let Some(new_oid) = new_oid {
+                            known_non_trigger_oids.insert(*new_oid);
                             insert_live_order(
                                 orders,
                                 cloid_to_oid,
@@ -2129,17 +2062,19 @@ fn process_block(
                 CmdEvent::TrackTriggerAdd { user, oid, cloid } => {
                     insert_trigger_ref(trigger_refs, user, *oid, cloid.as_deref());
                 }
-                CmdEvent::TrackTriggerModify {
-                    user,
-                    old_order_ref,
-                    new_oid,
-                    new_cloid,
-                } => {
+                CmdEvent::TrackTriggerPending { user, cloid } => {
+                    insert_pending_trigger_ref(trigger_refs, user, cloid.as_deref());
+                }
+                CmdEvent::TrackTriggerModify { user, old_order_ref, new_oid, new_cloid } => {
                     if let Some(old_oid) = resolve_trigger_ref(old_order_ref, Some(user.as_str()), trigger_refs) {
                         remove_trigger_ref(trigger_refs, old_oid);
+                    } else if let OrderRef::Cloid(cloid) = old_order_ref {
+                        remove_pending_trigger_ref_by_cloid(trigger_refs, user, cloid);
                     }
                     if let Some(new_oid) = new_oid {
                         insert_trigger_ref(trigger_refs, user, *new_oid, new_cloid.as_deref());
+                    } else if new_cloid.is_some() {
+                        insert_pending_trigger_ref(trigger_refs, user, new_cloid.as_deref());
                     }
                 }
                 CmdEvent::Skipped { user, oid, event, status } => {
@@ -2186,6 +2121,11 @@ fn process_block(
                 remove_trigger_ref(trigger_refs, trigger_oid);
                 continue;
             }
+            if let (Some(user), OrderRef::Cloid(cloid)) = (user.as_deref(), &order_ref)
+                && remove_pending_trigger_ref_by_cloid(trigger_refs, user, cloid)
+            {
+                continue;
+            }
             let resolved_oid = resolve_order_ref(&order_ref, user.as_deref(), cloid_to_oid);
             let mut emitted_remove = false;
 
@@ -2226,6 +2166,15 @@ fn process_block(
                 }
             }
 
+            if !emitted_remove && fallback_on_missing {
+                if let (Some(user), OrderRef::Oid(oid)) = (user.as_deref(), &order_ref)
+                    && !known_non_trigger_oids.contains(oid)
+                    && consume_pending_trigger_ref_for_user(trigger_refs, user)
+                {
+                    continue;
+                }
+            }
+
             if emit_rows && !emitted_remove && fallback_on_missing {
                 rows.push(OutputRow {
                     block_number: i64::try_from(block_number)?,
@@ -2257,11 +2206,7 @@ fn process_block(
     }
 
     if let Some(fills) = fills {
-        let taker_tids: HashSet<u64> = fills
-            .iter()
-            .filter(|fill| fill.crossed)
-            .filter_map(|fill| fill.tid)
-            .collect();
+        let taker_tids: HashSet<u64> = fills.iter().filter(|fill| fill.crossed).filter_map(|fill| fill.tid).collect();
 
         for fill in fills {
             let fill_time_ms = fill.block_time_ms;
@@ -2370,11 +2315,7 @@ fn process_block(
     Ok(())
 }
 
-fn finalize_output(
-    writer: ArrowWriter<File>,
-    rows: &mut RowBuffer,
-    schema: &Arc<Schema>,
-) -> Result<()> {
+fn finalize_output(writer: ArrowWriter<File>, rows: &mut RowBuffer, schema: &Arc<Schema>) -> Result<()> {
     let mut writer = writer;
     if let Some(batch) = rows.take_batch(schema)? {
         writer.write(&batch)?;
@@ -2405,8 +2346,7 @@ async fn main() -> Result<()> {
     };
 
     let replica_source = InputSource::parse(&args.replica_cmds).context("parsing --replica_cmds")?;
-    let node_fills_source =
-        InputSource::parse(&args.node_fills_by_block).context("parsing --node_fills_by_block")?;
+    let node_fills_source = InputSource::parse(&args.node_fills_by_block).context("parsing --node_fills_by_block")?;
     let s3_client = if replica_source.requires_s3() || node_fills_source.requires_s3() {
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest()).load().await;
         Some(Arc::new(S3Client::new(&config)))
@@ -2429,20 +2369,11 @@ async fn main() -> Result<()> {
             let Some(client) = s3_client.as_ref() else {
                 bail!("S3 replica_cmds requires initialized S3 client");
             };
-            let keys = resolve_replica_keys_for_range(
-                client,
-                bucket,
-                prefix,
-                start_height,
-                height_span,
-                requester_pays,
-            )
-            .await
-            .context("resolving replica_cmds keys from S3 layout")?;
-            ReaderSource::S3Keys {
-                bucket: bucket.clone(),
-                keys,
-            }
+            let keys =
+                resolve_replica_keys_for_range(client, bucket, prefix, start_height, height_span, requester_pays)
+                    .await
+                    .context("resolving replica_cmds keys from S3 layout")?;
+            ReaderSource::S3Keys { bucket: bucket.clone(), keys }
         }
     };
 
@@ -2462,12 +2393,7 @@ async fn main() -> Result<()> {
     };
 
     let mut fills_reader =
-        NodeFillsReader::new(
-            fills_reader_source.clone(),
-            s3_client.clone(),
-            requester_pays,
-            target_block_range,
-        )
+        NodeFillsReader::new(fills_reader_source.clone(), s3_client.clone(), requester_pays, target_block_range)
             .await
             .context("opening node_fills_by_block")?;
     let mut replica_reader = ReplicaCmdsReader::new(
@@ -2494,6 +2420,7 @@ async fn main() -> Result<()> {
     let mut orders: HashMap<u64, OrderState> = HashMap::new();
     let mut cloid_to_oid: HashMap<UserCloidKey, u64> = HashMap::new();
     let mut trigger_refs = TriggerOrderRefs::default();
+    let mut known_non_trigger_oids: HashSet<u64> = HashSet::new();
     let started_at = Instant::now();
     let mut processed_blocks: u64 = 0;
     eprintln!("[phase] processing blocks ...");
@@ -2518,9 +2445,8 @@ async fn main() -> Result<()> {
 
                 let replica = next_replica.take().unwrap();
                 let fills = next_fills.take().unwrap();
-                let emit_rows = target_block_range
-                    .map(|(start_height, _)| replica.block_number >= start_height)
-                    .unwrap_or(true);
+                let emit_rows =
+                    target_block_range.map(|(start_height, _)| replica.block_number >= start_height).unwrap_or(true);
                 process_block(
                     replica.block_number,
                     replica.block_time_ms,
@@ -2531,6 +2457,7 @@ async fn main() -> Result<()> {
                     &mut orders,
                     &mut cloid_to_oid,
                     &mut trigger_refs,
+                    &mut known_non_trigger_oids,
                     writer.as_mut().unwrap(),
                     &schema,
                 )?;
@@ -2550,9 +2477,8 @@ async fn main() -> Result<()> {
             }
             (Some(replica), Some(fills)) if replica.block_number < fills.block_number => {
                 let replica = next_replica.take().unwrap();
-                let emit_rows = target_block_range
-                    .map(|(start_height, _)| replica.block_number >= start_height)
-                    .unwrap_or(true);
+                let emit_rows =
+                    target_block_range.map(|(start_height, _)| replica.block_number >= start_height).unwrap_or(true);
                 process_block(
                     replica.block_number,
                     replica.block_time_ms,
@@ -2563,6 +2489,7 @@ async fn main() -> Result<()> {
                     &mut orders,
                     &mut cloid_to_oid,
                     &mut trigger_refs,
+                    &mut known_non_trigger_oids,
                     writer.as_mut().unwrap(),
                     &schema,
                 )?;
@@ -2581,9 +2508,8 @@ async fn main() -> Result<()> {
             }
             (Some(_), Some(_)) => {
                 let fills = next_fills.take().unwrap();
-                let emit_rows = target_block_range
-                    .map(|(start_height, _)| fills.block_number >= start_height)
-                    .unwrap_or(true);
+                let emit_rows =
+                    target_block_range.map(|(start_height, _)| fills.block_number >= start_height).unwrap_or(true);
                 process_block(
                     fills.block_number,
                     fills.block_time_ms,
@@ -2594,6 +2520,7 @@ async fn main() -> Result<()> {
                     &mut orders,
                     &mut cloid_to_oid,
                     &mut trigger_refs,
+                    &mut known_non_trigger_oids,
                     writer.as_mut().unwrap(),
                     &schema,
                 )?;

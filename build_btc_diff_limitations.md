@@ -5,7 +5,7 @@
 比较口径：
 
 - 参考文件：`/home/aimee/BTC_diff_HFT_951980001_952000000.parquet`
-- 当前程序输出样本：`btc_diff_951980001_span20000_matchfix9.parquet`
+- 当前程序输出样本：`/tmp/btc_diff_951980001_span20000_triggerfix_waitfill.parquet`
 - 重叠区间：`951980001..952000000`
 
 ## 输入与基本假设
@@ -143,26 +143,31 @@
 
 当前结果：
 
-- `remove/cancel`: `missing=1011`, `extra=104`
+- `remove/cancel`: `missing=1013`, `extra=80`
 - 新文件里的 `oid=NULL remove/cancel`: `597`
 
-`missing=1011` 的构成：
+`missing=1013` 的构成：
 
 - `604` 条：参考是非空 `oid canceled`，当前降级成了 `oid=NULL canceled`
 - `397` 条：`reduceOnlyCanceled`
 - `10` 条：`selfTradeCanceled`
 
-`extra=104` 的构成：
+`extra=80` 的构成：
 
-- 主体仍是 non-trigger `cancel`
-- 主体的原始响应都是 `status=ok, type=cancel, statuses[0]=success`
-- 这类行当前都表现为 non-null fallback cancel，且参考里没有对应 `user+oid` cancel
-- 还夹带极少量同 block 重复 fallback 和同块 add 后立刻 cancel 未完整还原的残差
+- 全部是 trigger `cancel` 的非空 `oid` 样本
+- 这类行当前都有 `status=canceled`，但参考里没有对应 `user+oid+block` 的 `remove/cancel`
+- 触发单里 `open->canceled` 的残差已压到 `0`（`has_open=0`）
 
 这组 extra 仍是当前程序和参考文件最主要的剩余策略差异之一：
 
-- 当前程序：保留 non-trigger `cancel success` 的 non-null fallback
-- 参考文件：并不总是记录这类 cancel
+- 当前程序：当 cancel 成功但本地无法证明是 trigger 时，仍会保留 non-null fallback
+- 参考文件：并不总是记录这类 cancel（尤其是区间前状态不可见时）
+
+补充（触发单修复后）：
+
+- `waitingForTrigger / waitingForFill` 已纳入 trigger pending 识别
+- 可避免的 `open->canceled` trigger 误落库已修复
+- 剩余 `extra=80` 更偏向“区间前历史状态不可见”导致的触发单 cancel 差异
 
 ## 触发单和参考文件的差异
 
@@ -270,3 +275,24 @@
 
 - 一个仅基于公开 `cmds + fills_by_block` 可见信息重建的 diff 生成器
 - 它可以非常接近参考文件，但不能保证在所有 cancel reason、trigger 链路、pre-range live orders、以及 `type=default` 降级返回上完全等价
+
+## 完整 Snapshot 可避免的差异
+
+这里的“完整 snapshot”指区间起点时刻的完整 live state（至少包括非 trigger/trigger 的 `user + oid + cloid + remaining_sz`）。
+
+可明显降低或消除的项：
+
+- `remove/fill` 中由 no-warmup 造成的缺失
+  - 起点前已在簿订单若能被 warmup，后续 fill 扣减到 `0` 可正常产出 `remove/fill`
+- `remove/cancel` 中一部分 `oid=NULL` 降级
+  - 起点前已存在订单的 `cloid->oid` 可直接命中，不再走 fallback
+- 触发单 `remove/cancel extra` 中由“区间前已存在 trigger 订单”造成的残差
+  - 当前剩余 `extra=80` 基本都属于此类可见性问题
+
+即使有完整 snapshot 仍不能完全消除的项：
+
+- `update/cancel` 全缺失（当前实现未输出该类型）
+- `type=default` / `no-status` 返回导致的新 `oid` 不可恢复
+- `filled-only GTC` 的入簿判断偏差（当前仍有 `new/add extra=2`）
+- reduce-only 超仓等场景的 `sz/raw_sz` 偏差（缺少持仓快照与撮合细节）
+- 少量 `update/fill` 行级 multiplicity 偏差（同 block、同 oid 多笔 fill 拆分差异）
