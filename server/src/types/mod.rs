@@ -1,13 +1,16 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use alloy::primitives::Address;
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    order_book::types::Side,
+    order_book::types::{Coin, MULTIPLIER, Px, Side, Sz},
     types::node_data::{NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
 };
 
+pub(crate) mod binary_protocol;
 pub(crate) mod inner;
 pub(crate) mod node_data;
 pub(crate) mod subscription;
@@ -115,6 +118,27 @@ pub(crate) struct L4Order {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct SnapshotOrder {
+    pub coin: Coin,
+    pub side: Side,
+    #[serde(deserialize_with = "deserialize_px")]
+    pub limit_px: Px,
+    #[serde(deserialize_with = "deserialize_sz")]
+    pub sz: Sz,
+    pub oid: u64,
+    pub timestamp: u64,
+    pub trigger_condition: String,
+    pub is_trigger: bool,
+    pub trigger_px: String,
+    pub is_position_tpsl: bool,
+    pub reduce_only: bool,
+    pub order_type: String,
+    pub tif: Option<String>,
+    pub cloid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum OrderDiff {
     #[serde(rename_all = "camelCase")]
     New {
@@ -126,6 +150,116 @@ pub(crate) enum OrderDiff {
         new_sz: String,
     },
     Remove,
+}
+
+fn deserialize_px<'de, D>(deserializer: D) -> Result<Px, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct PxVisitor;
+
+    impl Visitor<'_> for PxVisitor {
+        type Value = Px;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("string or number for limitPx")
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Px, E>
+        where
+            E: de::Error,
+        {
+            Px::parse_from_str(v).map_err(E::custom)
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Px, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&v)
+        }
+
+        fn visit_f64<E>(self, v: f64) -> Result<Px, E>
+        where
+            E: de::Error,
+        {
+            Ok(Px::new((v * MULTIPLIER).round() as u64))
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Px, E>
+        where
+            E: de::Error,
+        {
+            Ok(Px::new((v as f64 * MULTIPLIER).round() as u64))
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Px, E>
+        where
+            E: de::Error,
+        {
+            if v < 0 {
+                return Err(E::custom("limitPx must be non-negative"));
+            }
+            Ok(Px::new((v as f64 * MULTIPLIER).round() as u64))
+        }
+    }
+
+    deserializer.deserialize_any(PxVisitor)
+}
+
+fn deserialize_sz<'de, D>(deserializer: D) -> Result<Sz, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct SzVisitor;
+
+    impl Visitor<'_> for SzVisitor {
+        type Value = Sz;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("string or number for sz")
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Sz, E>
+        where
+            E: de::Error,
+        {
+            Sz::parse_from_str(v).map_err(E::custom)
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Sz, E>
+        where
+            E: de::Error,
+        {
+            self.visit_str(&v)
+        }
+
+        fn visit_f64<E>(self, v: f64) -> Result<Sz, E>
+        where
+            E: de::Error,
+        {
+            Ok(Sz::new((v * MULTIPLIER).round() as u64))
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Sz, E>
+        where
+            E: de::Error,
+        {
+            Ok(Sz::new((v as f64 * MULTIPLIER).round() as u64))
+        }
+
+        fn visit_i64<E>(self, v: i64) -> Result<Sz, E>
+        where
+            E: de::Error,
+        {
+            if v < 0 {
+                return Err(E::custom("sz must be non-negative"));
+            }
+            Ok(Sz::new((v as f64 * MULTIPLIER).round() as u64))
+        }
+    }
+
+    deserializer.deserialize_any(SzVisitor)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,17 +2,18 @@
 use std::net::Ipv4Addr;
 
 use clap::Parser;
+use env_logger::{Builder, Env};
 use server::{Result, run_websocket_server};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Args {
     /// Server address (e.g., 0.0.0.0)
-    #[arg(long)]
+    #[arg(long, default_value_t = Ipv4Addr::new(0, 0, 0, 0))]
     address: Ipv4Addr,
 
     /// Server port (e.g., 8000)
-    #[arg(long)]
+    #[arg(long, default_value_t = 8080)]
     port: u16,
 
     /// Compression level for WebSocket connections.
@@ -29,7 +30,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    Builder::from_env(Env::default().default_filter_or("info")).format_timestamp_micros().init();
 
     let args = Args::parse();
 

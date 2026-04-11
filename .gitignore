@@ -1,1 +1,34 @@
-target/
+**/target/
+**/*.rs.bk
+
+# Logs
+*.log
+*.log.*
+
+# Temp/editor
+*.tmp
+*.swp
+*.swo
+*~
+*.bak
+
+# Local env/config
+.env
+.env.*
+.DS_Store
+
+# Build outputs outside target (defensive)
+*.rlib
+*.rmeta
+*.d
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.pid
+*.sock
+
+# Per-crate lockfiles
+fifo_listener/Cargo.lock

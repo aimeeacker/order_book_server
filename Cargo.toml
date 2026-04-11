@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "binaries"]
+members = ["server", "binaries", "fifo_listener", "snapshot_bench", "compute_l4", "hl_book"]
 
 resolver = "3"
 
@@ -67,4 +67,3 @@ unused_lifetimes                              = { level = "warn" }
 unused_macro_rules                            = { level = "warn" }
 unused_qualifications                         = { level = "warn" }
 variant_size_differences                      = { level = "warn" }
-

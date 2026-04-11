@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::order_book::{InnerOrder, Oid, OrderBook, Px, Side, Snapshot, Sz, linked_list::LinkedList};
 use crate::types::Level;
 use crate::types::inner::InnerLevel;

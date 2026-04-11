@@ -1,0 +1,13 @@
+[package]
+name = "snapshot_bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memchr = "2.7.4"
+rayon = "1.10"
+memmap2 = "0.9.5"
+simd-json = "0.14.3"
+
+[lints]
+workspace = true

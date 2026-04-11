@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
 use alloy::primitives::Address;
@@ -19,6 +20,12 @@ pub(crate) struct NodeDataOrderDiff {
 }
 
 impl NodeDataOrderDiff {
+    pub(crate) fn new(user: String, oid: u64, px: String, coin: String, raw_book_diff: OrderDiff) -> Self {
+        // Parse address, defaulting to zero address on failure
+        let user = user.parse().unwrap_or_default();
+        Self { user, oid, px, coin, raw_book_diff }
+    }
+
     pub(crate) fn diff(&self) -> OrderDiff {
         self.raw_book_diff.clone()
     }
@@ -49,6 +56,7 @@ impl NodeDataOrderStatus {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, strum_macros::Display)]
 pub(crate) enum EventSource {
     Fills,
@@ -56,6 +64,7 @@ pub(crate) enum EventSource {
     OrderDiffs,
 }
 
+#[cfg(test)]
 impl EventSource {
     #[must_use]
     pub(crate) fn event_source_dir(self, dir: &Path) -> PathBuf {
@@ -76,6 +85,15 @@ pub(crate) struct Batch<E> {
 }
 
 impl<E> Batch<E> {
+    pub(crate) const fn new(
+        local_time: NaiveDateTime,
+        block_time: NaiveDateTime,
+        block_number: u64,
+        events: Vec<E>,
+    ) -> Self {
+        Self { local_time, block_time, block_number, events }
+    }
+
     #[allow(clippy::unwrap_used)]
     pub(crate) fn block_time(&self) -> u64 {
         self.block_time.and_utc().timestamp_millis().try_into().unwrap()
@@ -87,5 +105,17 @@ impl<E> Batch<E> {
 
     pub(crate) fn events(self) -> Vec<E> {
         self.events
+    }
+
+    pub(crate) fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&E) -> bool,
+    {
+        self.events.retain(f);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.is_empty()
     }
 }
