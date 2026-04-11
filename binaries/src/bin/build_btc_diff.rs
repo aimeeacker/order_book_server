@@ -34,7 +34,6 @@ const SZ_SCALE: i8 = 5;
 const HOUR_MS: i64 = 3_600_000;
 const REQUESTER_PAYS_ALWAYS: bool = true;
 const CANCEL_STATUS_CANCELED: &str = "canceled";
-
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Args {
@@ -93,13 +92,6 @@ impl InputSource {
 
     fn requires_s3(&self) -> bool {
         matches!(self, Self::S3Prefix { .. })
-    }
-
-    fn describe(&self) -> String {
-        match self {
-            Self::LocalFile(path) => path.display().to_string(),
-            Self::S3Prefix { bucket, prefix } => format!("s3://{bucket}/{prefix}"),
-        }
     }
 }
 
@@ -179,17 +171,35 @@ struct NodeFillsTimeBlock {
 struct FillEvent {
     #[serde(default)]
     coin: String,
+    #[serde(default)]
+    px: String,
+    #[serde(default)]
+    side: String,
     oid: u64,
     #[serde(default)]
     sz: String,
+    #[serde(default)]
+    crossed: bool,
+    tid: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 struct FillRecord {
     block_number: u64,
     block_time_ms: i64,
+    user: String,
     oid: u64,
+    side: Option<String>,
+    px: Option<Decimal>,
     sz: Decimal,
+    crossed: bool,
+    tid: Option<u64>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct UserCloidKey {
+    user: String,
+    cloid: String,
 }
 
 #[derive(Debug, Clone)]
@@ -258,7 +268,6 @@ enum CmdEvent {
         sz: Decimal,
         raw_sz: Option<Decimal>,
         meta: OrderMeta,
-        placed: bool,
     },
     Skipped {
         user: Option<String>,
@@ -610,10 +619,6 @@ fn is_success_status(status: Option<&Value>) -> bool {
         .is_some_and(|raw| raw.eq_ignore_ascii_case("success"))
 }
 
-fn is_error_status(status: Option<&Value>) -> bool {
-    status.is_some_and(|raw| raw.get("error").is_some())
-}
-
 enum BookedSzDecision {
     Booked {
         booked_sz: Decimal,
@@ -716,6 +721,124 @@ async fn list_lz4_keys(client: &S3Client, bucket: &str, prefix: &str, requester_
     Ok(keys)
 }
 
+async fn list_child_prefixes(client: &S3Client, bucket: &str, prefix: &str, requester_pays: bool) -> Result<Vec<String>> {
+    let normalized_prefix = prefix.trim_matches('/');
+    let list_prefix = format!("{normalized_prefix}/");
+
+    let mut next_token: Option<String> = None;
+    let mut prefixes = Vec::new();
+
+    loop {
+        let mut request = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(&list_prefix)
+            .delimiter("/");
+        if requester_pays {
+            request = request.request_payer(RequestPayer::Requester);
+        }
+        if let Some(token) = &next_token {
+            request = request.continuation_token(token);
+        }
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                if let Some(service_error) = err.as_service_error()
+                    && !requester_pays
+                    && service_error.code().is_some_and(|code| code == "AccessDenied")
+                {
+                    bail!("failed to list child prefixes in s3://{bucket}/{normalized_prefix}: AccessDenied");
+                }
+                bail!("failed to list child prefixes in s3://{bucket}/{normalized_prefix}: {err}");
+            }
+        };
+
+        for common_prefix in response.common_prefixes() {
+            if let Some(child) = common_prefix.prefix() {
+                let trimmed = child.trim_end_matches('/');
+                if !trimmed.is_empty() {
+                    prefixes.push(trimmed.to_owned());
+                }
+            }
+        }
+
+        if response.is_truncated().unwrap_or(false) {
+            next_token = response.next_continuation_token().map(ToOwned::to_owned);
+            if next_token.is_none() {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    Ok(prefixes)
+}
+
+async fn head_object_exists(client: &S3Client, bucket: &str, key: &str, requester_pays: bool) -> Result<bool> {
+    let mut request = client.head_object().bucket(bucket).key(key);
+    if requester_pays {
+        request = request.request_payer(RequestPayer::Requester);
+    }
+
+    match request.send().await {
+        Ok(_) => Ok(true),
+        Err(err) => {
+            if let Some(service_error) = err.as_service_error() {
+                let not_found = service_error.is_not_found()
+                    || service_error
+                        .code()
+                        .is_some_and(|code| matches!(code, "NotFound" | "NoSuchKey" | "404"));
+                if not_found {
+                    return Ok(false);
+                }
+                if !requester_pays && service_error.code().is_some_and(|code| code == "AccessDenied") {
+                    bail!("failed to head s3://{bucket}/{key}: AccessDenied");
+                }
+            }
+
+            bail!("failed to head s3://{bucket}/{key}: {err}")
+        }
+    }
+}
+
+fn resolve_required_chunks_from_keys(required_chunks: &[u64], keys: Vec<String>) -> Option<Vec<String>> {
+    let mut basename_to_key: HashMap<String, String> = HashMap::new();
+    for key in keys {
+        let Some(name) = key.rsplit('/').next() else {
+            continue;
+        };
+        match basename_to_key.get(name) {
+            Some(existing) if existing >= &key => {}
+            _ => {
+                basename_to_key.insert(name.to_owned(), key);
+            }
+        }
+    }
+
+    let mut resolved = Vec::with_capacity(required_chunks.len());
+    for chunk in required_chunks {
+        let file_name = format!("{chunk}.lz4");
+        let full_key = basename_to_key.get(&file_name)?.clone();
+        resolved.push(full_key);
+    }
+    Some(resolved)
+}
+
+async fn resolve_required_chunks_in_prefix(
+    client: &S3Client,
+    bucket: &str,
+    prefix: &str,
+    required_chunks: &[u64],
+    requester_pays: bool,
+) -> Result<Option<Vec<String>>> {
+    let keys = list_lz4_keys(client, bucket, prefix, requester_pays).await?;
+    Ok(resolve_required_chunks_from_keys(required_chunks, keys))
+}
+
 fn replica_chunk_starts_for_range(start_height: u64, height_span: u64) -> Result<Vec<u64>> {
     if start_height == 0 {
         bail!("--start-height must be >= 1 for replica_cmds naming rule <height-1>.lz4");
@@ -751,36 +874,50 @@ async fn resolve_replica_keys_for_range(
     requester_pays: bool,
 ) -> Result<Vec<String>> {
     let required_chunks = replica_chunk_starts_for_range(start_height, height_span)?;
-    let all_keys = list_lz4_keys(client, bucket, prefix, requester_pays).await?;
+    let normalized_prefix = prefix.trim_matches('/');
 
-    let mut basename_to_key: HashMap<String, String> = HashMap::new();
-    for key in all_keys {
-        let Some(name) = key.rsplit('/').next() else {
-            continue;
-        };
-        match basename_to_key.get(name) {
-            Some(existing) if existing >= &key => {}
-            _ => {
-                basename_to_key.insert(name.to_owned(), key);
-            }
+    // Fast path: try deterministic keys directly under the provided prefix.
+    let mut direct_keys = Vec::with_capacity(required_chunks.len());
+    let mut all_direct_present = true;
+    for chunk in &required_chunks {
+        let key = format!("{normalized_prefix}/{chunk}.lz4");
+        if head_object_exists(client, bucket, &key, requester_pays).await? {
+            direct_keys.push(key);
+        } else {
+            all_direct_present = false;
+            break;
+        }
+    }
+    if all_direct_present {
+        return Ok(direct_keys);
+    }
+
+    // Structured path optimization:
+    // `replica_cmds/<snapshot>/<yyyymmdd>/<chunk>.lz4`
+    // Scan snapshots from newest to oldest and only recurse inside one snapshot at a time.
+    let child_prefixes = list_child_prefixes(client, bucket, normalized_prefix, requester_pays).await?;
+    for child_prefix in child_prefixes.into_iter().rev() {
+        if let Some(resolved) =
+            resolve_required_chunks_in_prefix(client, bucket, &child_prefix, &required_chunks, requester_pays).await?
+        {
+            return Ok(resolved);
         }
     }
 
-    let mut resolved = Vec::with_capacity(required_chunks.len());
-    for chunk in required_chunks {
-        let file_name = format!("{chunk}.lz4");
-        let Some(full_key) = basename_to_key.get(&file_name) else {
-            bail!(
-                "missing replica key for chunk {} (expected basename {}). prefix=s3://{}/{}",
-                chunk,
-                file_name,
-                bucket,
-                prefix
-            );
-        };
-        resolved.push(full_key.clone());
+    // Fallback: recurse under the original prefix for compatibility with custom layouts.
+    if let Some(resolved) =
+        resolve_required_chunks_in_prefix(client, bucket, normalized_prefix, &required_chunks, requester_pays).await?
+    {
+        return Ok(resolved);
     }
-    Ok(resolved)
+
+    bail!(
+        "missing replica keys for range start_height={} span={} under s3://{}/{}",
+        start_height,
+        height_span,
+        bucket,
+        normalized_prefix
+    )
 }
 
 fn build_node_fills_hourly_key(prefix: &str, hour_start_ms: i64) -> Result<String> {
@@ -1029,7 +1166,7 @@ impl NodeFillsReader {
 
         let block_time_ms = parse_timestamp_ms(&block.block_time)?;
         let mut fills = Vec::with_capacity(block.events.len());
-        for (_address, event) in block.events {
+        for (address, event) in block.events {
             if event.coin != "BTC" {
                 continue;
             }
@@ -1037,8 +1174,13 @@ impl NodeFillsReader {
             fills.push(FillRecord {
                 block_number: block.block_number,
                 block_time_ms,
+                user: address,
                 oid: event.oid,
+                side: (!event.side.is_empty()).then_some(event.side),
+                px: (!event.px.is_empty()).then(|| parse_decimal(&event.px)).transpose()?,
                 sz: parse_decimal(&event.sz)?,
+                crossed: event.crossed,
+                tid: event.tid,
             });
         }
 
@@ -1316,6 +1458,13 @@ impl ReplicaCmdsReader {
 
                             let statuses = parse_statuses(&response_item.res.response);
                             let Some(status) = statuses.first() else {
+                                eprintln!(
+                                    "[warn] block={} user={} modify returned no statuses; treating as cancel-only old_ref={:?} response_type={:?}",
+                                    block_number,
+                                    user,
+                                    old_order_ref,
+                                    response_item.res.response.get("type").and_then(Value::as_str)
+                                );
                                 events.push(CmdEvent::Cancel {
                                     user: Some(user.clone()),
                                     order_ref: old_order_ref,
@@ -1338,8 +1487,6 @@ impl ReplicaCmdsReader {
                             if new_sz <= Decimal::ZERO {
                                 new_oid = None;
                             }
-                            let placed = status.get("resting").is_some() || status.get("filled").is_some();
-
                             events.push(CmdEvent::Modify {
                                 user: user.clone(),
                                 old_order_ref,
@@ -1350,7 +1497,6 @@ impl ReplicaCmdsReader {
                                 sz: new_sz,
                                 raw_sz,
                                 meta,
-                                placed,
                             });
 
                             if invalid_filled_total_sz {
@@ -1384,6 +1530,14 @@ impl ReplicaCmdsReader {
                                     continue;
                                 };
                                 let Some(status) = statuses.get(idx) else {
+                                    eprintln!(
+                                        "[warn] block={} user={} batchModify item={} returned no statuses; treating as cancel-only old_ref={:?} response_type={:?}",
+                                        block_number,
+                                        user,
+                                        idx,
+                                        old_order_ref,
+                                        response_item.res.response.get("type").and_then(Value::as_str)
+                                    );
                                     events.push(CmdEvent::Cancel {
                                         user: Some(user),
                                         order_ref: old_order_ref,
@@ -1409,8 +1563,6 @@ impl ReplicaCmdsReader {
                                 if new_sz <= Decimal::ZERO {
                                     new_oid = None;
                                 }
-                                let placed = status.get("resting").is_some() || status.get("filled").is_some();
-
                                 events.push(CmdEvent::Modify {
                                     user: user.clone(),
                                     old_order_ref,
@@ -1421,7 +1573,6 @@ impl ReplicaCmdsReader {
                                     sz: new_sz,
                                     raw_sz,
                                     meta,
-                                    placed,
                                 });
 
                                 if invalid_filled_total_sz {
@@ -1482,23 +1633,121 @@ fn clamp_lifetime_ms(created_time_ms: i64, current_time_ms: i64) -> Option<i32> 
     i32::try_from(delta).ok()
 }
 
-fn resolve_order_ref(order_ref: &OrderRef, cloid_to_oid: &HashMap<String, u64>) -> Option<u64> {
+fn resolve_order_ref(
+    order_ref: &OrderRef,
+    user: Option<&str>,
+    cloid_to_oid: &HashMap<UserCloidKey, u64>,
+) -> Option<u64> {
     match order_ref {
         OrderRef::Oid(oid) => Some(*oid),
-        OrderRef::Cloid(cloid) => cloid_to_oid.get(cloid).copied(),
+        OrderRef::Cloid(cloid) => {
+            let user = user?;
+            cloid_to_oid
+                .get(&UserCloidKey {
+                    user: user.to_owned(),
+                    cloid: cloid.clone(),
+                })
+                .copied()
+        }
     }
 }
 
 fn remove_live_order(
     orders: &mut HashMap<u64, OrderState>,
-    cloid_to_oid: &mut HashMap<String, u64>,
+    cloid_to_oid: &mut HashMap<UserCloidKey, u64>,
     oid: u64,
 ) -> Option<OrderState> {
     let state = orders.remove(&oid)?;
     if let Some(cloid) = &state.cloid {
-        cloid_to_oid.remove(cloid);
+        cloid_to_oid.remove(&UserCloidKey {
+            user: state.user.clone(),
+            cloid: cloid.clone(),
+        });
     }
     Some(state)
+}
+
+fn insert_live_order(
+    orders: &mut HashMap<u64, OrderState>,
+    cloid_to_oid: &mut HashMap<UserCloidKey, u64>,
+    user: &str,
+    oid: u64,
+    cloid: Option<&str>,
+    created_time_ms: i64,
+    side: &str,
+    px: Decimal,
+    sz: Decimal,
+    meta: &OrderMeta,
+) {
+    if let Some(cloid) = cloid {
+        cloid_to_oid.insert(
+            UserCloidKey {
+                user: user.to_owned(),
+                cloid: cloid.to_owned(),
+            },
+            oid,
+        );
+    }
+    orders.insert(
+        oid,
+        OrderState {
+            user: user.to_owned(),
+            cloid: cloid.map(ToOwned::to_owned),
+            created_time_ms,
+            side: side.to_owned(),
+            px,
+            remaining_sz: sz,
+            tif: meta.tif.clone(),
+            reduce_only: meta.reduce_only,
+            order_type: meta.order_type.clone(),
+            is_trigger: meta.is_trigger,
+            trigger_condition: meta.trigger_condition.clone(),
+            trigger_px: meta.trigger_px,
+            is_position_tpsl: meta.is_position_tpsl,
+            tp_trigger_px: meta.tp_trigger_px,
+            sl_trigger_px: meta.sl_trigger_px,
+        },
+    );
+}
+
+fn push_add_row(
+    rows: &mut RowBuffer,
+    block_number: u64,
+    block_time_ms: i64,
+    user: &str,
+    oid: u64,
+    side: &str,
+    px: Decimal,
+    sz: Decimal,
+    raw_sz: Option<Decimal>,
+    meta: &OrderMeta,
+) -> Result<()> {
+    rows.push(OutputRow {
+        block_number: i64::try_from(block_number)?,
+        block_time_ms,
+        coin: "BTC".to_owned(),
+        user: user.to_owned(),
+        oid: Some(i64::try_from(oid)?),
+        side: Some(side.to_owned()),
+        px: Some(px),
+        diff_type: "new".to_owned(),
+        event: "add".to_owned(),
+        sz: Some(sz),
+        orig_sz: None,
+        raw_sz,
+        is_trigger: Some(meta.is_trigger),
+        tif: meta.tif.clone(),
+        reduce_only: meta.reduce_only,
+        order_type: meta.order_type.clone(),
+        trigger_condition: meta.trigger_condition.clone(),
+        trigger_px: meta.trigger_px,
+        is_position_tpsl: meta.is_position_tpsl,
+        tp_trigger_px: meta.tp_trigger_px,
+        sl_trigger_px: meta.sl_trigger_px,
+        status: None,
+        lifetime: None,
+    });
+    Ok(())
 }
 
 fn process_block(
@@ -1506,72 +1755,48 @@ fn process_block(
     block_time_ms: i64,
     cmd_events: Option<Vec<CmdEvent>>,
     fills: Option<Vec<FillRecord>>,
+    emit_rows: bool,
     rows: &mut RowBuffer,
     orders: &mut HashMap<u64, OrderState>,
-    cloid_to_oid: &mut HashMap<String, u64>,
+    cloid_to_oid: &mut HashMap<UserCloidKey, u64>,
     writer: &mut ArrowWriter<File>,
     schema: &Arc<Schema>,
 ) -> Result<()> {
     if let Some(events) = cmd_events {
         let mut canceled_oids_in_block: HashSet<u64> = HashSet::new();
+        let mut deferred_cancels: Vec<(Option<String>, OrderRef, bool)> = Vec::new();
         for event in &events {
             match event {
                 CmdEvent::Add { user, oid, cloid, side, px, sz, raw_sz, meta } => {
-                    if let Some(cloid) = cloid.clone() {
-                        cloid_to_oid.insert(cloid, *oid);
-                    }
-                    orders.insert(
+                    insert_live_order(
+                        orders,
+                        cloid_to_oid,
+                        user,
                         *oid,
-                        OrderState {
-                            user: user.clone(),
-                            cloid: cloid.clone(),
-                            created_time_ms: block_time_ms,
-                            side: side.clone(),
-                            px: *px,
-                            remaining_sz: *sz,
-                            tif: meta.tif.clone(),
-                            reduce_only: meta.reduce_only,
-                            order_type: meta.order_type.clone(),
-                            is_trigger: meta.is_trigger,
-                            trigger_condition: meta.trigger_condition.clone(),
-                            trigger_px: meta.trigger_px,
-                            is_position_tpsl: meta.is_position_tpsl,
-                            tp_trigger_px: meta.tp_trigger_px,
-                            sl_trigger_px: meta.sl_trigger_px,
-                        },
-                    );
-                    rows.push(OutputRow {
-                        block_number: i64::try_from(block_number)?,
+                        cloid.as_deref(),
                         block_time_ms,
-                        coin: "BTC".to_owned(),
-                        user: user.clone(),
-                        oid: Some(i64::try_from(*oid)?),
-                        side: Some(side.clone()),
-                        px: Some(*px),
-                        diff_type: "new".to_owned(),
-                        event: "add".to_owned(),
-                        sz: Some(*sz),
-                        orig_sz: None,
-                        raw_sz: raw_sz.to_owned(),
-                        is_trigger: Some(meta.is_trigger),
-                        tif: meta.tif.clone(),
-                        reduce_only: meta.reduce_only,
-                        order_type: meta.order_type.clone(),
-                        trigger_condition: meta.trigger_condition.clone(),
-                        trigger_px: meta.trigger_px,
-                        is_position_tpsl: meta.is_position_tpsl,
-                        tp_trigger_px: meta.tp_trigger_px,
-                        sl_trigger_px: meta.sl_trigger_px,
-                        status: None,
-                        lifetime: None,
-                    });
+                        side,
+                        *px,
+                        *sz,
+                        meta,
+                    );
+                    if emit_rows {
+                        push_add_row(rows, block_number, block_time_ms, user, *oid, side, *px, *sz, *raw_sz, meta)?;
+                    }
                 }
                 CmdEvent::Cancel {
                     user,
                     order_ref,
                     fallback_on_missing,
                 } => {
-                    let resolved_oid = resolve_order_ref(order_ref, cloid_to_oid);
+                    let resolved_oid = resolve_order_ref(order_ref, user.as_deref(), cloid_to_oid);
+                    if resolved_oid.is_none()
+                        && matches!(order_ref, OrderRef::Cloid(_))
+                        && user.is_some()
+                    {
+                        deferred_cancels.push((user.clone(), order_ref.clone(), *fallback_on_missing));
+                        continue;
+                    }
                     let mut emitted_remove = false;
 
                     if let Some(oid) = resolved_oid {
@@ -1580,36 +1805,38 @@ fn process_block(
                         }
                         if let Some(state) = remove_live_order(orders, cloid_to_oid, oid) {
                             canceled_oids_in_block.insert(oid);
-                            rows.push(OutputRow {
-                                block_number: i64::try_from(block_number)?,
-                                block_time_ms,
-                                coin: "BTC".to_owned(),
-                                user: state.user,
-                                oid: Some(i64::try_from(oid)?),
-                                side: Some(state.side),
-                                px: Some(state.px),
-                                diff_type: "remove".to_owned(),
-                                event: "cancel".to_owned(),
-                                sz: Some(Decimal::ZERO),
-                                orig_sz: Some(state.remaining_sz),
-                                raw_sz: None,
-                                is_trigger: Some(state.is_trigger),
-                                tif: state.tif.clone(),
-                                reduce_only: state.reduce_only,
-                                order_type: state.order_type.clone(),
-                                trigger_condition: state.trigger_condition.clone(),
-                                trigger_px: state.trigger_px,
-                                is_position_tpsl: state.is_position_tpsl,
-                                tp_trigger_px: state.tp_trigger_px,
-                                sl_trigger_px: state.sl_trigger_px,
-                                status: Some(CANCEL_STATUS_CANCELED.to_owned()),
-                                lifetime: clamp_lifetime_ms(state.created_time_ms, block_time_ms),
-                            });
+                            if emit_rows {
+                                rows.push(OutputRow {
+                                    block_number: i64::try_from(block_number)?,
+                                    block_time_ms,
+                                    coin: "BTC".to_owned(),
+                                    user: state.user,
+                                    oid: Some(i64::try_from(oid)?),
+                                    side: Some(state.side),
+                                    px: Some(state.px),
+                                    diff_type: "remove".to_owned(),
+                                    event: "cancel".to_owned(),
+                                    sz: Some(Decimal::ZERO),
+                                    orig_sz: Some(state.remaining_sz),
+                                    raw_sz: None,
+                                    is_trigger: Some(state.is_trigger),
+                                    tif: state.tif.clone(),
+                                    reduce_only: state.reduce_only,
+                                    order_type: state.order_type.clone(),
+                                    trigger_condition: state.trigger_condition.clone(),
+                                    trigger_px: state.trigger_px,
+                                    is_position_tpsl: state.is_position_tpsl,
+                                    tp_trigger_px: state.tp_trigger_px,
+                                    sl_trigger_px: state.sl_trigger_px,
+                                    status: Some(CANCEL_STATUS_CANCELED.to_owned()),
+                                    lifetime: clamp_lifetime_ms(state.created_time_ms, block_time_ms),
+                                });
+                            }
                             emitted_remove = true;
                         }
                     }
 
-                    if !emitted_remove && *fallback_on_missing {
+                    if emit_rows && !emitted_remove && *fallback_on_missing {
                         let fallback_oid = match order_ref {
                             OrderRef::Oid(oid) => Some(i64::try_from(*oid)?),
                             OrderRef::Cloid(_) => None,
@@ -1654,42 +1881,43 @@ fn process_block(
                     sz,
                     raw_sz,
                     meta,
-                    placed,
                 } => {
                     let mut emitted_remove = false;
 
-                    if let Some(old_oid) = resolve_order_ref(old_order_ref, cloid_to_oid) {
+                    if let Some(old_oid) = resolve_order_ref(old_order_ref, Some(user.as_str()), cloid_to_oid) {
                         if let Some(old_state) = remove_live_order(orders, cloid_to_oid, old_oid) {
-                            rows.push(OutputRow {
-                                block_number: i64::try_from(block_number)?,
-                                block_time_ms,
-                                coin: "BTC".to_owned(),
-                                user: old_state.user,
-                                oid: Some(i64::try_from(old_oid)?),
-                                side: Some(old_state.side),
-                                px: Some(old_state.px),
-                                diff_type: "remove".to_owned(),
-                                event: "cancel".to_owned(),
-                                sz: Some(Decimal::ZERO),
-                                orig_sz: Some(old_state.remaining_sz),
-                                raw_sz: None,
-                                is_trigger: Some(old_state.is_trigger),
-                                tif: old_state.tif.clone(),
-                                reduce_only: old_state.reduce_only,
-                                order_type: old_state.order_type.clone(),
-                                trigger_condition: old_state.trigger_condition.clone(),
-                                trigger_px: old_state.trigger_px,
-                                is_position_tpsl: old_state.is_position_tpsl,
-                                tp_trigger_px: old_state.tp_trigger_px,
-                                sl_trigger_px: old_state.sl_trigger_px,
-                                status: Some(CANCEL_STATUS_CANCELED.to_owned()),
-                                lifetime: clamp_lifetime_ms(old_state.created_time_ms, block_time_ms),
-                            });
+                            if emit_rows {
+                                rows.push(OutputRow {
+                                    block_number: i64::try_from(block_number)?,
+                                    block_time_ms,
+                                    coin: "BTC".to_owned(),
+                                    user: old_state.user,
+                                    oid: Some(i64::try_from(old_oid)?),
+                                    side: Some(old_state.side),
+                                    px: Some(old_state.px),
+                                    diff_type: "remove".to_owned(),
+                                    event: "cancel".to_owned(),
+                                    sz: Some(Decimal::ZERO),
+                                    orig_sz: Some(old_state.remaining_sz),
+                                    raw_sz: None,
+                                    is_trigger: Some(old_state.is_trigger),
+                                    tif: old_state.tif.clone(),
+                                    reduce_only: old_state.reduce_only,
+                                    order_type: old_state.order_type.clone(),
+                                    trigger_condition: old_state.trigger_condition.clone(),
+                                    trigger_px: old_state.trigger_px,
+                                    is_position_tpsl: old_state.is_position_tpsl,
+                                    tp_trigger_px: old_state.tp_trigger_px,
+                                    sl_trigger_px: old_state.sl_trigger_px,
+                                    status: Some(CANCEL_STATUS_CANCELED.to_owned()),
+                                    lifetime: clamp_lifetime_ms(old_state.created_time_ms, block_time_ms),
+                                });
+                            }
                             emitted_remove = true;
                         }
                     }
 
-                    if !emitted_remove {
+                    if emit_rows && !emitted_remove {
                         let fallback_oid = match old_order_ref {
                             OrderRef::Oid(oid) => Some(i64::try_from(*oid)?),
                             OrderRef::Cloid(_) => None,
@@ -1721,86 +1949,66 @@ fn process_block(
                         });
                     }
 
-                    if *placed && !meta.is_trigger {
+                    if !meta.is_trigger {
                         if let Some(new_oid) = new_oid {
-                            if let Some(cloid) = new_cloid.clone() {
-                                cloid_to_oid.insert(cloid, *new_oid);
-                            }
-                            orders.insert(
+                            insert_live_order(
+                                orders,
+                                cloid_to_oid,
+                                user,
                                 *new_oid,
-                                OrderState {
-                                    user: user.clone(),
-                                    cloid: new_cloid.clone(),
-                                    created_time_ms: block_time_ms,
-                                    side: side.clone(),
-                                    px: *px,
-                                    remaining_sz: *sz,
-                                    tif: meta.tif.clone(),
-                                    reduce_only: meta.reduce_only,
-                                    order_type: meta.order_type.clone(),
-                                    is_trigger: meta.is_trigger,
-                                    trigger_condition: meta.trigger_condition.clone(),
-                                    trigger_px: meta.trigger_px,
-                                    is_position_tpsl: meta.is_position_tpsl,
-                                    tp_trigger_px: meta.tp_trigger_px,
-                                    sl_trigger_px: meta.sl_trigger_px,
-                                },
-                            );
-                            rows.push(OutputRow {
-                                block_number: i64::try_from(block_number)?,
+                                new_cloid.as_deref(),
                                 block_time_ms,
-                                coin: "BTC".to_owned(),
-                                user: user.clone(),
-                                oid: Some(i64::try_from(*new_oid)?),
-                                side: Some(side.clone()),
-                                px: Some(*px),
-                                diff_type: "new".to_owned(),
-                                event: "add".to_owned(),
-                                sz: Some(*sz),
-                                orig_sz: None,
-                                raw_sz: raw_sz.to_owned(),
-                                is_trigger: Some(meta.is_trigger),
-                                tif: meta.tif.clone(),
-                                reduce_only: meta.reduce_only,
-                                order_type: meta.order_type.clone(),
-                                trigger_condition: meta.trigger_condition.clone(),
-                                trigger_px: meta.trigger_px,
-                                is_position_tpsl: meta.is_position_tpsl,
-                                tp_trigger_px: meta.tp_trigger_px,
-                                sl_trigger_px: meta.sl_trigger_px,
-                                status: None,
-                                lifetime: None,
-                            });
+                                side,
+                                *px,
+                                *sz,
+                                meta,
+                            );
+                            if emit_rows {
+                                push_add_row(
+                                    rows,
+                                    block_number,
+                                    block_time_ms,
+                                    user,
+                                    *new_oid,
+                                    side,
+                                    *px,
+                                    *sz,
+                                    *raw_sz,
+                                    meta,
+                                )?;
+                            }
                         }
                     }
                 }
                 CmdEvent::Skipped { user, oid, event, status } => {
-                    let oid = oid.map(i64::try_from).transpose()?;
-                    rows.push(OutputRow {
-                        block_number: i64::try_from(block_number)?,
-                        block_time_ms,
-                        coin: "BTC".to_owned(),
-                        user: user.clone().unwrap_or_default(),
-                        oid,
-                        side: None,
-                        px: None,
-                        diff_type: "skip".to_owned(),
-                        event: event.clone(),
-                        sz: None,
-                        orig_sz: None,
-                        raw_sz: None,
-                        is_trigger: None,
-                        tif: None,
-                        reduce_only: None,
-                        order_type: None,
-                        trigger_condition: None,
-                        trigger_px: None,
-                        is_position_tpsl: None,
-                        tp_trigger_px: None,
-                        sl_trigger_px: None,
-                        status: Some(status.clone()),
-                        lifetime: None,
-                    });
+                    if emit_rows {
+                        let oid = oid.map(i64::try_from).transpose()?;
+                        rows.push(OutputRow {
+                            block_number: i64::try_from(block_number)?,
+                            block_time_ms,
+                            coin: "BTC".to_owned(),
+                            user: user.clone().unwrap_or_default(),
+                            oid,
+                            side: None,
+                            px: None,
+                            diff_type: "skip".to_owned(),
+                            event: event.clone(),
+                            sz: None,
+                            orig_sz: None,
+                            raw_sz: None,
+                            is_trigger: None,
+                            tif: None,
+                            reduce_only: None,
+                            order_type: None,
+                            trigger_condition: None,
+                            trigger_px: None,
+                            is_position_tpsl: None,
+                            tp_trigger_px: None,
+                            sl_trigger_px: None,
+                            status: Some(status.clone()),
+                            lifetime: None,
+                        });
+                    }
                 }
             }
 
@@ -1810,20 +2018,108 @@ fn process_block(
                 writer.write(&batch)?;
             }
         }
+
+        for (user, order_ref, fallback_on_missing) in deferred_cancels.drain(..) {
+            let resolved_oid = resolve_order_ref(&order_ref, user.as_deref(), cloid_to_oid);
+            let mut emitted_remove = false;
+
+            if let Some(oid) = resolved_oid {
+                if canceled_oids_in_block.contains(&oid) {
+                    continue;
+                }
+                if let Some(state) = remove_live_order(orders, cloid_to_oid, oid) {
+                    canceled_oids_in_block.insert(oid);
+                    if emit_rows {
+                        rows.push(OutputRow {
+                            block_number: i64::try_from(block_number)?,
+                            block_time_ms,
+                            coin: "BTC".to_owned(),
+                            user: state.user,
+                            oid: Some(i64::try_from(oid)?),
+                            side: Some(state.side),
+                            px: Some(state.px),
+                            diff_type: "remove".to_owned(),
+                            event: "cancel".to_owned(),
+                            sz: Some(Decimal::ZERO),
+                            orig_sz: Some(state.remaining_sz),
+                            raw_sz: None,
+                            is_trigger: Some(state.is_trigger),
+                            tif: state.tif.clone(),
+                            reduce_only: state.reduce_only,
+                            order_type: state.order_type.clone(),
+                            trigger_condition: state.trigger_condition.clone(),
+                            trigger_px: state.trigger_px,
+                            is_position_tpsl: state.is_position_tpsl,
+                            tp_trigger_px: state.tp_trigger_px,
+                            sl_trigger_px: state.sl_trigger_px,
+                            status: Some(CANCEL_STATUS_CANCELED.to_owned()),
+                            lifetime: clamp_lifetime_ms(state.created_time_ms, block_time_ms),
+                        });
+                    }
+                    emitted_remove = true;
+                }
+            }
+
+            if emit_rows && !emitted_remove && fallback_on_missing {
+                rows.push(OutputRow {
+                    block_number: i64::try_from(block_number)?,
+                    block_time_ms,
+                    coin: "BTC".to_owned(),
+                    user: user.unwrap_or_default(),
+                    oid: None,
+                    side: None,
+                    px: None,
+                    diff_type: "remove".to_owned(),
+                    event: "cancel".to_owned(),
+                    sz: None,
+                    orig_sz: None,
+                    raw_sz: None,
+                    is_trigger: None,
+                    tif: None,
+                    reduce_only: None,
+                    order_type: None,
+                    trigger_condition: None,
+                    trigger_px: None,
+                    is_position_tpsl: None,
+                    tp_trigger_px: None,
+                    sl_trigger_px: None,
+                    status: Some(CANCEL_STATUS_CANCELED.to_owned()),
+                    lifetime: None,
+                });
+            }
+        }
     }
 
     if let Some(fills) = fills {
+        let taker_tids: HashSet<u64> = fills
+            .iter()
+            .filter(|fill| fill.crossed)
+            .filter_map(|fill| fill.tid)
+            .collect();
+
         for fill in fills {
-            let Some(state) = orders.get_mut(&fill.oid) else {
-                let fill_time_ms = fill.block_time_ms;
+            let fill_time_ms = fill.block_time_ms;
+
+            if fill.crossed {
+                if rows.len() >= ROW_GROUP_SIZE
+                    && let Some(batch) = rows.take_batch(schema)?
+                {
+                    writer.write(&batch)?;
+                }
+                continue;
+            }
+
+            let has_matching_taker = fill.tid.is_some_and(|tid| taker_tids.contains(&tid));
+
+            if emit_rows && has_matching_taker {
                 rows.push(OutputRow {
                     block_number: i64::try_from(fill.block_number)?,
                     block_time_ms: fill_time_ms,
                     coin: "BTC".to_owned(),
-                    user: String::new(),
+                    user: fill.user.clone(),
                     oid: Some(i64::try_from(fill.oid)?),
-                    side: None,
-                    px: None,
+                    side: fill.side.clone(),
+                    px: fill.px,
                     diff_type: "update".to_owned(),
                     event: "fill".to_owned(),
                     sz: None,
@@ -1841,39 +2137,14 @@ fn process_block(
                     status: None,
                     lifetime: None,
                 });
+            }
 
-                rows.push(OutputRow {
-                    block_number: i64::try_from(fill.block_number)?,
-                    block_time_ms: fill_time_ms,
-                    coin: "BTC".to_owned(),
-                    user: String::new(),
-                    oid: Some(i64::try_from(fill.oid)?),
-                    side: None,
-                    px: None,
-                    diff_type: "remove".to_owned(),
-                    event: "fill".to_owned(),
-                    sz: None,
-                    orig_sz: None,
-                    raw_sz: None,
-                    is_trigger: None,
-                    tif: None,
-                    reduce_only: None,
-                    order_type: None,
-                    trigger_condition: None,
-                    trigger_px: None,
-                    is_position_tpsl: None,
-                    tp_trigger_px: None,
-                    sl_trigger_px: None,
-                    status: None,
-                    lifetime: None,
-                });
-
+            let Some(state) = orders.get_mut(&fill.oid) else {
                 if rows.len() >= ROW_GROUP_SIZE
                     && let Some(batch) = rows.take_batch(schema)?
                 {
                     writer.write(&batch)?;
                 }
-
                 continue;
             };
 
@@ -1882,69 +2153,44 @@ fn process_block(
                 continue;
             }
 
-            let fill_time_ms = fill.block_time_ms;
             let old_remaining = state.remaining_sz;
             let mut new_remaining = old_remaining - fill.sz;
             if new_remaining < Decimal::ZERO {
                 new_remaining = Decimal::ZERO;
             }
 
-            rows.push(OutputRow {
-                block_number: i64::try_from(fill.block_number)?,
-                block_time_ms: fill_time_ms,
-                coin: "BTC".to_owned(),
-                user: state.user.clone(),
-                oid: Some(i64::try_from(fill.oid)?),
-                side: Some(state.side.clone()),
-                px: Some(state.px),
-                diff_type: "update".to_owned(),
-                event: "fill".to_owned(),
-                sz: Some(new_remaining),
-                orig_sz: Some(old_remaining),
-                raw_sz: None,
-                is_trigger: None,
-                tif: None,
-                reduce_only: None,
-                order_type: None,
-                trigger_condition: None,
-                trigger_px: None,
-                is_position_tpsl: None,
-                tp_trigger_px: None,
-                sl_trigger_px: None,
-                status: None,
-                lifetime: None,
-            });
-
             state.remaining_sz = new_remaining;
 
             if new_remaining <= Decimal::ZERO {
                 let removed_state = remove_live_order(orders, cloid_to_oid, fill.oid)
                     .ok_or_else(|| anyhow!("missing state for oid {} on remove", fill.oid))?;
-                rows.push(OutputRow {
-                    block_number: i64::try_from(fill.block_number)?,
-                    block_time_ms: fill_time_ms,
-                    coin: "BTC".to_owned(),
-                    user: removed_state.user,
-                    oid: Some(i64::try_from(fill.oid)?),
-                    side: Some(removed_state.side),
-                    px: Some(removed_state.px),
-                    diff_type: "remove".to_owned(),
-                    event: "fill".to_owned(),
-                    sz: Some(Decimal::ZERO),
-                    orig_sz: None,
-                    raw_sz: Some(old_remaining),
-                    is_trigger: Some(removed_state.is_trigger),
-                    tif: removed_state.tif.clone(),
-                    reduce_only: removed_state.reduce_only,
-                    order_type: removed_state.order_type.clone(),
-                    trigger_condition: removed_state.trigger_condition.clone(),
-                    trigger_px: removed_state.trigger_px,
-                    is_position_tpsl: removed_state.is_position_tpsl,
-                    tp_trigger_px: removed_state.tp_trigger_px,
-                    sl_trigger_px: removed_state.sl_trigger_px,
-                    status: None,
-                    lifetime: clamp_lifetime_ms(removed_state.created_time_ms, fill_time_ms),
-                });
+                if emit_rows {
+                    rows.push(OutputRow {
+                        block_number: i64::try_from(fill.block_number)?,
+                        block_time_ms: fill_time_ms,
+                        coin: "BTC".to_owned(),
+                        user: removed_state.user,
+                        oid: Some(i64::try_from(fill.oid)?),
+                        side: Some(removed_state.side),
+                        px: Some(removed_state.px),
+                        diff_type: "remove".to_owned(),
+                        event: "fill".to_owned(),
+                        sz: Some(Decimal::ZERO),
+                        orig_sz: Some(old_remaining),
+                        raw_sz: None,
+                        is_trigger: Some(removed_state.is_trigger),
+                        tif: removed_state.tif.clone(),
+                        reduce_only: removed_state.reduce_only,
+                        order_type: removed_state.order_type.clone(),
+                        trigger_condition: removed_state.trigger_condition.clone(),
+                        trigger_px: removed_state.trigger_px,
+                        is_position_tpsl: removed_state.is_position_tpsl,
+                        tp_trigger_px: removed_state.tp_trigger_px,
+                        sl_trigger_px: removed_state.sl_trigger_px,
+                        status: None,
+                        lifetime: clamp_lifetime_ms(removed_state.created_time_ms, fill_time_ms),
+                    });
+                }
             }
 
             if rows.len() >= ROW_GROUP_SIZE
@@ -1979,7 +2225,7 @@ async fn main() -> Result<()> {
     if args.start_height.is_some() ^ args.height_span.is_some() {
         bail!("--start-height and --height-span must be provided together");
     }
-    let block_range = match (args.start_height, args.height_span) {
+    let target_block_range = match (args.start_height, args.height_span) {
         (Some(start_height), Some(height_span)) => {
             if height_span == 0 {
                 bail!("--height-span must be > 0");
@@ -2004,13 +2250,13 @@ async fn main() -> Result<()> {
 
     let replica_reader_source = match &replica_source {
         InputSource::LocalFile(path) => {
-            if block_range.is_some() {
+            if target_block_range.is_some() {
                 bail!("--start-height/--height-span currently require S3 replica_cmds prefix input");
             }
             ReaderSource::LocalFile(path.clone())
         }
         InputSource::S3Prefix { bucket, prefix } => {
-            let Some((start_height, end_height)) = block_range else {
+            let Some((start_height, end_height)) = target_block_range else {
                 bail!("S3 replica_cmds requires --start-height and --height-span");
             };
             let height_span = end_height - start_height + 1;
@@ -2050,7 +2296,12 @@ async fn main() -> Result<()> {
     };
 
     let mut fills_reader =
-        NodeFillsReader::new(fills_reader_source.clone(), s3_client.clone(), requester_pays, block_range)
+        NodeFillsReader::new(
+            fills_reader_source.clone(),
+            s3_client.clone(),
+            requester_pays,
+            target_block_range,
+        )
             .await
             .context("opening node_fills_by_block")?;
     let mut replica_reader = ReplicaCmdsReader::new(
@@ -2059,7 +2310,7 @@ async fn main() -> Result<()> {
         args.block_time_tolerance_ns,
         s3_client.clone(),
         requester_pays,
-        block_range,
+        target_block_range,
     )
     .await
     .context("opening replica_cmds")?;
@@ -2075,7 +2326,7 @@ async fn main() -> Result<()> {
 
     let mut rows = RowBuffer::default();
     let mut orders: HashMap<u64, OrderState> = HashMap::new();
-    let mut cloid_to_oid: HashMap<String, u64> = HashMap::new();
+    let mut cloid_to_oid: HashMap<UserCloidKey, u64> = HashMap::new();
     let started_at = Instant::now();
     let mut processed_blocks: u64 = 0;
     eprintln!("[phase] processing blocks ...");
@@ -2100,11 +2351,15 @@ async fn main() -> Result<()> {
 
                 let replica = next_replica.take().unwrap();
                 let fills = next_fills.take().unwrap();
+                let emit_rows = target_block_range
+                    .map(|(start_height, _)| replica.block_number >= start_height)
+                    .unwrap_or(true);
                 process_block(
                     replica.block_number,
                     replica.block_time_ms,
                     Some(replica.events),
                     Some(fills.fills),
+                    emit_rows,
                     &mut rows,
                     &mut orders,
                     &mut cloid_to_oid,
@@ -2127,11 +2382,15 @@ async fn main() -> Result<()> {
             }
             (Some(replica), Some(fills)) if replica.block_number < fills.block_number => {
                 let replica = next_replica.take().unwrap();
+                let emit_rows = target_block_range
+                    .map(|(start_height, _)| replica.block_number >= start_height)
+                    .unwrap_or(true);
                 process_block(
                     replica.block_number,
                     replica.block_time_ms,
                     Some(replica.events),
                     None,
+                    emit_rows,
                     &mut rows,
                     &mut orders,
                     &mut cloid_to_oid,
@@ -2153,11 +2412,15 @@ async fn main() -> Result<()> {
             }
             (Some(_), Some(_)) => {
                 let fills = next_fills.take().unwrap();
+                let emit_rows = target_block_range
+                    .map(|(start_height, _)| fills.block_number >= start_height)
+                    .unwrap_or(true);
                 process_block(
                     fills.block_number,
                     fills.block_time_ms,
                     None,
                     Some(fills.fills),
+                    emit_rows,
                     &mut rows,
                     &mut orders,
                     &mut cloid_to_oid,
@@ -2198,10 +2461,8 @@ async fn main() -> Result<()> {
     finalize_output(writer.take().unwrap(), &mut rows, &schema)?;
 
     println!(
-        "Wrote BTC diff parquet to {}. Inputs: replica={} fills={}. requester_pays={}. Remaining live orders in memory at EOF: {}",
+        "Wrote BTC diff parquet to {}. requester_pays={}. Remaining live orders in memory at EOF: {}",
         args.output_parquet.display(),
-        replica_source.describe(),
-        node_fills_source.describe(),
         requester_pays,
         orders.len()
     );
