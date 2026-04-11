@@ -5,8 +5,8 @@
 比较口径：
 
 - 参考文件：`/home/aimee/BTC_diff_HFT_951980001_952000000.parquet`
-- 当前程序输出样本：`btc_diff_951980001_span10000_matchfix9.parquet`
-- 重叠区间：`951980001..951990000`
+- 当前程序输出样本：`btc_diff_951980001_span20000_matchfix9.parquet`
+- 重叠区间：`951980001..952000000`
 
 ## 输入与基本假设
 
@@ -60,15 +60,16 @@
 
 当前结果：
 
-- `new/add`: `missing=72`, `extra=1`
-- 同键错量：`5`
+- `new/add`: `missing=129`, `extra=2`
+- 同键错量：`20`
 
 主要原因：
 
 - `modify / batchModify` 的 `type=default / no-status` 路径拿不到新 `oid`
 - 少量 reference 中的订单在当前可见输入里没有完整链路
-- `1` 条 extra 来自当前对 `filled-only GTC` 的保守入簿判断
-- `5` 条同键错量是 reduce-only 超过仓位大小的特殊情况，当前数据无法识别，属于已知接受项
+- `2` 条 extra 来自当前对 `filled-only GTC` 的保守入簿判断
+- 完全无痕的非 trigger 缺失仍主要集中在 `0x53310...` 这组 reduce-only GTC，以及少量 `default/no-status modify` 用户
+- `20` 条同键错量仍主要是 reduce-only 超过仓位大小的特殊情况，当前数据无法识别，属于已知接受项
 
 ## update/fill
 
@@ -88,12 +89,13 @@
 
 当前结果：
 
-- `update/fill`: `missing=0`, `extra=0`
-- `update/cancel`: `missing=73`, `extra=0`
+- `update/fill`: 按 `(block, oid)` 键集 `missing=0`, `extra=0`
+- `update/cancel`: `missing=137`, `extra=0`
 
 说明：
 
-- `update/fill` 已和参考对齐
+- `update/fill` 的键集已和参考对齐
+- 但仍有极少数同 block、同 oid 的多次 fill，在行级 multiplicity 上还没完全对齐
 - `update/cancel` 当前全缺失，这是实现选择，不是偶发 bug
 
 ## remove/fill
@@ -112,7 +114,7 @@
 
 当前结果：
 
-- `remove/fill`: `missing=135`, `extra=0`
+- `remove/fill`: `missing=142`, `extra=0`
 
 主要原因：
 
@@ -141,22 +143,23 @@
 
 当前结果：
 
-- `remove/cancel`: `missing=732`, `extra=63`
-- 新文件里的 `oid=NULL remove/cancel`: `536`
+- `remove/cancel`: `missing=1011`, `extra=104`
+- 新文件里的 `oid=NULL remove/cancel`: `597`
 
-`missing=732` 的构成：
+`missing=1011` 的构成：
 
-- `538` 条：参考是非空 `oid canceled`，当前降级成了 `oid=NULL canceled`
-- `192` 条：`reduceOnlyCanceled`
-- `2` 条：`selfTradeCanceled`
+- `604` 条：参考是非空 `oid canceled`，当前降级成了 `oid=NULL canceled`
+- `397` 条：`reduceOnlyCanceled`
+- `10` 条：`selfTradeCanceled`
 
-`extra=63` 的构成：
+`extra=104` 的构成：
 
-- `63/63` 都是 non-trigger `cancel`
-- `63/63` 的原始响应都是 `status=ok, type=cancel, statuses[0]=success`
-- 这些行当前都表现为 non-null fallback cancel，且参考里没有对应 `user+oid` cancel
+- 主体仍是 non-trigger `cancel`
+- 主体的原始响应都是 `status=ok, type=cancel, statuses[0]=success`
+- 这类行当前都表现为 non-null fallback cancel，且参考里没有对应 `user+oid` cancel
+- 还夹带极少量同 block 重复 fallback 和同块 add 后立刻 cancel 未完整还原的残差
 
-这 63 条是当前程序和参考文件最主要的剩余策略差异之一：
+这组 extra 仍是当前程序和参考文件最主要的剩余策略差异之一：
 
 - 当前程序：保留 non-trigger `cancel success` 的 non-null fallback
 - 参考文件：并不总是记录这类 cancel
@@ -197,6 +200,71 @@
 - 当前程序保留 non-trigger `cancel success` 的 fallback cancel，而参考并不总保留
 - 当前程序无法恢复所有 `type=default / no-status` 场景下的新 `oid`
 - 当前程序在 no-warmup 模式下天然会丢掉一部分 `remove/fill`
+
+## 仍未完全还原的逻辑
+
+以下几点在 `20000` block 对比里仍然可见，说明它们不是单纯噪声，而是当前实现尚未完全还原的行为差异。
+
+### 1. filled-only GTC 不一定真的入簿
+
+当前程序的规则是：
+
+- `Gtc`
+- response 只有 `filled`
+- 且 `order_sz > filled.totalSz`
+
+就认为仍有剩余数量入簿，因此生成 `new/add`。
+
+但在 `20000` block 对比里仍有 `2` 条 extra `new/add`，说明这个条件还偏宽。至少存在以下情况：
+
+- response 看起来像部分成交
+- 但参考文件并没有把剩余部分记成入簿订单
+
+这意味着仅凭 `filled.totalSz` 仍不足以判断“是否真的产生了挂单”。
+
+### 2. 同 block cancelByCloid + batchModify 的顺序/绑定语义未完全还原
+
+已观察到同 block 内出现：
+
+- 先 `cancelByCloid(success)`
+- 再 `batchModify` 返回新的 `resting oid`
+
+参考文件会把这条链还原成：
+
+- old oid `remove/cancel`
+- new oid `new/add`
+- 有时 new oid 在同块又立刻 `remove/cancel`
+
+当前程序在这类场景里仍可能出现：
+
+- old oid 已正确 cancel
+- 同块又多打一条 old oid fallback cancel
+- new oid 的同块 cancel 漏掉
+
+因此这部分 block 内时序和 `cloid -> oid` 重绑定逻辑还未完全还原。
+
+### 3. 同 block、同 oid 的多次 fill 还存在极少数 multiplicity 差异
+
+`update/fill` 的键集已对齐，但 `20000` block 内仍能看到极少数：
+
+- 参考里同 block、同 oid 有两条 `update/fill`
+- 当前程序只落一条
+
+这说明当前按 `node_fills_by_block + tid` 的 fill 还原，已足够覆盖键集合，但在少量多笔成交合并/拆分上仍和参考不完全一致。
+
+### 4. trigger 触发后转为普通单的后续生命周期未还原
+
+当前程序采取 trigger 完全不入 parquet 的保守策略。
+
+代价是，当参考文件把某些 trigger 单触发后，继续按普通单记录其：
+
+- `new/add`
+- `remove/cancel`
+- 甚至后续 fill/cancel 生命周期
+
+当前程序会整体缺失这一段。
+
+这不是简单的 `oid=NULL` 或 fallback 问题，而是“trigger 触发后何时变成普通 live order”的状态迁移没有建模。
 
 因此，当前程序更适合被理解为：
 
