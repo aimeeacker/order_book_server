@@ -1,13 +1,19 @@
 #![allow(unused_crate_dependencies)]
 
 mod build_btc_diff_replica_day_index;
+#[path = "lz4_parallel_common.rs"]
+mod lz4_parallel_common;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, create_dir_all, rename};
+use std::pin::Pin;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_array::builder::{
     BooleanBuilder, Decimal128Builder, Int32Builder, Int64Builder, StringBuilder, TimestampMillisecondBuilder,
@@ -18,16 +24,22 @@ use async_compression::tokio::bufread::Lz4Decoder;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::RequestPayer;
-use chrono::{Datelike, Days, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, Days, NaiveDate, Timelike};
 use clap::Parser;
+use env_logger::{Builder, Env};
+use log::{info, warn};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use rusqlite::{Connection, params};
 use rust_decimal::Decimal;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader as TokioBufReader};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::JoinHandle;
+
+use lz4_parallel_common::{ParallelLz4LineReader, ParallelLz4ReaderConfig};
 
 use crate::build_btc_diff_replica_day_index::{
     REPLICA_DAY_INDEX, REPLICA_INDEX_END_DATE_YYYYMMDD, REPLICA_INDEX_END_EXCLUSIVE_CHUNK,
@@ -48,6 +60,59 @@ const UNKNOWN_OID_SAMPLE_LIMIT_PER_WINDOW: usize = 200;
 const PRUNE_SAMPLE_LIMIT_PER_RUN: usize = 200;
 const REQUESTER_PAYS_ALWAYS: bool = true;
 const CANCEL_STATUS_CANCELED: &str = "canceled";
+const PROGRESS_LOG_INTERVAL_BLOCKS: u64 = 10_000;
+const ENABLE_MISSING_STATUS_WARN: bool = false;
+const LZ4_IO_BUFFER_BYTES: usize = 4 << 20;
+const MAX_REPLICA_PREFETCH_WORKERS: usize = 16;
+const DEFAULT_REPLICA_PREFETCH_WORKERS: usize = 4;
+const DEFAULT_REPLICA_PREFETCH: usize = 16;
+const DEFAULT_REPLICA_S3_CONNECTIONS: usize = 2;
+const DEFAULT_REPLICA_PREFETCH_BUFFER_MB: usize = 256;
+const TARGET_REPLICA_CPU_CORES: usize = 4;
+const REPLICA_WORKER_SCALE_UP: usize = 2;
+const REPLICA_PREFETCH_BUFFER_PERMIT_BYTES: usize = 1 << 20;
+const REPLICA_S3_RANGE_PART_BYTES: usize = 16 << 20;
+const WARMUP_STATE_FORMAT_VERSION: u32 = 3;
+const WARMUP_STATE_ZSTD_LEVEL: i32 = 3;
+const DEFAULT_OUTPUT_DIR: &str = "/home/aimee/hyperliquid";
+const DEFAULT_UNKNOWN_OID_SQLITE_FILE: &str = "/home/aimee/hyperliquid/build_btc_diff_unknown_oid.sqlite";
+const PRIMARY_ASSET_SYMBOL: &str = "BTC";
+
+fn parse_height_span(raw: &str) -> std::result::Result<u64, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("height span cannot be empty".to_owned());
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let (digits, multiplier) = if let Some(value) = lower.strip_suffix('k') {
+        (value, 1_000u64)
+    } else if let Some(value) = lower.strip_suffix('m') {
+        (value, 1_000_000u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+
+    if digits.is_empty() {
+        return Err(format!(
+            "invalid --span '{raw}', expected integer or suffix k/m (e.g. 20000, 20k, 2m)"
+        ));
+    }
+
+    let base = digits.replace('_', "");
+    if base.is_empty() {
+        return Err(format!(
+            "invalid --span '{raw}', expected integer or suffix k/m (e.g. 20000, 20k, 2m)"
+        ));
+    }
+
+    let parsed = base.parse::<u64>().map_err(|_| {
+        format!("invalid --span '{raw}', expected integer or suffix k/m (e.g. 20000, 20k, 2m)")
+    })?;
+
+    parsed.checked_mul(multiplier).ok_or_else(|| format!("--span overflow for '{raw}'"))
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Args {
@@ -61,26 +126,82 @@ struct Args {
     )]
     node_fills_by_block: String,
 
-    #[arg(long, help = "Output parquet directory (files are named by actual start/end heights)")]
+    #[arg(
+        long,
+        default_value = DEFAULT_OUTPUT_DIR,
+        help = "Output parquet directory (files are named by actual start/end heights)"
+    )]
     output_parquet: PathBuf,
 
-    #[arg(long, default_value = "/tmp/build_btc_diff_unknown_oid.sqlite")]
+    #[arg(long, default_value = DEFAULT_UNKNOWN_OID_SQLITE_FILE)]
     unknown_oid_log_sqlite: PathBuf,
 
-    #[arg(long)]
-    start_height: Option<u64>,
+    #[arg(long = "start", visible_alias = "start-height")]
+    start: Option<u64>,
 
-    #[arg(long)]
-    height_span: Option<u64>,
+    #[arg(
+        long = "span",
+        visible_alias = "height-span",
+        value_parser = parse_height_span,
+        help = "Block range size; supports suffixes like 20k and 2m"
+    )]
+    span: Option<u64>,
 
-    #[arg(long, default_value_t = 1_200_000)]
-    warmup: u64,
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "1280000",
+        value_parser = parse_height_span,
+        help = "Warmup block count; supports suffixes like 20k and 2m. Omit --warmup to disable warmup, use --warmup without value for default 1280000"
+    )]
+    warmup: Option<u64>,
+
+    #[arg(
+        long,
+        default_value = DEFAULT_OUTPUT_DIR,
+        help = "Directory to emit warmup state snapshots every 1m block boundary (msgpack + zstd level 3)"
+    )]
+    warmup_state_output_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Warmup state snapshot file (.msgpack.zst) to restore state and reduce warmup replay"
+    )]
+    warmup_state_file: Option<PathBuf>,
 
     #[arg(long, default_value_t = 2_000_000)]
     block_time_tolerance_ns: i64,
 
     #[arg(long, default_value_t = 0)]
     block_time_match_tolerance_ms: i64,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REPLICA_PREFETCH,
+        help = "Replica async preparse queue depth to overlap read/parse with processing (default 16)"
+    )]
+    replica_prefetch: usize,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REPLICA_PREFETCH_WORKERS,
+        help = "Replica prefetch background workers (default 4, capped at 16)"
+    )]
+    replica_prefetch_workers: usize,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REPLICA_S3_CONNECTIONS,
+        help = "Replica S3 concurrent range streams per active object (default 2)"
+    )]
+    replica_s3_connections: usize,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_REPLICA_PREFETCH_BUFFER_MB,
+        help = "Replica compressed prefetch memory buffer in MiB (default 256)"
+    )]
+    replica_prefetch_buffer_mb: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -139,7 +260,115 @@ struct SignedActionPayload {
 #[derive(Debug, Default, Deserialize)]
 struct SignedActionEnvelope {
     #[serde(default)]
-    action: Value,
+    action: ActionInput,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum JsonU64OrString {
+    U64(u64),
+    String(String),
+}
+
+impl JsonU64OrString {
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::U64(value) => Some(*value),
+            Self::String(raw) => raw.parse::<u64>().ok(),
+        }
+    }
+
+    fn to_order_ref(&self) -> OrderRef {
+        match self {
+            Self::U64(value) => OrderRef::Oid(*value),
+            Self::String(raw) => match raw.parse::<u64>() {
+                Ok(value) => OrderRef::Oid(value),
+                Err(_err) => OrderRef::Cloid(raw.clone()),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ActionInput {
+    #[serde(rename = "type", default)]
+    action_type: Option<String>,
+    #[serde(default)]
+    orders: Vec<OrderInput>,
+    #[serde(default)]
+    cancels: Vec<CancelInput>,
+    #[serde(default)]
+    order: Option<OrderInput>,
+    #[serde(default)]
+    modifies: Vec<ModifyInput>,
+    #[serde(default)]
+    oid: Option<JsonU64OrString>,
+    #[serde(default)]
+    cloid: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OrderInput {
+    #[serde(default, alias = "asset")]
+    a: Option<JsonU64OrString>,
+    #[serde(default)]
+    b: Option<bool>,
+    #[serde(default, alias = "price")]
+    p: Option<String>,
+    #[serde(default, alias = "size")]
+    s: Option<String>,
+    #[serde(default)]
+    t: Option<OrderTypeInput>,
+    #[serde(default, alias = "cloid")]
+    c: Option<String>,
+    #[serde(default)]
+    r: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OrderTypeInput {
+    #[serde(default)]
+    trigger: Option<OrderTriggerInput>,
+    #[serde(default)]
+    limit: Option<OrderLimitInput>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OrderTriggerInput {
+    #[serde(rename = "triggerPx", default)]
+    trigger_px: Option<String>,
+    #[serde(rename = "isMarket", default)]
+    is_market: bool,
+    #[serde(default)]
+    tpsl: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OrderLimitInput {
+    #[serde(default)]
+    tif: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CancelInput {
+    #[serde(default)]
+    o: Option<JsonU64OrString>,
+    #[serde(default)]
+    oid: Option<JsonU64OrString>,
+    #[serde(default)]
+    cloid: Option<String>,
+    #[serde(default, alias = "asset")]
+    a: Option<JsonU64OrString>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModifyInput {
+    #[serde(default)]
+    order: Option<OrderInput>,
+    #[serde(default)]
+    oid: Option<JsonU64OrString>,
+    #[serde(default)]
+    cloid: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -159,7 +388,125 @@ struct ResponseResult {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
-    response: Value,
+    response: ResponseBody,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ResponseBody {
+    Text(String),
+    Object(ResponseObject),
+    Other(IgnoredAny),
+}
+
+impl Default for ResponseBody {
+    fn default() -> Self {
+        Self::Other(IgnoredAny)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ResponseObject {
+    #[serde(rename = "type", default)]
+    response_type: Option<String>,
+    #[serde(default)]
+    data: Option<ResponseData>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ResponseData {
+    #[serde(default)]
+    statuses: Vec<StatusEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StatusEntry {
+    Text(String),
+    Object(StatusObject),
+}
+
+impl StatusEntry {
+    fn is_success(&self) -> bool {
+        matches!(self, Self::Text(raw) if raw.eq_ignore_ascii_case("success"))
+    }
+
+    fn is_pending_trigger(&self) -> bool {
+        match self {
+            Self::Text(raw) => {
+                raw.eq_ignore_ascii_case("waitingForTrigger") || raw.eq_ignore_ascii_case("waitingForFill")
+            }
+            Self::Object(value) => value.waiting_for_trigger || value.waiting_for_fill,
+        }
+    }
+
+    fn has_resting(&self) -> bool {
+        matches!(self, Self::Object(value) if value.resting.is_some())
+    }
+
+    fn resting_oid(&self) -> Option<u64> {
+        match self {
+            Self::Object(value) => value
+                .resting
+                .as_ref()
+                .and_then(|resting| resting.oid.as_ref())
+                .and_then(JsonU64OrString::as_u64),
+            Self::Text(_raw) => None,
+        }
+    }
+
+    fn filled_oid(&self) -> Option<u64> {
+        match self {
+            Self::Object(value) => value
+                .filled
+                .as_ref()
+                .and_then(|filled| filled.oid.as_ref())
+                .and_then(JsonU64OrString::as_u64),
+            Self::Text(_raw) => None,
+        }
+    }
+
+    fn filled_total_sz(&self) -> Option<&str> {
+        match self {
+            Self::Object(value) => value.filled.as_ref().and_then(|filled| filled.total_sz.as_deref()),
+            Self::Text(_raw) => None,
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        match self {
+            Self::Object(value) => value.error.as_deref(),
+            Self::Text(_raw) => None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StatusObject {
+    #[serde(default)]
+    resting: Option<StatusOid>,
+    #[serde(default)]
+    filled: Option<FilledStatus>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(rename = "waitingForTrigger", default)]
+    waiting_for_trigger: bool,
+    #[serde(rename = "waitingForFill", default)]
+    waiting_for_fill: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StatusOid {
+    #[serde(default)]
+    oid: Option<JsonU64OrString>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FilledStatus {
+    #[serde(default)]
+    oid: Option<JsonU64OrString>,
+    #[serde(rename = "totalSz", default)]
+    total_sz: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,12 +515,6 @@ struct NodeFillsBlock {
     block_number: u64,
     #[serde(default)]
     events: Vec<(String, FillEvent)>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NodeFillsTimeBlock {
-    block_time: String,
-    block_number: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,7 +546,7 @@ struct FillRecord {
     tid: Option<u64>,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 struct UserCloidKey {
     user: String,
     cloid: String,
@@ -264,27 +605,6 @@ struct StalePruneRun {
     samples: Vec<PrunedOrderSample>,
 }
 
-#[derive(Debug, Serialize)]
-struct PrunedKnownOidSample {
-    oid: u64,
-    created_block_number: u64,
-    created_time_ms: i64,
-    pruned_at_block_number: u64,
-    pruned_at_time_ms: i64,
-    age_ms: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct KnownOidPruneRun {
-    trigger_block_number: u64,
-    trigger_block_time_ms: i64,
-    cutoff_time_ms: i64,
-    pruned_total: u64,
-    sampled: u64,
-    sample_dropped: u64,
-    samples: Vec<PrunedKnownOidSample>,
-}
-
 #[derive(Debug)]
 struct UnknownOidWindowLogger {
     conn: Connection,
@@ -293,7 +613,6 @@ struct UnknownOidWindowLogger {
     stats: UnknownOidWindowStats,
     samples: Vec<UnknownOidSample>,
     stale_prune_runs: Vec<StalePruneRun>,
-    known_oid_prune_runs: Vec<KnownOidPruneRun>,
 }
 
 impl UnknownOidWindowLogger {
@@ -307,7 +626,8 @@ PRAGMA synchronous=NORMAL;
 PRAGMA busy_timeout=5000;
 
 CREATE TABLE IF NOT EXISTS unknown_oid_windows (
-    window_start_block INTEGER PRIMARY KEY,
+    asset_symbol TEXT NOT NULL,
+    window_start_block INTEGER NOT NULL,
     window_end_block INTEGER NOT NULL,
     window_type TEXT NOT NULL,
     unknown_cancel_total INTEGER NOT NULL,
@@ -316,10 +636,12 @@ CREATE TABLE IF NOT EXISTS unknown_oid_windows (
     unresolved_user_cloid_modify INTEGER NOT NULL,
     sampled INTEGER NOT NULL,
     sample_dropped INTEGER NOT NULL,
-    stale_prune_runs INTEGER NOT NULL
+    stale_prune_runs INTEGER NOT NULL,
+    PRIMARY KEY (asset_symbol, window_start_block)
 );
 
 CREATE TABLE IF NOT EXISTS unknown_oid_samples (
+    asset_symbol TEXT NOT NULL,
     window_start_block INTEGER NOT NULL,
     seq INTEGER NOT NULL,
     block_number INTEGER NOT NULL,
@@ -332,7 +654,7 @@ CREATE TABLE IF NOT EXISTS unknown_oid_samples (
     ref_oid INTEGER,
     ref_cloid TEXT,
     mapped_oid INTEGER,
-    PRIMARY KEY (window_start_block, seq)
+    PRIMARY KEY (asset_symbol, window_start_block, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_unknown_oid_samples_block ON unknown_oid_samples(block_number);
 CREATE INDEX IF NOT EXISTS idx_unknown_oid_samples_ref_oid ON unknown_oid_samples(ref_oid);
@@ -340,6 +662,7 @@ CREATE INDEX IF NOT EXISTS idx_unknown_oid_samples_mapped_oid ON unknown_oid_sam
 CREATE INDEX IF NOT EXISTS idx_unknown_oid_samples_user_cloid ON unknown_oid_samples(user_addr, ref_cloid);
 
 CREATE TABLE IF NOT EXISTS stale_prune_runs (
+    asset_symbol TEXT NOT NULL,
     window_start_block INTEGER NOT NULL,
     run_seq INTEGER NOT NULL,
     trigger_block_number INTEGER NOT NULL,
@@ -348,11 +671,12 @@ CREATE TABLE IF NOT EXISTS stale_prune_runs (
     pruned_total INTEGER NOT NULL,
     sampled INTEGER NOT NULL,
     sample_dropped INTEGER NOT NULL,
-    PRIMARY KEY (window_start_block, run_seq)
+    PRIMARY KEY (asset_symbol, window_start_block, run_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_stale_prune_runs_trigger_block ON stale_prune_runs(trigger_block_number);
 
 CREATE TABLE IF NOT EXISTS stale_prune_samples (
+    asset_symbol TEXT NOT NULL,
     window_start_block INTEGER NOT NULL,
     run_seq INTEGER NOT NULL,
     sample_seq INTEGER NOT NULL,
@@ -364,41 +688,22 @@ CREATE TABLE IF NOT EXISTS stale_prune_samples (
     pruned_at_block_number INTEGER NOT NULL,
     pruned_at_time_ms INTEGER NOT NULL,
     age_ms INTEGER NOT NULL,
-    PRIMARY KEY (window_start_block, run_seq, sample_seq)
+    PRIMARY KEY (asset_symbol, window_start_block, run_seq, sample_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_stale_prune_samples_oid ON stale_prune_samples(oid);
 CREATE INDEX IF NOT EXISTS idx_stale_prune_samples_created_block ON stale_prune_samples(created_block_number);
-
-CREATE TABLE IF NOT EXISTS known_oid_prune_runs (
-    window_start_block INTEGER NOT NULL,
-    run_seq INTEGER NOT NULL,
-    trigger_block_number INTEGER NOT NULL,
-    trigger_block_time_ms INTEGER NOT NULL,
-    cutoff_time_ms INTEGER NOT NULL,
-    pruned_total INTEGER NOT NULL,
-    sampled INTEGER NOT NULL,
-    sample_dropped INTEGER NOT NULL,
-    PRIMARY KEY (window_start_block, run_seq)
-);
-CREATE INDEX IF NOT EXISTS idx_known_oid_prune_runs_trigger_block ON known_oid_prune_runs(trigger_block_number);
-
-CREATE TABLE IF NOT EXISTS known_oid_prune_samples (
-    window_start_block INTEGER NOT NULL,
-    run_seq INTEGER NOT NULL,
-    sample_seq INTEGER NOT NULL,
-    oid INTEGER NOT NULL,
-    created_block_number INTEGER NOT NULL,
-    created_time_ms INTEGER NOT NULL,
-    pruned_at_block_number INTEGER NOT NULL,
-    pruned_at_time_ms INTEGER NOT NULL,
-    age_ms INTEGER NOT NULL,
-    PRIMARY KEY (window_start_block, run_seq, sample_seq)
-);
-CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_oid ON known_oid_prune_samples(oid);
-CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_created_block ON known_oid_prune_samples(created_block_number);
 "#,
         )
         .context("initializing unknown oid sqlite schema")?;
+    conn.execute_batch(
+        r#"
+CREATE INDEX IF NOT EXISTS idx_unknown_oid_windows_asset_start ON unknown_oid_windows(asset_symbol, window_start_block);
+CREATE INDEX IF NOT EXISTS idx_unknown_oid_samples_asset_window_seq ON unknown_oid_samples(asset_symbol, window_start_block, seq);
+CREATE INDEX IF NOT EXISTS idx_stale_prune_runs_asset_window_seq ON stale_prune_runs(asset_symbol, window_start_block, run_seq);
+CREATE INDEX IF NOT EXISTS idx_stale_prune_samples_asset_window_run_seq ON stale_prune_samples(asset_symbol, window_start_block, run_seq, sample_seq);
+"#,
+    )
+    .context("initializing unknown oid sqlite asset indexes")?;
 
         Ok(Self {
             conn,
@@ -407,7 +712,6 @@ CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_created_block ON known_oi
             stats: UnknownOidWindowStats::default(),
             samples: Vec::new(),
             stale_prune_runs: Vec::new(),
-            known_oid_prune_runs: Vec::new(),
         })
     }
 
@@ -474,13 +778,6 @@ CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_created_block ON known_oi
         self.stale_prune_runs.push(run);
     }
 
-    fn record_known_oid_prune_run(&mut self, run: KnownOidPruneRun) {
-        if !self.enabled {
-            return;
-        }
-        self.known_oid_prune_runs.push(run);
-    }
-
     fn flush_current(&mut self) -> Result<()> {
         let Some(window_start_block) = self.current_window_start else {
             return Ok(());
@@ -489,20 +786,20 @@ CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_created_block ON known_oi
         let stats = std::mem::take(&mut self.stats);
         let samples = std::mem::take(&mut self.samples);
         let stale_prune_runs = std::mem::take(&mut self.stale_prune_runs);
-        let known_oid_prune_runs = std::mem::take(&mut self.known_oid_prune_runs);
 
         let tx = self.conn.transaction().context("begin unknown oid sqlite txn")?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO unknown_oid_windows (
-                window_start_block, window_end_block, window_type,
+                asset_symbol, window_start_block, window_end_block, window_type,
                 unknown_cancel_total, unknown_modify_total,
                 unresolved_user_cloid_cancel, unresolved_user_cloid_modify,
                 sampled, sample_dropped, stale_prune_runs
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
+                PRIMARY_ASSET_SYMBOL,
                 i64::try_from(window_start_block)?,
                 i64::try_from(window_end_block)?,
-                "unknown_oid_window_v3_sqlite",
+                "unknown_oid_window_v4_sqlite_asset",
                 i64::try_from(stats.unknown_cancel_total)?,
                 i64::try_from(stats.unknown_modify_total)?,
                 i64::try_from(stats.unresolved_user_cloid_cancel)?,
@@ -514,7 +811,7 @@ CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_created_block ON known_oi
         )?;
 
         if inserted == 0 {
-            eprintln!(
+            warn!(
                 "[warn] unknown-oid sqlite conflict at window_start_block={} (already exists); skipping this window",
                 window_start_block
             );
@@ -525,10 +822,11 @@ CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_created_block ON known_oi
         for (seq, sample) in samples.iter().enumerate() {
             tx.execute(
                 "INSERT OR IGNORE INTO unknown_oid_samples (
-                    window_start_block, seq, block_number, block_time_ms,
+                    asset_symbol, window_start_block, seq, block_number, block_time_ms,
                     event, phase, reason, user_addr, ref_kind, ref_oid, ref_cloid, mapped_oid
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
+                    PRIMARY_ASSET_SYMBOL,
                     i64::try_from(window_start_block)?,
                     i64::try_from(seq)?,
                     i64::try_from(sample.block_number)?,
@@ -548,10 +846,11 @@ CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_created_block ON known_oi
         for (run_seq, run) in stale_prune_runs.iter().enumerate() {
             tx.execute(
                 "INSERT OR IGNORE INTO stale_prune_runs (
-                    window_start_block, run_seq, trigger_block_number, trigger_block_time_ms,
+                    asset_symbol, window_start_block, run_seq, trigger_block_number, trigger_block_time_ms,
                     cutoff_time_ms, pruned_total, sampled, sample_dropped
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
+                    PRIMARY_ASSET_SYMBOL,
                     i64::try_from(window_start_block)?,
                     i64::try_from(run_seq)?,
                     i64::try_from(run.trigger_block_number)?,
@@ -566,55 +865,17 @@ CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_created_block ON known_oi
             for (sample_seq, sample) in run.samples.iter().enumerate() {
                 tx.execute(
                     "INSERT OR IGNORE INTO stale_prune_samples (
-                        window_start_block, run_seq, sample_seq, oid, user_addr, cloid,
+                        asset_symbol, window_start_block, run_seq, sample_seq, oid, user_addr, cloid,
                         created_block_number, created_time_ms, pruned_at_block_number, pruned_at_time_ms, age_ms
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
+                        PRIMARY_ASSET_SYMBOL,
                         i64::try_from(window_start_block)?,
                         i64::try_from(run_seq)?,
                         i64::try_from(sample_seq)?,
                         i64::try_from(sample.oid)?,
                         sample.user.as_str(),
                         sample.cloid.as_deref(),
-                        i64::try_from(sample.created_block_number)?,
-                        sample.created_time_ms,
-                        i64::try_from(sample.pruned_at_block_number)?,
-                        sample.pruned_at_time_ms,
-                        sample.age_ms,
-                    ],
-                )?;
-            }
-        }
-
-        for (run_seq, run) in known_oid_prune_runs.iter().enumerate() {
-            tx.execute(
-                "INSERT OR IGNORE INTO known_oid_prune_runs (
-                    window_start_block, run_seq, trigger_block_number, trigger_block_time_ms,
-                    cutoff_time_ms, pruned_total, sampled, sample_dropped
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    i64::try_from(window_start_block)?,
-                    i64::try_from(run_seq)?,
-                    i64::try_from(run.trigger_block_number)?,
-                    run.trigger_block_time_ms,
-                    run.cutoff_time_ms,
-                    i64::try_from(run.pruned_total)?,
-                    i64::try_from(run.sampled)?,
-                    i64::try_from(run.sample_dropped)?,
-                ],
-            )?;
-
-            for (sample_seq, sample) in run.samples.iter().enumerate() {
-                tx.execute(
-                    "INSERT OR IGNORE INTO known_oid_prune_samples (
-                        window_start_block, run_seq, sample_seq, oid,
-                        created_block_number, created_time_ms, pruned_at_block_number, pruned_at_time_ms, age_ms
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        i64::try_from(window_start_block)?,
-                        i64::try_from(run_seq)?,
-                        i64::try_from(sample_seq)?,
-                        i64::try_from(sample.oid)?,
                         i64::try_from(sample.created_block_number)?,
                         sample.created_time_ms,
                         i64::try_from(sample.pruned_at_block_number)?,
@@ -647,15 +908,9 @@ struct OrderMeta {
     sl_trigger_px: Option<Decimal>,
 }
 
-#[derive(Debug, Clone)]
-struct BlockIndex {
-    ts_ns: i64,
-    block_number: u64,
-}
-
 #[derive(Debug)]
 struct ReplicaBatch {
-    block_number: u64,
+    block_time_ns: i64,
     block_time_ms: i64,
     events: Vec<CmdEvent>,
 }
@@ -663,6 +918,7 @@ struct ReplicaBatch {
 #[derive(Debug)]
 struct NodeFillsBatch {
     block_number: u64,
+    block_time_ns: i64,
     block_time_ms: i64,
     fills: Vec<FillRecord>,
 }
@@ -718,7 +974,7 @@ enum CmdEvent {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderState {
     user: String,
     cloid: Option<String>,
@@ -738,17 +994,31 @@ struct OrderState {
     sl_trigger_px: Option<Decimal>,
 }
 
-#[derive(Debug, Clone)]
-struct KnownOidState {
-    created_block_number: u64,
-    created_time_ms: i64,
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct TriggerOrderRefs {
     oid_to_cloid: HashMap<u64, Option<UserCloidKey>>,
     cloid_to_oid: HashMap<String, HashMap<String, u64>>,
     pending_by_user: HashMap<String, VecDeque<Option<String>>>,
+    #[serde(default)]
+    oid_created_time_ms: HashMap<u64, i64>,
+    #[serde(default)]
+    #[serde(skip_serializing, skip_deserializing)]
+    oid_created_queue: VecDeque<(i64, u64)>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct WarmupAssetSnapshot {
+    live_orders: HashMap<u64, OrderState>,
+    live_oid_by_user_cloid: HashMap<String, HashMap<String, u64>>,
+    trigger_refs: TriggerOrderRefs,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WarmupStateSnapshot {
+    format_version: u32,
+    checkpoint_block_number: u64,
+    checkpoint_block_time_ms: i64,
+    assets: HashMap<String, WarmupAssetSnapshot>,
 }
 
 #[derive(Debug)]
@@ -936,22 +1206,99 @@ impl RowBuffer {
     }
 }
 
-fn parse_timestamp_ns(raw: &str) -> Result<i64> {
-    let (ts_ns, _ts_ms) = parse_timestamp_ns_ms(raw)?;
-    Ok(ts_ns)
-}
-
 fn parse_timestamp_ms(raw: &str) -> Result<i64> {
     let (_ts_ns, ts_ms) = parse_timestamp_ns_ms(raw)?;
     Ok(ts_ms)
 }
 
+fn parse_fixed_digits_u32(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
 fn parse_timestamp_ns_ms(raw: &str) -> Result<(i64, i64)> {
-    let dt = NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f")
-        .with_context(|| format!("failed to parse timestamp: {raw}"))?;
-    let utc = dt.and_utc();
-    let ts_ns = utc.timestamp_nanos_opt().ok_or_else(|| anyhow!("timestamp overflow for {raw}"))?;
-    let ts_ms = utc.timestamp_millis();
+    const BASE_LEN: usize = 19;
+    const NS_SCALE: [i64; 10] = [
+        1_000_000_000,
+        100_000_000,
+        10_000_000,
+        1_000_000,
+        100_000,
+        10_000,
+        1_000,
+        100,
+        10,
+        1,
+    ];
+
+    let bytes = raw.as_bytes();
+    if bytes.len() < BASE_LEN
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        bail!("failed to parse timestamp: {raw}");
+    }
+
+    let year = i32::try_from(parse_fixed_digits_u32(&bytes[0..4]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?)
+        .map_err(|_| anyhow!("failed to parse timestamp: {raw}"))?;
+    let month = parse_fixed_digits_u32(&bytes[5..7]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
+    let day = parse_fixed_digits_u32(&bytes[8..10]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
+    let hour = parse_fixed_digits_u32(&bytes[11..13]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
+    let minute = parse_fixed_digits_u32(&bytes[14..16]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
+    let second = parse_fixed_digits_u32(&bytes[17..19]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
+
+    let mut idx = BASE_LEN;
+    let mut frac_ns = 0i64;
+    if idx < bytes.len() {
+        if bytes[idx] == b'.' {
+            idx += 1;
+            let frac_start = idx;
+            while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+                idx += 1;
+            }
+            let frac_digits = idx.saturating_sub(frac_start);
+            if frac_digits == 0 {
+                bail!("failed to parse timestamp: {raw}");
+            }
+
+            let kept_digits = frac_digits.min(9);
+            let frac_value = parse_fixed_digits_u32(&bytes[frac_start..(frac_start + kept_digits)])
+                .ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
+            frac_ns = i64::from(frac_value)
+                .checked_mul(NS_SCALE[kept_digits])
+                .ok_or_else(|| anyhow!("timestamp overflow for {raw}"))?;
+        }
+
+        if idx < bytes.len() {
+            if bytes[idx] == b'Z' && idx + 1 == bytes.len() {
+                idx += 1;
+            } else {
+                bail!("failed to parse timestamp: {raw}");
+            }
+        }
+    }
+
+    if idx != bytes.len() {
+        bail!("failed to parse timestamp: {raw}");
+    }
+
+    let date = NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
+    let dt = date.and_hms_opt(hour, minute, second).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
+    let ts_sec = dt.and_utc().timestamp();
+    let ts_ns = ts_sec
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(frac_ns))
+        .ok_or_else(|| anyhow!("timestamp overflow for {raw}"))?;
+    let ts_ms = ts_ns.div_euclid(1_000_000);
     Ok((ts_ns, ts_ms))
 }
 
@@ -959,76 +1306,36 @@ fn parse_decimal(raw: &str) -> Result<Decimal> {
     raw.parse::<Decimal>().with_context(|| format!("failed to parse decimal: {raw}"))
 }
 
-fn get_u64(value: &Value, keys: &[&str]) -> Option<u64> {
-    for key in keys {
-        let Some(v) = value.get(*key) else {
-            continue;
-        };
-        if let Some(parsed) = v.as_u64() {
-            return Some(parsed);
-        }
-        if let Some(raw) = v.as_str()
-            && let Ok(parsed) = raw.parse::<u64>()
-        {
-            return Some(parsed);
-        }
-    }
-    None
+fn parse_order_ref(oid: Option<&JsonU64OrString>, cloid: Option<&str>) -> Option<OrderRef> {
+    oid.map(JsonU64OrString::to_order_ref).or_else(|| cloid.map(|value| OrderRef::Cloid(value.to_owned())))
 }
 
-fn get_string(value: &Value, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(raw) = value.get(*key).and_then(Value::as_str) {
-            return Some(raw.to_owned());
-        }
-    }
-    None
+fn parse_cancel_order_ref(cancel: &CancelInput) -> Option<OrderRef> {
+    cancel
+        .o
+        .as_ref()
+        .map(JsonU64OrString::to_order_ref)
+        .or_else(|| cancel.oid.as_ref().map(JsonU64OrString::to_order_ref))
+        .or_else(|| cancel.cloid.as_deref().map(|value| OrderRef::Cloid(value.to_owned())))
 }
 
-fn get_order_ref(value: &Value, keys: &[&str]) -> Option<OrderRef> {
-    for key in keys {
-        let Some(v) = value.get(*key) else {
-            continue;
-        };
-        if *key == "cloid" {
-            if let Some(raw) = v.as_str() {
-                return Some(OrderRef::Cloid(raw.to_owned()));
-            }
-            continue;
-        }
-        if let Some(parsed) = v.as_u64() {
-            return Some(OrderRef::Oid(parsed));
-        }
-        if let Some(raw) = v.as_str() {
-            if let Ok(parsed) = raw.parse::<u64>() {
-                return Some(OrderRef::Oid(parsed));
-            }
-            return Some(OrderRef::Cloid(raw.to_owned()));
-        }
-    }
-    None
-}
-
-fn parse_order_fields(order: &Value) -> Option<(u64, String, Decimal, Decimal, Option<String>, OrderMeta)> {
-    let asset = get_u64(order, &["a", "asset"])?;
-    let is_bid = order.get("b")?.as_bool()?;
+fn parse_order_fields(order: &OrderInput) -> Option<(u64, String, Decimal, Decimal, Option<String>, OrderMeta)> {
+    let asset = order.a.as_ref().and_then(JsonU64OrString::as_u64)?;
+    let is_bid = order.b?;
     let side = if is_bid { "B" } else { "A" }.to_owned();
-    let px_raw = get_string(order, &["p", "price"])?;
-    let px = parse_decimal(&px_raw).ok()?;
-    let sz_raw = get_string(order, &["s", "size"])?;
-    let sz = parse_decimal(&sz_raw).ok()?;
-    let trigger = order.get("t").and_then(|t| t.get("trigger"));
-    let cloid = get_string(order, &["c", "cloid"]);
-    let reduce_only = order.get("r").and_then(Value::as_bool);
+    let px = parse_decimal(order.p.as_deref()?).ok()?;
+    let sz = parse_decimal(order.s.as_deref()?).ok()?;
+    let trigger = order.t.as_ref().and_then(|value| value.trigger.as_ref());
+    let cloid = order.c.clone();
+    let reduce_only = order.r;
 
     let meta = if let Some(trigger) = trigger {
-        let trigger_px = get_string(trigger, &["triggerPx"]).and_then(|raw| parse_decimal(&raw).ok())?;
-        let is_market = trigger.get("isMarket").and_then(Value::as_bool).unwrap_or(false);
-        let tpsl = trigger.get("tpsl").and_then(Value::as_str);
+        let trigger_px = parse_decimal(trigger.trigger_px.as_deref()?).ok()?;
+        let tpsl = trigger.tpsl.as_deref();
         OrderMeta {
             tif: None,
             reduce_only,
-            order_type: Some(if is_market { "Stop Market".to_owned() } else { "Stop Limit".to_owned() }),
+            order_type: Some(if trigger.is_market { "Stop Market".to_owned() } else { "Stop Limit".to_owned() }),
             is_trigger: true,
             trigger_condition: None,
             trigger_px: Some(trigger_px),
@@ -1037,12 +1344,7 @@ fn parse_order_fields(order: &Value) -> Option<(u64, String, Decimal, Decimal, O
             sl_trigger_px: if tpsl == Some("sl") { Some(trigger_px) } else { None },
         }
     } else {
-        let tif = order
-            .get("t")
-            .and_then(|t| t.get("limit"))
-            .and_then(|limit| limit.get("tif"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
+        let tif = order.t.as_ref().and_then(|value| value.limit.as_ref()).and_then(|value| value.tif.clone());
         OrderMeta {
             tif,
             reduce_only,
@@ -1059,17 +1361,18 @@ fn parse_order_fields(order: &Value) -> Option<(u64, String, Decimal, Decimal, O
     Some((asset, side, px, sz, cloid, meta))
 }
 
-fn parse_statuses(response: &Value) -> &[Value] {
-    response
-        .get("data")
-        .and_then(|data| data.get("statuses"))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
+fn parse_statuses(response: &ResponseBody) -> &[StatusEntry] {
+    match response {
+        ResponseBody::Object(value) => value.data.as_ref().map(|data| data.statuses.as_slice()).unwrap_or(&[]),
+        ResponseBody::Text(_) | ResponseBody::Other(_) => &[],
+    }
 }
 
-fn response_type(response: &Value) -> Option<&str> {
-    response.get("type").and_then(Value::as_str)
+fn response_type(response: &ResponseBody) -> Option<&str> {
+    match response {
+        ResponseBody::Object(value) => value.response_type.as_deref(),
+        ResponseBody::Text(_) | ResponseBody::Other(_) => None,
+    }
 }
 
 fn is_dead_order_error(raw: &str) -> bool {
@@ -1081,25 +1384,19 @@ fn is_dead_order_modify_response(result: &ResponseResult) -> bool {
         return true;
     }
 
-    if let Some(raw) = result.response.as_str() {
+    if let ResponseBody::Text(raw) = &result.response {
         return is_dead_order_error(raw);
     }
 
-    parse_statuses(&result.response)
-        .iter()
-        .any(|status| status.get("error").and_then(Value::as_str).is_some_and(is_dead_order_error))
+    parse_statuses(&result.response).iter().any(|status| status.error().is_some_and(is_dead_order_error))
 }
 
-fn is_success_status(status: Option<&Value>) -> bool {
-    status.and_then(Value::as_str).is_some_and(|raw| raw.eq_ignore_ascii_case("success"))
+fn is_success_status(status: Option<&StatusEntry>) -> bool {
+    status.is_some_and(StatusEntry::is_success)
 }
 
-fn is_pending_trigger_status(status: &Value) -> bool {
-    status
-        .as_str()
-        .is_some_and(|raw| raw.eq_ignore_ascii_case("waitingForTrigger") || raw.eq_ignore_ascii_case("waitingForFill"))
-        || status.get("waitingForTrigger").and_then(Value::as_bool).unwrap_or(false)
-        || status.get("waitingForFill").and_then(Value::as_bool).unwrap_or(false)
+fn is_pending_trigger_status(status: &StatusEntry) -> bool {
+    status.is_pending_trigger()
 }
 
 enum BookedSzDecision {
@@ -1108,16 +1405,12 @@ enum BookedSzDecision {
     InvalidFilledTotalSz,
 }
 
-fn parse_booked_and_raw_sz(order_sz: Decimal, status: &Value) -> BookedSzDecision {
-    let Some(filled) = status.get("filled") else {
+fn parse_booked_and_raw_sz(order_sz: Decimal, status: &StatusEntry) -> BookedSzDecision {
+    let Some(raw_total_sz) = status.filled_total_sz() else {
         return BookedSzDecision::Booked { booked_sz: order_sz, raw_sz: None };
     };
 
-    let Some(raw_total_sz) = get_string(filled, &["totalSz"]) else {
-        return BookedSzDecision::InvalidFilledTotalSz;
-    };
-
-    let Ok(filled_sz) = parse_decimal(&raw_total_sz) else {
+    let Ok(filled_sz) = parse_decimal(raw_total_sz) else {
         return BookedSzDecision::InvalidFilledTotalSz;
     };
 
@@ -1318,10 +1611,10 @@ async fn resolve_required_chunks_in_prefix(
 
 fn replica_chunk_starts_for_range(start_height: u64, height_span: u64) -> Result<Vec<u64>> {
     if start_height == 0 {
-        bail!("--start-height must be >= 1 for replica_cmds naming rule <height-1>.lz4");
+        bail!("--start must be >= 1 for replica_cmds naming rule <height-1>.lz4");
     }
     if height_span == 0 {
-        bail!("--height-span must be > 0");
+        bail!("--span must be > 0");
     }
 
     let end_height = start_height
@@ -1398,7 +1691,7 @@ async fn resolve_replica_keys_for_range(
     let normalized_prefix = prefix.trim_matches('/');
 
     if let Some(resolved) = resolve_replica_keys_via_hardcoded_day_index(normalized_prefix, &required_chunks)? {
-        eprintln!(
+        info!(
             "[index] resolved replica_cmds via hardcoded day index for {} chunks (range {}..{})",
             resolved.len(),
             start_height,
@@ -1477,6 +1770,30 @@ struct Lz4JsonLineReader {
     local_opened: bool,
     current_reader: Option<Box<dyn AsyncBufRead + Unpin + Send>>,
     line: Vec<u8>,
+    perf: ReaderReadPerfStats,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct ReaderReadPerfStats {
+    open_reader_ns: u128,
+    open_reader_calls: u64,
+    s3_get_ns: u128,
+    s3_get_calls: u64,
+    line_read_ns: u128,
+    line_read_calls: u64,
+    line_read_bytes: u64,
+    json_parse_ns: u128,
+    json_parse_calls: u64,
+}
+
+impl ReaderReadPerfStats {
+    fn open_non_s3_ns(self) -> u128 {
+        self.open_reader_ns.saturating_sub(self.s3_get_ns)
+    }
+
+    fn instrumented_total_ns(self) -> u128 {
+        self.s3_get_ns + self.line_read_ns + self.json_parse_ns + self.open_non_s3_ns()
+    }
 }
 
 impl Lz4JsonLineReader {
@@ -1492,6 +1809,7 @@ impl Lz4JsonLineReader {
             local_opened: false,
             current_reader: None,
             line: Vec::with_capacity(1 << 20),
+            perf: ReaderReadPerfStats::default(),
         })
     }
 
@@ -1499,13 +1817,13 @@ impl Lz4JsonLineReader {
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
-        let buffered = TokioBufReader::new(reader);
+        let buffered = TokioBufReader::with_capacity(LZ4_IO_BUFFER_BYTES, reader);
         let decoder = Lz4Decoder::new(buffered);
-        Box::new(TokioBufReader::new(decoder))
+        Box::new(TokioBufReader::with_capacity(LZ4_IO_BUFFER_BYTES, decoder))
     }
 
     async fn fetch_s3_reader(
-        &self,
+        &mut self,
         bucket: &str,
         key: &str,
         allow_missing: bool,
@@ -1519,6 +1837,7 @@ impl Lz4JsonLineReader {
             request = request.request_payer(RequestPayer::Requester);
         }
 
+        let s3_started_at = Instant::now();
         let output = match request.send().await {
             Ok(output) => output,
             Err(err) => {
@@ -1538,6 +1857,8 @@ impl Lz4JsonLineReader {
                 bail!("failed to fetch s3://{bucket}/{key}: {err}");
             }
         };
+        self.perf.s3_get_ns += s3_started_at.elapsed().as_nanos();
+        self.perf.s3_get_calls = self.perf.s3_get_calls.saturating_add(1);
 
         Ok(Some(Self::make_lz4_reader(output.body.into_async_read())))
     }
@@ -1573,7 +1894,8 @@ impl Lz4JsonLineReader {
             }
         };
 
-        match plan {
+        let open_started_at = Instant::now();
+        let result = match plan {
             OpenPlan::End => Ok(false),
             OpenPlan::Local(path) => {
                 let file =
@@ -1583,15 +1905,46 @@ impl Lz4JsonLineReader {
             }
             OpenPlan::S3Key { bucket, key, allow_missing, advance_hour } => {
                 let maybe_reader = self.fetch_s3_reader(&bucket, &key, allow_missing).await?;
-                let Some(reader) = maybe_reader else {
-                    return Ok(false);
+                let opened = if let Some(reader) = maybe_reader {
+                    if advance_hour && let ReaderSource::S3HourlyFrom { next_hour_ms, .. } = &mut self.source {
+                        *next_hour_ms += HOUR_MS;
+                    }
+                    self.current_reader = Some(reader);
+                    true
+                } else {
+                    false
                 };
-                if advance_hour && let ReaderSource::S3HourlyFrom { next_hour_ms, .. } = &mut self.source {
-                    *next_hour_ms += HOUR_MS;
-                }
-                self.current_reader = Some(reader);
-                Ok(true)
+                Ok(opened)
             }
+        };
+        self.perf.open_reader_ns += open_started_at.elapsed().as_nanos();
+        self.perf.open_reader_calls = self.perf.open_reader_calls.saturating_add(1);
+        result
+    }
+
+    async fn next_raw_line_into(&mut self, line: &mut Vec<u8>) -> Result<bool> {
+        loop {
+            if self.current_reader.is_none() && !self.open_next_reader().await? {
+                return Ok(false);
+            }
+
+            line.clear();
+            let line_read_started_at = Instant::now();
+            let bytes_read = self
+                .current_reader
+                .as_mut()
+                .expect("current_reader checked")
+                .read_until(b'\n', line)
+                .await?;
+            self.perf.line_read_ns += line_read_started_at.elapsed().as_nanos();
+            self.perf.line_read_calls = self.perf.line_read_calls.saturating_add(1);
+            self.perf.line_read_bytes = self.perf.line_read_bytes.saturating_add(u64::try_from(bytes_read)?);
+            if bytes_read == 0 {
+                self.current_reader = None;
+                continue;
+            }
+
+            return Ok(true);
         }
     }
 
@@ -1599,21 +1952,23 @@ impl Lz4JsonLineReader {
     where
         T: for<'de> Deserialize<'de>,
     {
-        loop {
-            if self.current_reader.is_none() && !self.open_next_reader().await? {
-                return Ok(None);
-            }
-
-            self.line.clear();
-            let bytes_read =
-                self.current_reader.as_mut().expect("current_reader checked").read_until(b'\n', &mut self.line).await?;
-            if bytes_read == 0 {
-                self.current_reader = None;
-                continue;
-            }
-
-            return parse_json_line(&mut self.line).map(Some);
+        let mut line = std::mem::take(&mut self.line);
+        let has_line = self.next_raw_line_into(&mut line).await?;
+        if !has_line {
+            self.line = line;
+            return Ok(None);
         }
+
+        let parse_started_at = Instant::now();
+        let parsed = parse_json_line(&mut line);
+        self.perf.json_parse_ns += parse_started_at.elapsed().as_nanos();
+        self.perf.json_parse_calls = self.perf.json_parse_calls.saturating_add(1);
+        self.line = line;
+        parsed.map(Some)
+    }
+
+    fn perf_snapshot(&self) -> ReaderReadPerfStats {
+        self.perf
     }
 }
 
@@ -1649,7 +2004,7 @@ impl NodeFillsReader {
             break block;
         };
 
-        let block_time_ms = parse_timestamp_ms(&block.block_time)?;
+        let (block_time_ns, block_time_ms) = parse_timestamp_ns_ms(&block.block_time)?;
         let mut fills = Vec::with_capacity(block.events.len());
         for (address, event) in block.events {
             if event.coin != "BTC" {
@@ -1669,255 +2024,732 @@ impl NodeFillsReader {
             });
         }
 
-        Ok(Some(NodeFillsBatch { block_number: block.block_number, block_time_ms, fills }))
-    }
-}
-
-enum BlockMatch {
-    Matched(u64),
-    Unmatched,
-    PastEnd,
-}
-
-struct FillsTimeCursor {
-    reader: Lz4JsonLineReader,
-    block_range: Option<(u64, u64)>,
-    prev: Option<BlockIndex>,
-    curr: Option<BlockIndex>,
-    exhausted: bool,
-}
-
-impl FillsTimeCursor {
-    async fn new(
-        source: ReaderSource,
-        s3_client: Option<Arc<S3Client>>,
-        requester_pays: bool,
-        block_range: Option<(u64, u64)>,
-    ) -> Result<Self> {
-        let mut cursor = Self {
-            reader: Lz4JsonLineReader::new(source, s3_client, requester_pays).await?,
-            block_range,
-            prev: None,
-            curr: None,
-            exhausted: false,
-        };
-        cursor.curr = cursor.read_next_index().await?;
-        Ok(cursor)
+        Ok(Some(NodeFillsBatch { block_number: block.block_number, block_time_ns, block_time_ms, fills }))
     }
 
-    async fn read_next_index(&mut self) -> Result<Option<BlockIndex>> {
-        loop {
-            let Some(block) = self.reader.next_json_line::<NodeFillsTimeBlock>().await? else {
-                self.exhausted = true;
-                return Ok(None);
-            };
-
-            if let Some((start_height, end_height)) = self.block_range {
-                if block.block_number < start_height {
-                    continue;
-                }
-                if block.block_number > end_height {
-                    self.exhausted = true;
-                    return Ok(None);
-                }
-            }
-
-            let ts_ns = parse_timestamp_ns(&block.block_time)?;
-            return Ok(Some(BlockIndex { ts_ns, block_number: block.block_number }));
-        }
-    }
-
-    async fn match_block(&mut self, ts_ns: i64, tolerance_ns: i64) -> Result<BlockMatch> {
-        while self.curr.as_ref().is_some_and(|curr| curr.ts_ns < ts_ns) {
-            self.prev = self.curr.take();
-            self.curr = self.read_next_index().await?;
-        }
-
-        let mut best: Option<(i64, u64)> = None;
-        for candidate in [self.prev.as_ref(), self.curr.as_ref()].into_iter().flatten() {
-            let delta = (candidate.ts_ns - ts_ns).abs();
-            if delta <= tolerance_ns {
-                match best {
-                    Some((best_delta, _)) if best_delta <= delta => {}
-                    _ => best = Some((delta, candidate.block_number)),
-                }
-            }
-        }
-
-        if let Some((_, block_number)) = best {
-            return Ok(BlockMatch::Matched(block_number));
-        }
-
-        if self.exhausted
-            && self.curr.is_none()
-            && self.prev.as_ref().is_some_and(|last| ts_ns > last.ts_ns.saturating_add(tolerance_ns))
-        {
-            return Ok(BlockMatch::PastEnd);
-        }
-
-        Ok(BlockMatch::Unmatched)
+    fn perf_snapshot(&self) -> ReaderReadPerfStats {
+        self.reader.perf_snapshot()
     }
 }
 
 struct ReplicaCmdsReader {
-    reader: Lz4JsonLineReader,
-    fills_time_cursor: FillsTimeCursor,
-    tolerance_ns: i64,
-    block_range: Option<(u64, u64)>,
+    reader: ReplicaRawReader,
+}
+
+enum ReplicaRawReader {
+    Stream(Lz4JsonLineReader),
+    Parallel(ParallelReplicaLz4Reader),
+}
+
+struct ParallelReplicaLz4Reader {
+    source: ReaderSource,
+    s3_client: Option<Arc<S3Client>>,
+    requester_pays: bool,
+    parallel_workers: usize,
+    s3_range_workers: usize,
+    prefetch_buffer: Arc<Semaphore>,
+    prefetch_stream_chunk_cap: usize,
+    next_key_idx: usize,
+    local_opened: bool,
+    current_reader: Option<ParallelLz4LineReader>,
+    perf: ReaderReadPerfStats,
+}
+
+struct PrefetchChunk {
+    chunk_idx: u64,
+    bytes: Vec<u8>,
+    _memory_permit: OwnedSemaphorePermit,
+}
+
+struct PrefetchedS3AsyncRead {
+    rx: mpsc::Receiver<std::result::Result<PrefetchChunk, String>>,
+    current_chunk: Option<PrefetchChunk>,
+    current_chunk_offset: usize,
+    pending_chunks: BTreeMap<u64, PrefetchChunk>,
+    next_chunk_idx: u64,
+    downloaders: Vec<JoinHandle<()>>,
+    stream_done: bool,
+}
+
+impl AsyncRead for PrefetchedS3AsyncRead {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut wrote_any = false;
+        loop {
+            if let Some(chunk) = self.current_chunk.as_ref() {
+                let remaining = chunk.bytes.len().saturating_sub(self.current_chunk_offset);
+                if remaining > 0 {
+                    let copy_len = remaining.min(buf.remaining());
+                    let end = self.current_chunk_offset + copy_len;
+                    buf.put_slice(&chunk.bytes[self.current_chunk_offset..end]);
+                    self.current_chunk_offset = end;
+                    wrote_any = true;
+                    if buf.remaining() == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                    continue;
+                }
+                self.current_chunk = None;
+                self.current_chunk_offset = 0;
+                continue;
+            }
+
+            let expected_chunk_idx = self.next_chunk_idx;
+            if let Some(chunk) = self.pending_chunks.remove(&expected_chunk_idx) {
+                self.current_chunk = Some(chunk);
+                self.current_chunk_offset = 0;
+                self.next_chunk_idx = self.next_chunk_idx.saturating_add(1);
+                continue;
+            }
+
+            if self.stream_done {
+                if self.pending_chunks.is_empty() {
+                    return Poll::Ready(Ok(()));
+                }
+                return Poll::Ready(Err(std::io::Error::other(format!(
+                    "missing ordered replica prefetch chunk idx={} pending_chunks={}",
+                    self.next_chunk_idx,
+                    self.pending_chunks.len()
+                ))));
+            }
+
+            if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            match Pin::new(&mut self.rx).poll_recv(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if chunk.chunk_idx < self.next_chunk_idx {
+                        continue;
+                    }
+                    self.pending_chunks.insert(chunk.chunk_idx, chunk);
+                }
+                Poll::Ready(Some(Err(err))) => {
+                    return Poll::Ready(Err(std::io::Error::other(err)));
+                }
+                Poll::Ready(None) => {
+                    self.stream_done = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => {
+                    return if wrote_any { Poll::Ready(Ok(())) } else { Poll::Pending };
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PrefetchedS3AsyncRead {
+    fn drop(&mut self) {
+        for handle in self.downloaders.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+struct PrefetchedParallelS3Reader {
+    reader: Option<PrefetchedS3AsyncRead>,
+    open_reader_ns: u128,
+    s3_get_ns: u128,
+    s3_get_calls: u64,
+}
+
+async fn fetch_parallel_s3_reader(
+    client: Arc<S3Client>,
+    requester_pays: bool,
+    bucket: String,
+    key: String,
+    allow_missing: bool,
+    prefetch_buffer: Arc<Semaphore>,
+    prefetch_stream_chunk_cap: usize,
+    s3_range_workers: usize,
+) -> Result<PrefetchedParallelS3Reader> {
+    let open_started_at = Instant::now();
+    let mut request = client.head_object().bucket(&bucket).key(&key);
+    if requester_pays {
+        request = request.request_payer(RequestPayer::Requester);
+    }
+
+    let s3_started_at = Instant::now();
+    let head_output = match request.send().await {
+        Ok(output) => output,
+        Err(err) => {
+            if let Some(service_error) = err.as_service_error() {
+                if allow_missing
+                    && (service_error.is_not_found()
+                        || service_error.code().is_some_and(|code| matches!(code, "NotFound" | "NoSuchKey" | "404")))
+                {
+                    return Ok(PrefetchedParallelS3Reader {
+                        reader: None,
+                        open_reader_ns: open_started_at.elapsed().as_nanos(),
+                        s3_get_ns: s3_started_at.elapsed().as_nanos(),
+                        s3_get_calls: 1,
+                    });
+                }
+
+                if !requester_pays && service_error.code().is_some_and(|code| code == "AccessDenied") {
+                    bail!("failed to fetch s3://{bucket}/{key}: AccessDenied");
+                }
+            }
+
+            bail!("failed to fetch s3://{bucket}/{key}: {err}");
+        }
+    };
+
+    let Some(content_length) = head_output.content_length() else {
+        bail!("missing content length for s3://{bucket}/{key}");
+    };
+    if content_length < 0 {
+        bail!("invalid negative content length for s3://{bucket}/{key}: {}", content_length);
+    }
+    let content_length =
+        usize::try_from(content_length).with_context(|| format!("content length overflow for s3://{bucket}/{key}"))?;
+
+    if content_length == 0 {
+        return Ok(PrefetchedParallelS3Reader {
+            reader: Some(PrefetchedS3AsyncRead {
+                rx: mpsc::channel(1).1,
+                current_chunk: None,
+                current_chunk_offset: 0,
+                pending_chunks: BTreeMap::new(),
+                next_chunk_idx: 0,
+                downloaders: Vec::new(),
+                stream_done: true,
+            }),
+            open_reader_ns: open_started_at.elapsed().as_nanos(),
+            s3_get_ns: s3_started_at.elapsed().as_nanos(),
+            s3_get_calls: 1,
+        });
+    }
+
+    let chunk_count = (content_length + REPLICA_S3_RANGE_PART_BYTES - 1) / REPLICA_S3_RANGE_PART_BYTES;
+    let next_chunk_idx = Arc::new(AtomicUsize::new(0));
+    let queue_cap = prefetch_stream_chunk_cap.max(s3_range_workers * 2).max(1);
+    let (tx, rx) = mpsc::channel::<std::result::Result<PrefetchChunk, String>>(queue_cap);
+    let mut downloaders = Vec::with_capacity(s3_range_workers);
+
+    for _ in 0..s3_range_workers {
+        let worker_client = Arc::clone(&client);
+        let worker_bucket = bucket.clone();
+        let worker_key = key.clone();
+        let worker_prefetch_buffer = prefetch_buffer.clone();
+        let worker_chunk_idx = Arc::clone(&next_chunk_idx);
+        let worker_tx = tx.clone();
+        let worker_requester_pays = requester_pays;
+        let downloader = tokio::spawn(async move {
+            loop {
+                let chunk_idx = worker_chunk_idx.fetch_add(1, Ordering::Relaxed);
+                if chunk_idx >= chunk_count {
+                    break;
+                }
+
+                let start = chunk_idx.saturating_mul(REPLICA_S3_RANGE_PART_BYTES);
+                let end_exclusive = (start + REPLICA_S3_RANGE_PART_BYTES).min(content_length);
+                if end_exclusive <= start {
+                    continue;
+                }
+                let end_inclusive = end_exclusive.saturating_sub(1);
+                let mut worker_request = worker_client
+                    .get_object()
+                    .bucket(&worker_bucket)
+                    .key(&worker_key)
+                    .range(format!("bytes={start}-{end_inclusive}"));
+                if worker_requester_pays {
+                    worker_request = worker_request.request_payer(RequestPayer::Requester);
+                }
+
+                let output = match worker_request.send().await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        drop(
+                            worker_tx
+                                .send(Err(format!(
+                                    "failed to fetch s3://{}/{} range bytes={}-{}: {}",
+                                    worker_bucket, worker_key, start, end_inclusive, err
+                                )))
+                                .await,
+                        );
+                        return;
+                    }
+                };
+
+                let bytes = match output.body.collect().await {
+                    Ok(collected) => collected.into_bytes().to_vec(),
+                    Err(err) => {
+                        drop(
+                            worker_tx
+                                .send(Err(format!(
+                                    "failed to read s3://{}/{} range bytes={}-{}: {}",
+                                    worker_bucket, worker_key, start, end_inclusive, err
+                                )))
+                                .await,
+                        );
+                        return;
+                    }
+                };
+
+                if bytes.is_empty() {
+                    continue;
+                }
+
+                let permits = ((bytes.len() + REPLICA_PREFETCH_BUFFER_PERMIT_BYTES - 1)
+                    / REPLICA_PREFETCH_BUFFER_PERMIT_BYTES)
+                    .max(1);
+                let permits = u32::try_from(permits).unwrap_or(u32::MAX);
+                let permit = match worker_prefetch_buffer.clone().acquire_many_owned(permits).await {
+                    Ok(value) => value,
+                    Err(_) => {
+                        drop(
+                            worker_tx
+                                .send(Err("replica prefetch memory semaphore closed unexpectedly".to_owned()))
+                                .await,
+                        );
+                        return;
+                    }
+                };
+
+                if worker_tx
+                    .send(Ok(PrefetchChunk {
+                        chunk_idx: u64::try_from(chunk_idx).unwrap_or(u64::MAX),
+                        bytes,
+                        _memory_permit: permit,
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        downloaders.push(downloader);
+    }
+    drop(tx);
+
+    Ok(PrefetchedParallelS3Reader {
+        reader: Some(PrefetchedS3AsyncRead {
+            rx,
+            current_chunk: None,
+            current_chunk_offset: 0,
+            pending_chunks: BTreeMap::new(),
+            next_chunk_idx: 0,
+            downloaders,
+            stream_done: false,
+        }),
+        open_reader_ns: open_started_at.elapsed().as_nanos(),
+        s3_get_ns: s3_started_at.elapsed().as_nanos(),
+        s3_get_calls: u64::try_from(chunk_count).unwrap_or(u64::MAX).saturating_add(1),
+    })
+}
+
+impl ParallelReplicaLz4Reader {
+    async fn new(
+        source: ReaderSource,
+        s3_client: Option<Arc<S3Client>>,
+        requester_pays: bool,
+        parallel_workers: usize,
+        max_s3_connections: usize,
+        replica_prefetch_buffer_mb: usize,
+    ) -> Result<Self> {
+        if matches!(source, ReaderSource::S3Keys { .. } | ReaderSource::S3HourlyFrom { .. }) && s3_client.is_none() {
+            bail!("S3 input requires initialized S3 client");
+        }
+        let prefetch_buffer_bytes = replica_prefetch_buffer_mb.saturating_mul(1024 * 1024);
+        let prefetch_buffer_permits =
+            ((prefetch_buffer_bytes + REPLICA_PREFETCH_BUFFER_PERMIT_BYTES - 1) / REPLICA_PREFETCH_BUFFER_PERMIT_BYTES)
+                .max(1);
+        let s3_range_workers = max_s3_connections.max(1);
+        let range_part_permits =
+            ((REPLICA_S3_RANGE_PART_BYTES + REPLICA_PREFETCH_BUFFER_PERMIT_BYTES - 1)
+                / REPLICA_PREFETCH_BUFFER_PERMIT_BYTES)
+                .max(1);
+        let prefetch_stream_chunk_cap = (prefetch_buffer_permits / range_part_permits)
+            .max(s3_range_workers * 2)
+            .max(8);
+        info!(
+            "[config] replica_prefetch_ring_buffer_mb={} permit_bytes={} total_permits={} range_part_bytes={} chunk_queue_cap={} s3_range_workers={}",
+            replica_prefetch_buffer_mb,
+            REPLICA_PREFETCH_BUFFER_PERMIT_BYTES,
+            prefetch_buffer_permits,
+            REPLICA_S3_RANGE_PART_BYTES,
+            prefetch_stream_chunk_cap,
+            s3_range_workers
+        );
+        Ok(Self {
+            source,
+            s3_client,
+            requester_pays,
+            parallel_workers: parallel_workers.max(1),
+            s3_range_workers,
+            prefetch_buffer: Arc::new(Semaphore::new(prefetch_buffer_permits)),
+            prefetch_stream_chunk_cap,
+            next_key_idx: 0,
+            local_opened: false,
+            current_reader: None,
+            perf: ReaderReadPerfStats::default(),
+        })
+    }
+
+    fn make_parallel_reader<R>(&self, reader: R) -> ParallelLz4LineReader
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        ParallelLz4LineReader::new(
+            reader,
+            ParallelLz4ReaderConfig { workers: self.parallel_workers, io_buffer_bytes: LZ4_IO_BUFFER_BYTES },
+        )
+    }
+
+    fn next_s3_plan(&mut self) -> Result<Option<(String, String, bool)>> {
+        let plan = match &mut self.source {
+            ReaderSource::S3Keys { bucket, keys } => {
+                if self.next_key_idx >= keys.len() {
+                    return Ok(None);
+                }
+                let key = keys[self.next_key_idx].clone();
+                self.next_key_idx += 1;
+                (bucket.clone(), key, false)
+            }
+            ReaderSource::S3HourlyFrom { bucket, prefix, next_hour_ms } => {
+                let key = build_node_fills_hourly_key(prefix, *next_hour_ms)?;
+                *next_hour_ms += HOUR_MS;
+                (bucket.clone(), key, true)
+            }
+            ReaderSource::LocalFile(_) => return Ok(None),
+        };
+        Ok(Some(plan))
+    }
+
+    async fn open_next_reader(&mut self) -> Result<bool> {
+        if let ReaderSource::LocalFile(path) = &self.source {
+            if self.local_opened {
+                return Ok(false);
+            }
+            self.local_opened = true;
+            let open_started_at = Instant::now();
+            let file = tokio::fs::File::open(path).await.with_context(|| format!("failed to open {}", path.display()))?;
+            self.current_reader = Some(self.make_parallel_reader(file));
+            self.perf.open_reader_ns += open_started_at.elapsed().as_nanos();
+            self.perf.open_reader_calls = self.perf.open_reader_calls.saturating_add(1);
+            return Ok(true);
+        }
+
+        let Some(client) = self.s3_client.clone() else {
+            bail!("S3 input requires initialized S3 client");
+        };
+
+        loop {
+            let Some((bucket, key, allow_missing)) = self.next_s3_plan()? else {
+                return Ok(false);
+            };
+
+            let prefetched = fetch_parallel_s3_reader(
+                Arc::clone(&client),
+                self.requester_pays,
+                bucket,
+                key,
+                allow_missing,
+                Arc::clone(&self.prefetch_buffer),
+                self.prefetch_stream_chunk_cap,
+                self.s3_range_workers,
+            )
+            .await?;
+            self.perf.open_reader_ns += prefetched.open_reader_ns;
+            self.perf.open_reader_calls = self.perf.open_reader_calls.saturating_add(1);
+            self.perf.s3_get_ns += prefetched.s3_get_ns;
+            self.perf.s3_get_calls = self.perf.s3_get_calls.saturating_add(prefetched.s3_get_calls);
+
+            if let Some(reader) = prefetched.reader {
+                self.current_reader = Some(self.make_parallel_reader(reader));
+                return Ok(true);
+            }
+        }
+    }
+
+    async fn next_raw_line_into(&mut self, line: &mut Vec<u8>) -> Result<bool> {
+        loop {
+            if self.current_reader.is_none() && !self.open_next_reader().await? {
+                return Ok(false);
+            }
+
+            let line_started_at = Instant::now();
+            let has_line = self
+                .current_reader
+                .as_mut()
+                .expect("current_reader checked")
+                .next_line_into(line)
+                .await?;
+            self.perf.line_read_ns += line_started_at.elapsed().as_nanos();
+            self.perf.line_read_calls = self.perf.line_read_calls.saturating_add(1);
+            if has_line {
+                self.perf.line_read_bytes = self.perf.line_read_bytes.saturating_add(u64::try_from(line.len())?);
+                return Ok(true);
+            }
+
+            self.current_reader = None;
+        }
+    }
+
+    fn perf_snapshot(&self) -> ReaderReadPerfStats {
+        self.perf
+    }
 }
 
 impl ReplicaCmdsReader {
     async fn new(
         source: ReaderSource,
-        fills_time_source: ReaderSource,
-        tolerance_ns: i64,
         s3_client: Option<Arc<S3Client>>,
         requester_pays: bool,
-        block_range: Option<(u64, u64)>,
+        parallel_lz4_workers: usize,
+        replica_s3_connections: usize,
+        replica_prefetch_buffer_mb: usize,
     ) -> Result<Self> {
+        if parallel_lz4_workers > 1 {
+            info!(
+                "[config] replica_lz4_decode=parallel workers={}",
+                parallel_lz4_workers
+            );
+            let reader = ParallelReplicaLz4Reader::new(
+                source,
+                s3_client,
+                requester_pays,
+                parallel_lz4_workers,
+                replica_s3_connections,
+                replica_prefetch_buffer_mb,
+            )
+            .await?;
+            return Ok(Self { reader: ReplicaRawReader::Parallel(reader) });
+        }
+
         Ok(Self {
-            reader: Lz4JsonLineReader::new(source, s3_client.clone(), requester_pays).await?,
-            fills_time_cursor: FillsTimeCursor::new(fills_time_source, s3_client, requester_pays, block_range).await?,
-            tolerance_ns,
-            block_range,
+            reader: ReplicaRawReader::Stream(Lz4JsonLineReader::new(source, s3_client, requester_pays).await?),
         })
     }
 
-    async fn next_batch(&mut self) -> Result<Option<ReplicaBatch>> {
-        loop {
-            let Some(replica) = self.reader.next_json_line::<ReplicaLine>().await? else {
-                return Ok(None);
+    async fn next_raw_line_into(&mut self, line: &mut Vec<u8>) -> Result<bool> {
+        match &mut self.reader {
+            ReplicaRawReader::Stream(reader) => reader.next_raw_line_into(line).await,
+            ReplicaRawReader::Parallel(reader) => reader.next_raw_line_into(line).await,
+        }
+    }
+
+    fn parse_raw_line(line: &mut Vec<u8>) -> Result<ReplicaBatch> {
+        let replica = parse_json_line::<ReplicaLine>(line)?;
+        Self::parse_replica_line(replica)
+    }
+
+    fn parse_replica_line(replica: ReplicaLine) -> Result<ReplicaBatch> {
+        let (block_time_ns, block_time_ms) = parse_timestamp_ns_ms(&replica.abci_block.time)?;
+        let block_number = 0_u64;
+
+        let mut action_map = HashMap::with_capacity(replica.abci_block.signed_action_bundles.len());
+        for (tx_hash, payload) in replica.abci_block.signed_action_bundles {
+            action_map.insert(tx_hash, payload);
+        }
+        let mut events = Vec::new();
+
+        for (tx_hash, responses) in replica.resps.full {
+            let Some(payload) = action_map.get(&tx_hash) else {
+                continue;
             };
 
-            let (ts_ns, block_time_ms) = parse_timestamp_ns_ms(&replica.abci_block.time)?;
-            let block_number = match self.fills_time_cursor.match_block(ts_ns, self.tolerance_ns).await? {
-                BlockMatch::Matched(block_number) => block_number,
-                BlockMatch::Unmatched => continue,
-                BlockMatch::PastEnd => return Ok(None),
-            };
-            if let Some((start_height, end_height)) = self.block_range {
-                if block_number < start_height {
-                    continue;
-                }
-                if block_number > end_height {
-                    return Ok(None);
-                }
-            }
+            for (action_item, response_item) in payload.signed_actions.iter().zip(responses.iter()) {
+                let action = &action_item.action;
+                match action.action_type.as_deref() {
+                    Some("order") => {
+                        let orders = action.orders.as_slice();
+                        let statuses = parse_statuses(&response_item.res.response);
 
-            let action_map: HashMap<_, _> = replica.abci_block.signed_action_bundles.into_iter().collect();
-            let mut events = Vec::new();
+                        for (order, status) in orders.iter().zip(statuses.iter()) {
+                            let Some((asset, side, px, sz, cloid, meta)) = parse_order_fields(order) else {
+                                continue;
+                            };
+                            if asset != BTC_ASSET_ID {
+                                continue;
+                            }
+                            let Some(user) = response_item.user.clone() else {
+                                continue;
+                            };
 
-            for (tx_hash, responses) in replica.resps.full {
-                let Some(payload) = action_map.get(&tx_hash) else {
-                    continue;
-                };
-
-                for (action_item, response_item) in payload.signed_actions.iter().zip(responses.iter()) {
-                    let action = &action_item.action;
-                    let action_type = action.get("type").and_then(Value::as_str);
-                    match action_type {
-                        Some("order") => {
-                            let orders =
-                                action.get("orders").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
-                            let statuses = parse_statuses(&response_item.res.response);
-
-                            for (order, status) in orders.iter().zip(statuses.iter()) {
-                                let Some((asset, side, px, sz, cloid, meta)) = parse_order_fields(order) else {
-                                    continue;
-                                };
-                                if asset != BTC_ASSET_ID {
-                                    continue;
+                            let has_resting = status.has_resting();
+                            let is_gtc = meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
+                            let oid_from_resting = status.resting_oid();
+                            let oid_from_filled = status.filled_oid();
+                            let oid = oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
+                            if meta.is_trigger {
+                                if let Some(oid) = oid {
+                                    events.push(CmdEvent::TrackTriggerAdd { user, oid, cloid });
+                                } else if is_pending_trigger_status(status) {
+                                    events.push(CmdEvent::TrackTriggerPending { user, cloid });
                                 }
-                                let Some(user) = response_item.user.clone() else {
-                                    continue;
-                                };
+                                continue;
+                            }
+                            let Some(oid) = oid else {
+                                continue;
+                            };
 
-                                let has_resting = status.get("resting").is_some();
-                                let is_gtc = meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
-                                let oid_from_resting =
-                                    status.get("resting").and_then(|resting| get_u64(resting, &["oid"]));
-                                let oid_from_filled = status.get("filled").and_then(|filled| get_u64(filled, &["oid"]));
-                                let oid = oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
-                                if meta.is_trigger {
-                                    if let Some(oid) = oid {
-                                        events.push(CmdEvent::TrackTriggerAdd { user, oid, cloid });
-                                    } else if is_pending_trigger_status(status) {
-                                        events.push(CmdEvent::TrackTriggerPending { user, cloid });
-                                    }
-                                    continue;
+                            if !has_resting && !is_gtc {
+                                continue;
+                            }
+
+                            match parse_booked_and_raw_sz(sz, status) {
+                                BookedSzDecision::Booked { booked_sz, raw_sz } => {
+                                    events.push(CmdEvent::Add {
+                                        user,
+                                        oid,
+                                        cloid,
+                                        side,
+                                        px,
+                                        sz: booked_sz,
+                                        raw_sz,
+                                        meta,
+                                    });
                                 }
-                                let Some(oid) = oid else {
-                                    continue;
-                                };
-
-                                if !has_resting && !is_gtc {
-                                    continue;
-                                }
-
-                                match parse_booked_and_raw_sz(sz, status) {
-                                    BookedSzDecision::Booked { booked_sz, raw_sz } => {
-                                        events.push(CmdEvent::Add {
-                                            user,
-                                            oid,
-                                            cloid,
-                                            side,
-                                            px,
-                                            sz: booked_sz,
-                                            raw_sz,
-                                            meta,
-                                        });
-                                    }
-                                    BookedSzDecision::FullyFilled => continue,
-                                    BookedSzDecision::InvalidFilledTotalSz => {
-                                        events.push(CmdEvent::Skipped {
-                                            user: Some(user),
-                                            oid: Some(oid),
-                                            event: "add".to_owned(),
-                                            status: "skipped_invalid_filled_total_sz".to_owned(),
-                                        });
-                                    }
+                                BookedSzDecision::FullyFilled => continue,
+                                BookedSzDecision::InvalidFilledTotalSz => {
+                                    events.push(CmdEvent::Skipped {
+                                        user: Some(user),
+                                        oid: Some(oid),
+                                        event: "add".to_owned(),
+                                        status: "skipped_invalid_filled_total_sz".to_owned(),
+                                    });
                                 }
                             }
                         }
-                        Some("cancel") | Some("cancelByCloid") => {
-                            let cancels =
-                                action.get("cancels").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
-                            let statuses = parse_statuses(&response_item.res.response);
-                            let is_cancel_by_cloid = action_type == Some("cancelByCloid");
+                    }
+                    Some("cancel") | Some("cancelByCloid") => {
+                        let cancels = action.cancels.as_slice();
+                        let statuses = parse_statuses(&response_item.res.response);
+                        let is_cancel_by_cloid = action.action_type.as_deref() == Some("cancelByCloid");
 
-                            for (idx, cancel) in cancels.iter().enumerate() {
-                                let status = statuses.get(idx);
-                                if is_cancel_by_cloid {
-                                    if !is_success_status(status) {
-                                        continue;
-                                    }
-                                } else if !is_success_status(status) {
+                        for (idx, cancel) in cancels.iter().enumerate() {
+                            let status = statuses.get(idx);
+                            if is_cancel_by_cloid {
+                                if !is_success_status(status) {
                                     continue;
                                 }
-                                let order_ref = get_order_ref(cancel, &["o", "oid", "cloid"]);
-                                let Some(asset) = get_u64(cancel, &["a", "asset"]) else {
-                                    continue;
-                                };
+                            } else if !is_success_status(status) {
+                                continue;
+                            }
+                            let order_ref = parse_cancel_order_ref(cancel);
+                            let Some(asset) = cancel.a.as_ref().and_then(JsonU64OrString::as_u64) else {
+                                continue;
+                            };
 
-                                if asset != BTC_ASSET_ID {
-                                    continue;
-                                }
-                                let Some(order_ref) = order_ref else {
-                                    continue;
-                                };
-                                if matches!(order_ref, OrderRef::Oid(0)) {
-                                    continue;
-                                }
+                            if asset != BTC_ASSET_ID {
+                                continue;
+                            }
+                            let Some(order_ref) = order_ref else {
+                                continue;
+                            };
+                            if matches!(order_ref, OrderRef::Oid(0)) {
+                                continue;
+                            }
 
+                            events.push(CmdEvent::Cancel {
+                                user: response_item.user.clone(),
+                                order_ref,
+                                fallback_on_missing: true,
+                            });
+                        }
+                    }
+                    Some("modify") => {
+                        let Some(order) = action.order.as_ref() else {
+                            continue;
+                        };
+                        let Some((asset, side, px, sz, new_cloid, meta)) = parse_order_fields(order) else {
+                            continue;
+                        };
+                        if asset != BTC_ASSET_ID {
+                            continue;
+                        }
+                        let Some(user) = response_item.user.clone() else {
+                            continue;
+                        };
+                        let Some(old_order_ref) = parse_order_ref(action.oid.as_ref(), action.cloid.as_deref()) else {
+                            continue;
+                        };
+                        if is_dead_order_modify_response(&response_item.res) {
+                            continue;
+                        }
+
+                        let statuses = parse_statuses(&response_item.res.response);
+                        let Some(status) = statuses.first() else {
+                            if meta.is_trigger {
+                                if ENABLE_MISSING_STATUS_WARN {
+                                    warn!(
+                                        "[warn] block={} user={} trigger modify returned no statuses; skipping old_ref={:?} response_type={:?}",
+                                        block_number,
+                                        user,
+                                        old_order_ref,
+                                        response_type(&response_item.res.response)
+                                    );
+                                }
+                            } else {
+                                if ENABLE_MISSING_STATUS_WARN {
+                                    warn!(
+                                        "[warn] block={} user={} modify returned no statuses; treating as cancel-only old_ref={:?} response_type={:?}",
+                                        block_number,
+                                        user,
+                                        old_order_ref,
+                                        response_type(&response_item.res.response)
+                                    );
+                                }
                                 events.push(CmdEvent::Cancel {
-                                    user: response_item.user.clone(),
-                                    order_ref,
+                                    user: Some(user.clone()),
+                                    order_ref: old_order_ref,
                                     fallback_on_missing: true,
                                 });
                             }
+                            continue;
+                        };
+                        let is_gtc = meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
+                        let oid_from_resting = status.resting_oid();
+                        let oid_from_filled = status.filled_oid();
+                        if meta.is_trigger {
+                            let new_oid = oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
+                            events.push(CmdEvent::TrackTriggerModify { user, old_order_ref, new_oid, new_cloid });
+                            continue;
                         }
-                        Some("modify") => {
-                            let Some(order) = action.get("order") else {
+
+                        let (new_sz, raw_sz, invalid_filled_total_sz) = match parse_booked_and_raw_sz(sz, status) {
+                            BookedSzDecision::Booked { booked_sz, raw_sz } => (booked_sz, raw_sz, false),
+                            BookedSzDecision::FullyFilled => (Decimal::ZERO, None, false),
+                            BookedSzDecision::InvalidFilledTotalSz => (Decimal::ZERO, None, true),
+                        };
+                        let mut new_oid = oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
+                        if new_sz <= Decimal::ZERO {
+                            new_oid = None;
+                        }
+                        events.push(CmdEvent::Modify {
+                            user: user.clone(),
+                            old_order_ref,
+                            new_oid,
+                            new_cloid,
+                            side,
+                            px,
+                            sz: new_sz,
+                            raw_sz,
+                            meta,
+                        });
+
+                        if invalid_filled_total_sz {
+                            events.push(CmdEvent::Skipped {
+                                user: Some(user),
+                                oid: oid_from_resting.or(oid_from_filled),
+                                event: "modify".to_owned(),
+                                status: "skipped_invalid_filled_total_sz".to_owned(),
+                            });
+                        }
+                    }
+                    Some("batchModify") => {
+                        let modifies = action.modifies.as_slice();
+                        let statuses = parse_statuses(&response_item.res.response);
+
+                        for (idx, modify) in modifies.iter().enumerate() {
+                            let Some(order) = modify.order.as_ref() else {
                                 continue;
                             };
                             let Some((asset, side, px, sz, new_cloid, meta)) = parse_order_fields(order) else {
@@ -1929,42 +2761,48 @@ impl ReplicaCmdsReader {
                             let Some(user) = response_item.user.clone() else {
                                 continue;
                             };
-                            let Some(old_order_ref) = get_order_ref(action, &["oid", "cloid"]) else {
+                            let Some(old_order_ref) = parse_order_ref(modify.oid.as_ref(), modify.cloid.as_deref()) else {
                                 continue;
                             };
-                            if is_dead_order_modify_response(&response_item.res) {
-                                continue;
-                            }
-
-                            let statuses = parse_statuses(&response_item.res.response);
-                            let Some(status) = statuses.first() else {
-                                if meta.is_trigger {
-                                    eprintln!(
-                                        "[warn] block={} user={} trigger modify returned no statuses; skipping old_ref={:?} response_type={:?}",
+                            let status = statuses.get(idx);
+                            if status.is_none() && meta.is_trigger {
+                                if ENABLE_MISSING_STATUS_WARN {
+                                    warn!(
+                                        "[warn] block={} user={} trigger batchModify item={} returned no statuses; skipping old_ref={:?} response_type={:?}",
                                         block_number,
                                         user,
+                                        idx,
                                         old_order_ref,
                                         response_type(&response_item.res.response)
                                     );
-                                } else {
-                                    eprintln!(
-                                        "[warn] block={} user={} modify returned no statuses; treating as cancel-only old_ref={:?} response_type={:?}",
-                                        block_number,
-                                        user,
-                                        old_order_ref,
-                                        response_type(&response_item.res.response)
-                                    );
-                                    events.push(CmdEvent::Cancel {
-                                        user: Some(user.clone()),
-                                        order_ref: old_order_ref,
-                                        fallback_on_missing: true,
-                                    });
                                 }
                                 continue;
-                            };
+                            }
+                            if status.is_none() && !meta.is_trigger {
+                                if ENABLE_MISSING_STATUS_WARN {
+                                    warn!(
+                                        "[warn] block={} user={} batchModify item={} returned no statuses; treating as cancel-only old_ref={:?} response_type={:?}",
+                                        block_number,
+                                        user,
+                                        idx,
+                                        old_order_ref,
+                                        response_type(&response_item.res.response)
+                                    );
+                                }
+                                events.push(CmdEvent::Cancel {
+                                    user: Some(user),
+                                    order_ref: old_order_ref,
+                                    fallback_on_missing: true,
+                                });
+                                continue;
+                            }
+                            if status.and_then(StatusEntry::error).is_some_and(is_dead_order_error) {
+                                continue;
+                            }
+                            let status = status.unwrap();
                             let is_gtc = meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
-                            let oid_from_resting = status.get("resting").and_then(|resting| get_u64(resting, &["oid"]));
-                            let oid_from_filled = status.get("filled").and_then(|filled| get_u64(filled, &["oid"]));
+                            let oid_from_resting = status.resting_oid();
+                            let oid_from_filled = status.filled_oid();
                             if meta.is_trigger {
                                 let new_oid = oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
                                 events.push(CmdEvent::TrackTriggerModify { user, old_order_ref, new_oid, new_cloid });
@@ -2001,118 +2839,230 @@ impl ReplicaCmdsReader {
                                 });
                             }
                         }
-                        Some("batchModify") => {
-                            let modifies =
-                                action.get("modifies").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
-                            let statuses = parse_statuses(&response_item.res.response);
+                    }
+                    _ => {}
+                }
+            }
+        }
 
-                            for (idx, modify) in modifies.iter().enumerate() {
-                                let Some(order) = modify.get("order") else {
-                                    continue;
-                                };
-                                let Some((asset, side, px, sz, new_cloid, meta)) = parse_order_fields(order) else {
-                                    continue;
-                                };
-                                if asset != BTC_ASSET_ID {
-                                    continue;
-                                }
-                                let Some(user) = response_item.user.clone() else {
-                                    continue;
-                                };
-                                let Some(old_order_ref) = get_order_ref(modify, &["oid", "cloid"]) else {
-                                    continue;
-                                };
-                                let status = statuses.get(idx);
-                                if status.is_none() && meta.is_trigger {
-                                    eprintln!(
-                                        "[warn] block={} user={} trigger batchModify item={} returned no statuses; skipping old_ref={:?} response_type={:?}",
-                                        block_number,
-                                        user,
-                                        idx,
-                                        old_order_ref,
-                                        response_type(&response_item.res.response)
-                                    );
-                                    continue;
-                                }
-                                if status.is_none() && !meta.is_trigger {
-                                    eprintln!(
-                                        "[warn] block={} user={} batchModify item={} returned no statuses; treating as cancel-only old_ref={:?} response_type={:?}",
-                                        block_number,
-                                        user,
-                                        idx,
-                                        old_order_ref,
-                                        response_type(&response_item.res.response)
-                                    );
-                                    events.push(CmdEvent::Cancel {
-                                        user: Some(user),
-                                        order_ref: old_order_ref,
-                                        fallback_on_missing: true,
-                                    });
-                                    continue;
-                                }
-                                if status
-                                    .and_then(|status| status.get("error").and_then(Value::as_str))
-                                    .is_some_and(is_dead_order_error)
-                                {
-                                    continue;
-                                }
-                                let status = status.unwrap();
-                                let is_gtc = meta.tif.as_deref().is_some_and(|tif| tif.eq_ignore_ascii_case("Gtc"));
-                                let oid_from_resting =
-                                    status.get("resting").and_then(|resting| get_u64(resting, &["oid"]));
-                                let oid_from_filled = status.get("filled").and_then(|filled| get_u64(filled, &["oid"]));
-                                if meta.is_trigger {
-                                    let new_oid =
-                                        oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
-                                    events.push(CmdEvent::TrackTriggerModify {
-                                        user,
-                                        old_order_ref,
-                                        new_oid,
-                                        new_cloid,
-                                    });
-                                    continue;
-                                }
+        Ok(ReplicaBatch { block_time_ns, block_time_ms, events })
+    }
 
-                                let (new_sz, raw_sz, invalid_filled_total_sz) =
-                                    match parse_booked_and_raw_sz(sz, status) {
-                                        BookedSzDecision::Booked { booked_sz, raw_sz } => (booked_sz, raw_sz, false),
-                                        BookedSzDecision::FullyFilled => (Decimal::ZERO, None, false),
-                                        BookedSzDecision::InvalidFilledTotalSz => (Decimal::ZERO, None, true),
-                                    };
-                                let mut new_oid =
-                                    oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
-                                if new_sz <= Decimal::ZERO {
-                                    new_oid = None;
-                                }
-                                events.push(CmdEvent::Modify {
-                                    user: user.clone(),
-                                    old_order_ref,
-                                    new_oid,
-                                    new_cloid,
-                                    side,
-                                    px,
-                                    sz: new_sz,
-                                    raw_sz,
-                                    meta,
-                                });
+    fn perf_snapshot(&self) -> ReaderReadPerfStats {
+        match &self.reader {
+            ReplicaRawReader::Stream(reader) => reader.perf_snapshot(),
+            ReplicaRawReader::Parallel(reader) => reader.perf_snapshot(),
+        }
+    }
+}
 
-                                if invalid_filled_total_sz {
-                                    events.push(CmdEvent::Skipped {
-                                        user: Some(user),
-                                        oid: oid_from_resting.or(oid_from_filled),
-                                        event: "modify".to_owned(),
-                                        status: "skipped_invalid_filled_total_sz".to_owned(),
-                                    });
-                                }
-                            }
+struct ReplicaParseTask {
+    seq: u64,
+    line: Vec<u8>,
+}
+
+struct ReplicaParseResult {
+    seq: u64,
+    line: Vec<u8>,
+    parsed: Result<ReplicaBatch>,
+    parse_ns: u128,
+}
+
+type ReplicaPrefetchMessage = Result<(Option<ReplicaBatch>, ReaderReadPerfStats)>;
+
+struct ReplicaPrefetchReader {
+    rx: mpsc::Receiver<ReplicaPrefetchMessage>,
+    worker: JoinHandle<()>,
+    last_perf: ReaderReadPerfStats,
+    active_workers: usize,
+}
+
+impl ReplicaPrefetchReader {
+    async fn new(
+        source: ReaderSource,
+        s3_client: Option<Arc<S3Client>>,
+        requester_pays: bool,
+        queue_depth: usize,
+        requested_workers: usize,
+        replica_s3_connections: usize,
+        replica_prefetch_buffer_mb: usize,
+    ) -> Result<Self> {
+        let requested_workers = requested_workers.clamp(1, MAX_REPLICA_PREFETCH_WORKERS);
+        let host_parallelism = std::thread::available_parallelism().map(|parallelism| parallelism.get()).unwrap_or(1);
+        let cpu_budget = host_parallelism.clamp(1, TARGET_REPLICA_CPU_CORES);
+        let base_parse_worker_budget = cpu_budget.saturating_sub(1).max(1);
+        let base_parse_workers = requested_workers.min(base_parse_worker_budget);
+        // User asked to scale both LZ4 decode workers and JSON parse workers to 2x of the previous plan.
+        let replica_lz4_decode_workers = host_parallelism.min(REPLICA_WORKER_SCALE_UP).max(1);
+        let effective_workers = base_parse_workers
+            .saturating_mul(REPLICA_WORKER_SCALE_UP)
+            .clamp(1, MAX_REPLICA_PREFETCH_WORKERS);
+        if effective_workers != requested_workers {
+            info!(
+                "[config] replica_prefetch_workers requested={} auto_tuned={} host_parallelism={} cpu_budget={} scale_up={}",
+                requested_workers,
+                effective_workers,
+                host_parallelism,
+                cpu_budget,
+                REPLICA_WORKER_SCALE_UP
+            );
+        }
+        info!(
+            "[config] replica_prefetch_cpu_plan host_parallelism={} cpu_budget={} parse_workers_base={} parse_workers={} lz4_workers_base=1 lz4_workers={}",
+            host_parallelism,
+            cpu_budget,
+            base_parse_workers,
+            effective_workers,
+            replica_lz4_decode_workers
+        );
+        let channel_capacity = queue_depth.max(1);
+
+        let mut reader = ReplicaCmdsReader::new(
+            source,
+            s3_client,
+            requester_pays,
+            replica_lz4_decode_workers,
+            replica_s3_connections,
+            replica_prefetch_buffer_mb,
+        )
+        .await?;
+        let (tx, rx) = mpsc::channel(channel_capacity);
+        let worker = tokio::spawn(async move {
+            let parser_result_capacity = channel_capacity.max(effective_workers);
+            let per_worker_capacity = (parser_result_capacity / effective_workers).max(1);
+            let (result_tx, mut result_rx) = mpsc::channel::<ReplicaParseResult>(parser_result_capacity);
+
+            let mut task_txs = Vec::with_capacity(effective_workers);
+            for _ in 0..effective_workers {
+                let (task_tx, mut task_rx) = mpsc::channel::<ReplicaParseTask>(per_worker_capacity);
+                task_txs.push(task_tx);
+                let worker_result_tx = result_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(mut task) = task_rx.recv().await {
+                        let parse_started_at = Instant::now();
+                        let parsed = ReplicaCmdsReader::parse_raw_line(&mut task.line);
+                        let parse_ns = parse_started_at.elapsed().as_nanos();
+                        task.line.clear();
+                        if worker_result_tx
+                            .send(ReplicaParseResult { seq: task.seq, line: task.line, parsed, parse_ns })
+                            .await
+                            .is_err()
+                        {
+                            break;
                         }
-                        _ => {}
+                    }
+                });
+            }
+            drop(result_tx);
+
+            let mut next_seq_to_assign = 0_u64;
+            let mut next_seq_to_emit = 0_u64;
+            let mut next_worker_idx = 0_usize;
+            let mut inflight = 0_usize;
+            let max_inflight = channel_capacity.max(effective_workers);
+            let mut reader_exhausted = false;
+            let mut pending: BTreeMap<u64, Result<ReplicaBatch>> = BTreeMap::new();
+            let mut recycled_line_buffers: Vec<Vec<u8>> = Vec::with_capacity(max_inflight + effective_workers);
+            let mut parse_ns_total = 0_u128;
+            let mut parse_calls_total = 0_u64;
+
+            loop {
+                while !reader_exhausted && inflight < max_inflight {
+                    let mut line =
+                        recycled_line_buffers.pop().unwrap_or_else(|| Vec::with_capacity(LZ4_IO_BUFFER_BYTES));
+                    let has_line = match reader.next_raw_line_into(&mut line).await {
+                        Ok(has_line) => has_line,
+                        Err(err) => {
+                            drop(tx.send(Err(err)).await);
+                            return;
+                        }
+                    };
+                    if !has_line {
+                        recycled_line_buffers.push(line);
+                        reader_exhausted = true;
+                        break;
+                    }
+
+                    let worker_slot = next_worker_idx % effective_workers;
+                    next_worker_idx = next_worker_idx.wrapping_add(1);
+                    if task_txs[worker_slot].send(ReplicaParseTask { seq: next_seq_to_assign, line }).await.is_err() {
+                        drop(tx.send(Err(anyhow!("replica prefetch parser worker channel closed unexpectedly"))).await);
+                        return;
+                    }
+                    next_seq_to_assign = next_seq_to_assign.saturating_add(1);
+                    inflight = inflight.saturating_add(1);
+                }
+
+                if inflight == 0 {
+                    if reader_exhausted {
+                        break;
+                    }
+                    continue;
+                }
+
+                let Some(result) = result_rx.recv().await else {
+                    drop(tx.send(Err(anyhow!("replica prefetch parser workers stopped unexpectedly"))).await);
+                    return;
+                };
+                inflight = inflight.saturating_sub(1);
+                parse_ns_total = parse_ns_total.saturating_add(result.parse_ns);
+                parse_calls_total = parse_calls_total.saturating_add(1);
+                recycled_line_buffers.push(result.line);
+                pending.insert(result.seq, result.parsed);
+
+                while let Some(parsed) = pending.remove(&next_seq_to_emit) {
+                    let mut perf = reader.perf_snapshot();
+                    perf.json_parse_ns = parse_ns_total;
+                    perf.json_parse_calls = parse_calls_total;
+                    let had_error = parsed.is_err();
+                    if tx.send(parsed.map(|batch| (Some(batch), perf))).await.is_err() {
+                        return;
+                    }
+                    next_seq_to_emit = next_seq_to_emit.saturating_add(1);
+                    if had_error {
+                        return;
                     }
                 }
             }
 
-            return Ok(Some(ReplicaBatch { block_number, block_time_ms, events }));
-        }
+            drop(task_txs);
+            let mut perf = reader.perf_snapshot();
+            perf.json_parse_ns = parse_ns_total;
+            perf.json_parse_calls = parse_calls_total;
+            drop(tx.send(Ok((None, perf))).await);
+        });
+
+        Ok(Self { rx, worker, last_perf: ReaderReadPerfStats::default(), active_workers: effective_workers })
+    }
+
+    async fn next_batch(&mut self) -> Result<Option<ReplicaBatch>> {
+        let Some(message) = self.rx.recv().await else {
+            if self.worker.is_finished() {
+                match (&mut self.worker).await {
+                    Ok(()) => return Ok(None),
+                    Err(err) => bail!("replica prefetch worker failed: {err}"),
+                }
+            }
+            bail!("replica prefetch channel closed unexpectedly");
+        };
+
+        let (batch, perf) = message?;
+        self.last_perf = perf;
+        Ok(batch)
+    }
+
+    fn worker_count(&self) -> usize {
+        self.active_workers
+    }
+
+    fn perf_snapshot(&self) -> ReaderReadPerfStats {
+        self.last_perf
+    }
+}
+
+impl Drop for ReplicaPrefetchReader {
+    fn drop(&mut self) {
+        self.worker.abort();
     }
 }
 
@@ -2205,6 +3155,7 @@ fn remove_trigger_ref(trigger_refs: &mut TriggerOrderRefs, oid: u64) -> bool {
     let Some(cloid_key) = trigger_refs.oid_to_cloid.remove(&oid) else {
         return false;
     };
+    trigger_refs.oid_created_time_ms.remove(&oid);
     if let Some(ref cloid_key) = cloid_key {
         let mut remove_user_bucket = false;
         if let Some(by_cloid) = trigger_refs.cloid_to_oid.get_mut(&cloid_key.user) {
@@ -2226,10 +3177,11 @@ fn remove_pending_trigger_ref_by_cloid(trigger_refs: &mut TriggerOrderRefs, user
     let Some(pending) = trigger_refs.pending_by_user.get_mut(user) else {
         return false;
     };
-    let Some(idx) = pending.iter().position(|pending_cloid| pending_cloid.as_deref() == Some(cloid)) else {
+    let before_len = pending.len();
+    pending.retain(|pending_cloid| pending_cloid.as_deref() != Some(cloid));
+    if before_len == pending.len() {
         return false;
-    };
-    pending.remove(idx);
+    }
     if pending.is_empty() {
         trigger_refs.pending_by_user.remove(user);
     }
@@ -2249,24 +3201,43 @@ fn consume_pending_trigger_ref_for_user(trigger_refs: &mut TriggerOrderRefs, use
     true
 }
 
-fn insert_trigger_ref(trigger_refs: &mut TriggerOrderRefs, user: &str, oid: u64, cloid: Option<&str>) {
+fn insert_trigger_ref(
+    trigger_refs: &mut TriggerOrderRefs,
+    user: &str,
+    oid: u64,
+    cloid: Option<&str>,
+    created_time_ms: i64,
+) {
     remove_trigger_ref(trigger_refs, oid);
     if let Some(cloid) = cloid {
+        if let Some(existing_oid) = trigger_refs
+            .cloid_to_oid
+            .get(user)
+            .and_then(|by_cloid| by_cloid.get(cloid))
+            .copied()
+            && existing_oid != oid
+        {
+            remove_trigger_ref(trigger_refs, existing_oid);
+        }
         remove_pending_trigger_ref_by_cloid(trigger_refs, user, cloid);
     }
     let cloid_key = cloid.map(|cloid| UserCloidKey { user: user.to_owned(), cloid: cloid.to_owned() });
     if let Some(cloid_key) = &cloid_key {
         trigger_refs.cloid_to_oid.entry(cloid_key.user.clone()).or_default().insert(cloid_key.cloid.clone(), oid);
     }
+    trigger_refs.oid_created_time_ms.insert(oid, created_time_ms);
+    trigger_refs.oid_created_queue.push_back((created_time_ms, oid));
     trigger_refs.oid_to_cloid.insert(oid, cloid_key);
 }
 
 fn remove_live_order(
     orders: &mut HashMap<u64, OrderState>,
     cloid_to_oid: &mut HashMap<String, HashMap<String, u64>>,
+    order_expiry_index: &mut BTreeSet<(i64, u64)>,
     oid: u64,
 ) -> Option<OrderState> {
     let state = orders.remove(&oid)?;
+    order_expiry_index.remove(&(state.created_time_ms, oid));
     if let Some(cloid) = &state.cloid {
         let mut remove_user_bucket = false;
         if let Some(by_cloid) = cloid_to_oid.get_mut(&state.user) {
@@ -2283,6 +3254,7 @@ fn remove_live_order(
 fn insert_live_order(
     orders: &mut HashMap<u64, OrderState>,
     cloid_to_oid: &mut HashMap<String, HashMap<String, u64>>,
+    order_expiry_index: &mut BTreeSet<(i64, u64)>,
     user: &str,
     oid: u64,
     cloid: Option<&str>,
@@ -2293,7 +3265,16 @@ fn insert_live_order(
     sz: Decimal,
     meta: &OrderMeta,
 ) {
+    drop(remove_live_order(orders, cloid_to_oid, order_expiry_index, oid));
     if let Some(cloid) = cloid {
+        if let Some(existing_oid) = cloid_to_oid
+            .get(user)
+            .and_then(|by_cloid| by_cloid.get(cloid))
+            .copied()
+            && existing_oid != oid
+        {
+            drop(remove_live_order(orders, cloid_to_oid, order_expiry_index, existing_oid));
+        }
         cloid_to_oid.entry(user.to_owned()).or_default().insert(cloid.to_owned(), oid);
     }
     orders.insert(
@@ -2317,21 +3298,29 @@ fn insert_live_order(
             sl_trigger_px: meta.sl_trigger_px,
         },
     );
+    order_expiry_index.insert((created_time_ms, oid));
 }
 
 fn prune_stale_live_orders(
     orders: &mut HashMap<u64, OrderState>,
     cloid_to_oid: &mut HashMap<String, HashMap<String, u64>>,
+    order_expiry_index: &mut BTreeSet<(i64, u64)>,
     current_block_number: u64,
     current_time_ms: i64,
 ) -> StalePruneRun {
     let cutoff_ms = current_time_ms.saturating_sub(LIVE_STATE_TTL_MS);
-    let stale_oids: Vec<u64> =
-        orders.iter().filter_map(|(oid, state)| (state.created_time_ms <= cutoff_ms).then_some(*oid)).collect();
     let mut samples = Vec::new();
     let mut pruned_total = 0u64;
-    for oid in stale_oids {
-        if let Some(state) = remove_live_order(orders, cloid_to_oid, oid) {
+    while let Some((created_time_ms, oid)) = order_expiry_index.first().copied() {
+        if created_time_ms > cutoff_ms {
+            break;
+        }
+        order_expiry_index.pop_first();
+        let should_prune = orders.get(&oid).is_some_and(|state| state.created_time_ms == created_time_ms);
+        if !should_prune {
+            continue;
+        }
+        if let Some(state) = remove_live_order(orders, cloid_to_oid, order_expiry_index, oid) {
             pruned_total += 1;
             if samples.len() < PRUNE_SAMPLE_LIMIT_PER_RUN {
                 samples.push(PrunedOrderSample {
@@ -2360,44 +3349,49 @@ fn prune_stale_live_orders(
     }
 }
 
-fn prune_known_non_trigger_oids(
-    known_non_trigger_oids: &mut HashMap<u64, KnownOidState>,
-    current_block_number: u64,
-    current_time_ms: i64,
-) -> KnownOidPruneRun {
+fn prune_stale_trigger_oids(trigger_refs: &mut TriggerOrderRefs, current_time_ms: i64) -> usize {
     let cutoff_ms = current_time_ms.saturating_sub(LIVE_STATE_TTL_MS);
-    let stale_oids: Vec<u64> = known_non_trigger_oids
-        .iter()
-        .filter_map(|(oid, state)| (state.created_time_ms <= cutoff_ms).then_some(*oid))
-        .collect();
-    let mut samples = Vec::new();
-    let mut pruned_total = 0u64;
-    for oid in stale_oids {
-        if let Some(state) = known_non_trigger_oids.remove(&oid) {
-            pruned_total += 1;
-            if samples.len() < PRUNE_SAMPLE_LIMIT_PER_RUN {
-                samples.push(PrunedKnownOidSample {
-                    oid,
-                    created_block_number: state.created_block_number,
-                    created_time_ms: state.created_time_ms,
-                    pruned_at_block_number: current_block_number,
-                    pruned_at_time_ms: current_time_ms,
-                    age_ms: current_time_ms.saturating_sub(state.created_time_ms),
-                });
-            }
+    let mut pruned = 0usize;
+    while let Some((created_time_ms, oid)) = trigger_refs.oid_created_queue.front().copied() {
+        if created_time_ms > cutoff_ms {
+            break;
+        }
+        trigger_refs.oid_created_queue.pop_front();
+        let should_prune = trigger_refs
+            .oid_created_time_ms
+            .get(&oid)
+            .is_some_and(|known_created| *known_created == created_time_ms);
+        if !should_prune {
+            continue;
+        }
+        if remove_trigger_ref(trigger_refs, oid) {
+            pruned += 1;
         }
     }
-    let sampled = u64::try_from(samples.len()).unwrap_or(0);
-    let sample_dropped = pruned_total.saturating_sub(sampled);
-    KnownOidPruneRun {
-        trigger_block_number: current_block_number,
-        trigger_block_time_ms: current_time_ms,
-        cutoff_time_ms: cutoff_ms,
-        pruned_total,
-        sampled,
-        sample_dropped,
-        samples,
+    pruned
+}
+
+fn rebuild_trigger_cloid_index(trigger_refs: &mut TriggerOrderRefs) {
+    trigger_refs.cloid_to_oid.clear();
+    for (&oid, cloid_key) in trigger_refs.oid_to_cloid.iter() {
+        if let Some(cloid_key) = cloid_key {
+            trigger_refs
+                .cloid_to_oid
+                .entry(cloid_key.user.clone())
+                .or_default()
+                .insert(cloid_key.cloid.clone(), oid);
+        }
     }
+}
+
+fn rebuild_trigger_created_queue(trigger_refs: &mut TriggerOrderRefs) {
+    let mut ordered: Vec<(i64, u64)> = trigger_refs
+        .oid_created_time_ms
+        .iter()
+        .map(|(&oid, &created_time_ms)| (created_time_ms, oid))
+        .collect();
+    ordered.sort_unstable();
+    trigger_refs.oid_created_queue = VecDeque::from(ordered);
 }
 
 fn push_add_row(
@@ -2440,6 +3434,12 @@ fn push_add_row(
     Ok(())
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct BlockPruneStats {
+    live_pruned_orders: u64,
+    trigger_pruned_oids: u64,
+}
+
 fn process_block(
     block_number: u64,
     block_time_ms: i64,
@@ -2450,34 +3450,40 @@ fn process_block(
     rows: &mut RowBuffer,
     orders: &mut HashMap<u64, OrderState>,
     cloid_to_oid: &mut HashMap<String, HashMap<String, u64>>,
+    order_expiry_index: &mut BTreeSet<(i64, u64)>,
     trigger_refs: &mut TriggerOrderRefs,
-    known_non_trigger_oids: &mut HashMap<u64, KnownOidState>,
     unknown_oid_logger: &mut UnknownOidWindowLogger,
-) -> Result<()> {
+    perf_stats: &mut ProcessingPerfStats,
+) -> Result<BlockPruneStats> {
+    let process_block_started_at = Instant::now();
+    let mut block_prune_stats = BlockPruneStats::default();
+
+    let prune_started_at = Instant::now();
     unknown_oid_logger.set_enabled(emit_json_logs);
     unknown_oid_logger.observe_block(block_number)?;
     if block_number == row_group_window_start_block(block_number) {
-        let prune_run = prune_stale_live_orders(orders, cloid_to_oid, block_number, block_time_ms);
-        let known_oid_prune_run = prune_known_non_trigger_oids(known_non_trigger_oids, block_number, block_time_ms);
+        let prune_run =
+            prune_stale_live_orders(orders, cloid_to_oid, order_expiry_index, block_number, block_time_ms);
+        block_prune_stats.live_pruned_orders = prune_run.pruned_total;
+        let pruned_trigger_oids = prune_stale_trigger_oids(trigger_refs, block_time_ms);
+        block_prune_stats.trigger_pruned_oids = u64::try_from(pruned_trigger_oids).unwrap_or(u64::MAX);
         if emit_json_logs {
             unknown_oid_logger.record_stale_prune_run(prune_run);
-            unknown_oid_logger.record_known_oid_prune_run(known_oid_prune_run);
         }
     }
+    perf_stats.process_block_prune_ns += prune_started_at.elapsed().as_nanos();
 
     if let Some(events) = cmd_events {
+        let cmd_started_at = Instant::now();
         let mut canceled_oids_in_block: HashSet<u64> = HashSet::new();
         let mut deferred_cancels: Vec<(Option<String>, OrderRef, bool)> = Vec::new();
         for event in &events {
             match event {
                 CmdEvent::Add { user, oid, cloid, side, px, sz, raw_sz, meta } => {
-                    known_non_trigger_oids.insert(
-                        *oid,
-                        KnownOidState { created_block_number: block_number, created_time_ms: block_time_ms },
-                    );
                     insert_live_order(
                         orders,
                         cloid_to_oid,
+                        order_expiry_index,
                         user,
                         *oid,
                         cloid.as_deref(),
@@ -2514,7 +3520,7 @@ fn process_block(
                         if canceled_oids_in_block.contains(&oid) {
                             continue;
                         }
-                        if let Some(state) = remove_live_order(orders, cloid_to_oid, oid) {
+                        if let Some(state) = remove_live_order(orders, cloid_to_oid, order_expiry_index, oid) {
                             canceled_oids_in_block.insert(oid);
                             if emit_rows {
                                 rows.push(OutputRow {
@@ -2572,7 +3578,7 @@ fn process_block(
 
                     if !emitted_remove {
                         if let (Some(user), OrderRef::Oid(oid)) = (user.as_deref(), order_ref)
-                            && !known_non_trigger_oids.contains_key(oid)
+                            && !orders.contains_key(oid)
                             && consume_pending_trigger_ref_for_user(trigger_refs, user)
                         {
                             continue;
@@ -2597,7 +3603,7 @@ fn process_block(
                 CmdEvent::Modify { user, old_order_ref, new_oid, new_cloid, side, px, sz, raw_sz, meta } => {
                     let resolved_old_oid = resolve_order_ref(old_order_ref, Some(user.as_str()), cloid_to_oid);
                     if let Some(old_oid) = resolved_old_oid {
-                        if let Some(old_state) = remove_live_order(orders, cloid_to_oid, old_oid) {
+                        if let Some(old_state) = remove_live_order(orders, cloid_to_oid, order_expiry_index, old_oid) {
                             if emit_rows {
                                 rows.push(OutputRow {
                                     block_number: i64::try_from(block_number)?,
@@ -2665,13 +3671,10 @@ fn process_block(
 
                     if !meta.is_trigger {
                         if let Some(new_oid) = new_oid {
-                            known_non_trigger_oids.insert(
-                                *new_oid,
-                                KnownOidState { created_block_number: block_number, created_time_ms: block_time_ms },
-                            );
                             insert_live_order(
                                 orders,
                                 cloid_to_oid,
+                                order_expiry_index,
                                 user,
                                 *new_oid,
                                 new_cloid.as_deref(),
@@ -2700,7 +3703,7 @@ fn process_block(
                     }
                 }
                 CmdEvent::TrackTriggerAdd { user, oid, cloid } => {
-                    insert_trigger_ref(trigger_refs, user, *oid, cloid.as_deref());
+                    insert_trigger_ref(trigger_refs, user, *oid, cloid.as_deref(), block_time_ms);
                 }
                 CmdEvent::TrackTriggerPending { user, cloid } => {
                     insert_pending_trigger_ref(trigger_refs, user, cloid.as_deref());
@@ -2712,7 +3715,7 @@ fn process_block(
                         remove_pending_trigger_ref_by_cloid(trigger_refs, user, cloid);
                     }
                     if let Some(new_oid) = new_oid {
-                        insert_trigger_ref(trigger_refs, user, *new_oid, new_cloid.as_deref());
+                        insert_trigger_ref(trigger_refs, user, *new_oid, new_cloid.as_deref(), block_time_ms);
                     } else if new_cloid.is_some() {
                         insert_pending_trigger_ref(trigger_refs, user, new_cloid.as_deref());
                     }
@@ -2768,7 +3771,7 @@ fn process_block(
                 if canceled_oids_in_block.contains(&oid) {
                     continue;
                 }
-                if let Some(state) = remove_live_order(orders, cloid_to_oid, oid) {
+                if let Some(state) = remove_live_order(orders, cloid_to_oid, order_expiry_index, oid) {
                     canceled_oids_in_block.insert(oid);
                     if emit_rows {
                         rows.push(OutputRow {
@@ -2826,7 +3829,7 @@ fn process_block(
 
             if !emitted_remove {
                 if let (Some(user), OrderRef::Oid(oid)) = (user.as_deref(), &order_ref)
-                    && !known_non_trigger_oids.contains_key(oid)
+                    && !orders.contains_key(oid)
                     && consume_pending_trigger_ref_for_user(trigger_refs, user)
                 {
                     continue;
@@ -2848,19 +3851,30 @@ fn process_block(
                 }
             }
         }
+        perf_stats.process_block_cmd_ns += cmd_started_at.elapsed().as_nanos();
     }
 
     if let Some(fills) = fills {
-        let taker_tids: HashSet<u64> = fills.iter().filter(|fill| fill.crossed).filter_map(|fill| fill.tid).collect();
+        let fills_started_at = Instant::now();
+        let taker_tids = if emit_rows {
+            Some(fills.iter().filter(|fill| fill.crossed).filter_map(|fill| fill.tid).collect::<HashSet<u64>>())
+        } else {
+            None
+        };
 
         for fill in fills {
             let fill_time_ms = fill.block_time_ms;
+
+            // Filled/crossed trigger orders should not remain in live trigger refs.
+            remove_trigger_ref(trigger_refs, fill.oid);
 
             if fill.crossed {
                 continue;
             }
 
-            let has_matching_taker = fill.tid.is_some_and(|tid| taker_tids.contains(&tid));
+            let has_matching_taker = taker_tids
+                .as_ref()
+                .is_some_and(|known_taker_tids| fill.tid.is_some_and(|tid| known_taker_tids.contains(&tid)));
 
             if emit_rows && has_matching_taker {
                 rows.push(OutputRow {
@@ -2895,7 +3909,7 @@ fn process_block(
             };
 
             if state.remaining_sz <= Decimal::ZERO {
-                remove_live_order(orders, cloid_to_oid, fill.oid);
+                remove_live_order(orders, cloid_to_oid, order_expiry_index, fill.oid);
                 continue;
             }
 
@@ -2907,24 +3921,50 @@ fn process_block(
             state.remaining_sz = new_remaining;
 
             if new_remaining <= Decimal::ZERO {
-                remove_live_order(orders, cloid_to_oid, fill.oid);
+                remove_live_order(orders, cloid_to_oid, order_expiry_index, fill.oid);
             }
         }
+        perf_stats.process_block_fill_ns += fills_started_at.elapsed().as_nanos();
     }
 
-    Ok(())
+    perf_stats.process_block_total_ns += process_block_started_at.elapsed().as_nanos();
+
+    Ok(block_prune_stats)
+}
+
+fn cleanup_stale_parquet_tmp_files(output_dir: &Path) -> Result<usize> {
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(output_dir)
+        .with_context(|| format!("failed to read output directory: {}", output_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read entry in {}", output_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".parquet.tmp") {
+            continue;
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("failed to remove stale parquet tmp file {}", path.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 fn build_output_tmp_path(output_dir: &Path, actual_start_block: u64) -> Result<PathBuf> {
     create_dir_all(output_dir)
         .with_context(|| format!("failed to create output directory: {}", output_dir.display()))?;
     let pid = std::process::id();
-    let mut candidate = output_dir.join(format!(".tmp_btc_diff_start{actual_start_block}_pid{pid}.parquet"));
+    let mut candidate = output_dir.join(format!(".tmp_btc_diff_start{actual_start_block}_pid{pid}.parquet.tmp"));
     if !candidate.exists() {
         return Ok(candidate);
     }
     for idx in 1..=9_999usize {
-        candidate = output_dir.join(format!(".tmp_btc_diff_start{actual_start_block}_pid{pid}_{idx}.parquet"));
+        candidate = output_dir.join(format!(".tmp_btc_diff_start{actual_start_block}_pid{pid}_{idx}.parquet.tmp"));
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -2951,6 +3991,198 @@ fn build_final_output_path(output_dir: &Path, actual_start_block: u64, actual_en
         actual_end_block,
         output_dir.display()
     );
+}
+
+fn build_warmup_state_output_path(output_dir: &Path, checkpoint_block_number: u64) -> Result<PathBuf> {
+    create_dir_all(output_dir)
+        .with_context(|| format!("failed to create warmup state output directory: {}", output_dir.display()))?;
+    Ok(output_dir.join(format!("warmup_state_{checkpoint_block_number}.msgpack.zst")))
+}
+
+fn auto_match_warmup_state_path(
+    output_dir: Option<&Path>,
+    output_block_range: Option<(u64, u64)>,
+    warmup_blocks: u64,
+) -> Option<PathBuf> {
+    if warmup_blocks == 0 {
+        return None;
+    }
+    let Some((start_height, _)) = output_block_range else {
+        return None;
+    };
+    let Some(dir) = output_dir else {
+        return None;
+    };
+    let checkpoint_block = start_height.saturating_sub(1);
+    let candidate = dir.join(format!("warmup_state_{checkpoint_block}.msgpack.zst"));
+    candidate.is_file().then_some(candidate)
+}
+
+fn write_warmup_state_snapshot(
+    output_dir: &Path,
+    checkpoint_block_number: u64,
+    checkpoint_block_time_ms: i64,
+    orders: &HashMap<u64, OrderState>,
+    cloid_to_oid: &HashMap<String, HashMap<String, u64>>,
+    trigger_refs: &TriggerOrderRefs,
+) -> Result<PathBuf> {
+    let mut assets = HashMap::new();
+    assets.insert(
+        PRIMARY_ASSET_SYMBOL.to_owned(),
+        WarmupAssetSnapshot {
+            live_orders: orders.clone(),
+            live_oid_by_user_cloid: cloid_to_oid.clone(),
+            trigger_refs: trigger_refs.clone(),
+        },
+    );
+    let snapshot = WarmupStateSnapshot {
+        format_version: WARMUP_STATE_FORMAT_VERSION,
+        checkpoint_block_number,
+        checkpoint_block_time_ms,
+        assets,
+    };
+    let packed = rmp_serde::to_vec_named(&snapshot).context("serializing warmup state snapshot as msgpack")?;
+    let compressed =
+        zstd::stream::encode_all(packed.as_slice(), WARMUP_STATE_ZSTD_LEVEL).context("compressing warmup state")?;
+
+    create_dir_all(output_dir)
+        .with_context(|| format!("failed to create warmup state output directory: {}", output_dir.display()))?;
+    let pid = std::process::id();
+    let tmp_path =
+        output_dir.join(format!(".tmp_warmup_state_{checkpoint_block_number}_pid{pid}.msgpack.zst"));
+    std::fs::write(&tmp_path, compressed)
+        .with_context(|| format!("failed to write warmup state temp file {}", tmp_path.display()))?;
+
+    let final_path = build_warmup_state_output_path(output_dir, checkpoint_block_number)?;
+    rename(&tmp_path, &final_path).with_context(|| {
+        format!("failed to rename warmup state temp file {} -> {}", tmp_path.display(), final_path.display())
+    })?;
+    Ok(final_path)
+}
+
+fn read_warmup_state_snapshot(path: &Path) -> Result<WarmupStateSnapshot> {
+    let compressed =
+        std::fs::read(path).with_context(|| format!("failed to read warmup state file {}", path.display()))?;
+    let decoded = zstd::stream::decode_all(compressed.as_slice())
+        .with_context(|| format!("failed to decompress warmup state file {}", path.display()))?;
+    let snapshot: WarmupStateSnapshot =
+        rmp_serde::from_slice(&decoded).with_context(|| format!("invalid warmup state msgpack in {}", path.display()))?;
+    if snapshot.format_version != WARMUP_STATE_FORMAT_VERSION {
+        bail!(
+            "unsupported warmup state format_version={} in {}, expected {}",
+            snapshot.format_version,
+            path.display(),
+            WARMUP_STATE_FORMAT_VERSION
+        );
+    }
+    Ok(snapshot)
+}
+
+fn maybe_write_warmup_state_snapshot(
+    output_dir: Option<&Path>,
+    block_number: u64,
+    block_time_ms: i64,
+    in_warmup: bool,
+    warmup_just_ended: bool,
+    block_prune_stats: BlockPruneStats,
+    orders: &HashMap<u64, OrderState>,
+    cloid_to_oid: &HashMap<String, HashMap<String, u64>>,
+    trigger_refs: &TriggerOrderRefs,
+) -> Result<()> {
+    let Some(output_dir) = output_dir else {
+        return Ok(());
+    };
+    if in_warmup && !warmup_just_ended {
+        return Ok(());
+    }
+    let hit_file_boundary = block_number % FILE_ROTATION_BLOCKS == 0;
+    if !warmup_just_ended && !hit_file_boundary {
+        return Ok(());
+    }
+    let reason = if warmup_just_ended { "warmup_end" } else { "file_boundary_1m" };
+    let final_path = write_warmup_state_snapshot(
+        output_dir,
+        block_number,
+        block_time_ms,
+        orders,
+        cloid_to_oid,
+        trigger_refs,
+    )?;
+    info!(
+        "[warmup.state] reason={} checkpoint_block={} checkpoint_time_ms={} purged_live={} purged_trigger={} path={} live_orders={} user_cloid_oid_map_entries={} trigger_oids={}",
+        reason,
+        block_number,
+        block_time_ms,
+        block_prune_stats.live_pruned_orders,
+        block_prune_stats.trigger_pruned_oids,
+        final_path.display(),
+        orders.len(),
+        cloid_mapping_entry_count(cloid_to_oid),
+        trigger_refs.oid_to_cloid.len(),
+    );
+    Ok(())
+}
+
+fn warmup_just_finished(
+    warmup_end_logged: bool,
+    read_block_range: Option<(u64, u64)>,
+    output_block_range: Option<(u64, u64)>,
+    block_number: u64,
+) -> bool {
+    if warmup_end_logged {
+        return false;
+    }
+    let (Some((warmup_start, _)), Some((output_start, _))) = (read_block_range, output_block_range) else {
+        return false;
+    };
+    warmup_start < output_start && block_number == output_start.saturating_sub(1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_warmup_state_snapshot(
+    snapshot: WarmupStateSnapshot,
+    orders: &mut HashMap<u64, OrderState>,
+    cloid_to_oid: &mut HashMap<String, HashMap<String, u64>>,
+    order_expiry_index: &mut BTreeSet<(i64, u64)>,
+    trigger_refs: &mut TriggerOrderRefs,
+) -> Result<()> {
+    let checkpoint_time_ms = snapshot.checkpoint_block_time_ms;
+    let primary_asset = snapshot.assets.get(PRIMARY_ASSET_SYMBOL).ok_or_else(|| {
+        anyhow!(
+            "warmup snapshot missing primary asset bucket: {}",
+            PRIMARY_ASSET_SYMBOL
+        )
+    })?;
+
+    *orders = primary_asset.live_orders.clone();
+    *cloid_to_oid = primary_asset.live_oid_by_user_cloid.clone();
+    *trigger_refs = primary_asset.trigger_refs.clone();
+
+    for &oid in trigger_refs.oid_to_cloid.keys() {
+        trigger_refs
+            .oid_created_time_ms
+            .entry(oid)
+            .or_insert(checkpoint_time_ms);
+    }
+    trigger_refs
+        .oid_created_time_ms
+        .retain(|oid, _| trigger_refs.oid_to_cloid.contains_key(oid));
+    rebuild_trigger_cloid_index(trigger_refs);
+    rebuild_trigger_created_queue(trigger_refs);
+
+    order_expiry_index.clear();
+    let rebuild_live_cloid_map = cloid_to_oid.is_empty();
+    if rebuild_live_cloid_map {
+        cloid_to_oid.clear();
+    }
+    for (&oid, state) in orders.iter() {
+        if rebuild_live_cloid_map && let Some(cloid) = state.cloid.as_deref() {
+            cloid_to_oid.entry(state.user.clone()).or_default().insert(cloid.to_owned(), oid);
+        }
+        order_expiry_index.insert((state.created_time_ms, oid));
+    }
+
+    Ok(())
 }
 
 fn open_output_writer(path: &Path, schema: &Arc<Schema>) -> Result<ArrowWriter<File>> {
@@ -3022,7 +4254,7 @@ fn ensure_output_ready_for_block(
         *current_file_window_start = Some(next_file_window);
         *current_row_group_window_start = Some(next_row_group_window);
         *current_file_actual_start_block = Some(block_number);
-        eprintln!("[file] open parquet_tmp={} start_block={}", tmp_path.display(), block_number);
+        info!("[file] open parquet_tmp={} start_block={}", tmp_path.display(), block_number);
         return Ok(());
     }
 
@@ -3045,7 +4277,7 @@ fn ensure_output_ready_for_block(
                 closed_end,
             )?;
             generated_output_files.push(final_path.clone());
-            eprintln!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
+            info!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
         }
 
         let tmp_path = build_output_tmp_path(output_dir, block_number)?;
@@ -3054,7 +4286,7 @@ fn ensure_output_ready_for_block(
         *current_file_window_start = Some(next_file_window);
         *current_row_group_window_start = Some(next_row_group_window);
         *current_file_actual_start_block = Some(block_number);
-        eprintln!("[file] open parquet_tmp={} start_block={}", tmp_path.display(), block_number);
+        info!("[file] open parquet_tmp={} start_block={}", tmp_path.display(), block_number);
         return Ok(());
     }
 
@@ -3069,25 +4301,212 @@ fn ensure_output_ready_for_block(
 }
 
 async fn fetch_next_pair(
-    replica_reader: &mut ReplicaCmdsReader,
+    replica_reader: &mut ReplicaPrefetchReader,
     fills_reader: &mut NodeFillsReader,
 ) -> Result<(Option<ReplicaBatch>, Option<NodeFillsBatch>)> {
     let (next_replica, next_fills) = tokio::try_join!(replica_reader.next_batch(), fills_reader.next_batch())?;
     Ok((next_replica, next_fills))
 }
 
+#[derive(Default, Debug)]
+struct ProcessingPerfStats {
+    fetch_pair_ns: u128,
+    fetch_replica_only_ns: u128,
+    fetch_fills_only_ns: u128,
+    ensure_output_ns: u128,
+    process_block_total_ns: u128,
+    process_block_prune_ns: u128,
+    process_block_cmd_ns: u128,
+    process_block_fill_ns: u128,
+}
+
+impl ProcessingPerfStats {
+    fn ns_to_secs(ns: u128) -> f64 {
+        ns as f64 / 1_000_000_000.0
+    }
+
+    fn pct_of_total(ns: u128, total_secs: f64) -> f64 {
+        if total_secs <= 0.0 {
+            0.0
+        } else {
+            (Self::ns_to_secs(ns) / total_secs) * 100.0
+        }
+    }
+
+    fn log_summary(&self, processed_blocks: u64, total_elapsed_secs: f64) {
+        info!(
+            "[perf] blocks={} elapsed={:.1}s read_pair={:.1}s({:.1}%) read_replica_only={:.1}s read_fills_only={:.1}s ensure_output={:.1}s({:.1}%) process_block={:.1}s({:.1}%) prune={:.1}s cmd={:.1}s fills={:.1}s",
+            processed_blocks,
+            total_elapsed_secs,
+            Self::ns_to_secs(self.fetch_pair_ns),
+            Self::pct_of_total(self.fetch_pair_ns, total_elapsed_secs),
+            Self::ns_to_secs(self.fetch_replica_only_ns),
+            Self::ns_to_secs(self.fetch_fills_only_ns),
+            Self::ns_to_secs(self.ensure_output_ns),
+            Self::pct_of_total(self.ensure_output_ns, total_elapsed_secs),
+            Self::ns_to_secs(self.process_block_total_ns),
+            Self::pct_of_total(self.process_block_total_ns, total_elapsed_secs),
+            Self::ns_to_secs(self.process_block_prune_ns),
+            Self::ns_to_secs(self.process_block_cmd_ns),
+            Self::ns_to_secs(self.process_block_fill_ns),
+        );
+    }
+
+    fn pct_of_reader(ns: u128, reader_total_ns: u128) -> f64 {
+        if reader_total_ns == 0 {
+            0.0
+        } else {
+            (ns as f64 / reader_total_ns as f64) * 100.0
+        }
+    }
+
+    fn log_reader_breakdown(label: &str, perf: ReaderReadPerfStats) {
+        let open_other_ns = perf.open_non_s3_ns();
+        let reader_total_ns = perf.instrumented_total_ns();
+        info!(
+            "[perf.read_pair] reader={} cpu_sum_total={:.1}s s3_get={:.1}s({:.1}%) read_line_lz4={:.1}s({:.1}%) json_parse={:.1}s({:.1}%) open_other={:.1}s({:.1}%) s3_get_calls={} line_reads={} json_parses={} line_bytes={}",
+            label,
+            Self::ns_to_secs(reader_total_ns),
+            Self::ns_to_secs(perf.s3_get_ns),
+            Self::pct_of_reader(perf.s3_get_ns, reader_total_ns),
+            Self::ns_to_secs(perf.line_read_ns),
+            Self::pct_of_reader(perf.line_read_ns, reader_total_ns),
+            Self::ns_to_secs(perf.json_parse_ns),
+            Self::pct_of_reader(perf.json_parse_ns, reader_total_ns),
+            Self::ns_to_secs(open_other_ns),
+            Self::pct_of_reader(open_other_ns, reader_total_ns),
+            perf.s3_get_calls,
+            perf.line_read_calls,
+            perf.json_parse_calls,
+            perf.line_read_bytes,
+        );
+    }
+
+    fn log_read_pair_breakdown(&self, replica_perf: ReaderReadPerfStats, fills_perf: ReaderReadPerfStats) {
+        let replica_total_ns = replica_perf.instrumented_total_ns();
+        let fills_total_ns = fills_perf.instrumented_total_ns();
+        info!(
+            "[perf.read_pair] wall_read_pair={:.1}s replica_instrumented_cpu_sum={:.1}s fills_instrumented_cpu_sum={:.1}s combined_cpu_sum={:.1}s",
+            Self::ns_to_secs(self.fetch_pair_ns),
+            Self::ns_to_secs(replica_total_ns),
+            Self::ns_to_secs(fills_total_ns),
+            Self::ns_to_secs(replica_total_ns + fills_total_ns),
+        );
+        Self::log_reader_breakdown("replica_cmds", replica_perf);
+        Self::log_reader_breakdown("node_fills", fills_perf);
+    }
+}
+
+fn cloid_mapping_entry_count(cloid_to_oid: &HashMap<String, HashMap<String, u64>>) -> usize {
+    cloid_to_oid.values().map(std::collections::HashMap::len).sum()
+}
+
+fn format_u64_thousands(value: u64) -> String {
+    let raw = value.to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    let raw_len = raw.len();
+    for (idx, ch) in raw.chars().enumerate() {
+        out.push(ch);
+        let remaining = raw_len - idx - 1;
+        if remaining > 0 && remaining % 3 == 0 {
+            out.push(',');
+        }
+    }
+    out
+}
+
+fn format_usize_thousands(value: usize) -> String {
+    format_u64_thousands(u64::try_from(value).unwrap_or(u64::MAX))
+}
+
+fn format_timestamp_utc8(block_time_ms: i64) -> String {
+    let Some(offset) = chrono::FixedOffset::east_opt(8 * 3600) else {
+        return "invalid_timezone".to_owned();
+    };
+    chrono::DateTime::from_timestamp_millis(block_time_ms)
+        .map(|value| value.with_timezone(&offset).to_rfc3339())
+        .unwrap_or_else(|| "invalid_timestamp".to_owned())
+}
+
+fn log_processing_progress(
+    processed_blocks: u64,
+    block_number: u64,
+    block_time_ms: i64,
+    live_orders: usize,
+    cloid_map_entries: usize,
+    trigger_oids: usize,
+    buffered_rows: usize,
+    pruned_live_orders: u64,
+    pruned_trigger_oids: u64,
+    elapsed_secs: f64,
+    total_secs: f64,
+    in_warmup: bool,
+) {
+    let phase = if in_warmup { "[warmup]" } else { "[progress]" };
+    let block_time = format_timestamp_utc8(block_time_ms);
+    let block_window = block_number / ROW_GROUP_BLOCKS;
+    info!(
+        "{} blocks={} last={} time={} live={}|-{} cloid={} trigger={}|-{} rows={} elapsed={:.1}s total={:.1}s",
+        phase,
+        format_u64_thousands(processed_blocks),
+        format_u64_thousands(block_window),
+        block_time,
+        format_usize_thousands(live_orders),
+        format_u64_thousands(pruned_live_orders),        
+        format_usize_thousands(cloid_map_entries),
+        format_usize_thousands(trigger_oids),
+        format_u64_thousands(pruned_trigger_oids),        
+        format_usize_thousands(buffered_rows),
+        elapsed_secs,
+        total_secs
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    Builder::from_env(Env::default().default_filter_or("info")).format_timestamp_micros().init();
+
     let args = Args::parse();
-    let requester_pays = REQUESTER_PAYS_ALWAYS;
-    eprintln!("[config] json_parser=simd-json");
-    if args.start_height.is_some() ^ args.height_span.is_some() {
-        bail!("--start-height and --height-span must be provided together");
+    let requested_prefetch_workers = args.replica_prefetch_workers;
+    if requested_prefetch_workers == 0 {
+        bail!("--replica-prefetch-workers must be >= 1");
     }
-    let output_block_range = match (args.start_height, args.height_span) {
+    let replica_prefetch_workers = requested_prefetch_workers.min(MAX_REPLICA_PREFETCH_WORKERS);
+    if requested_prefetch_workers > MAX_REPLICA_PREFETCH_WORKERS {
+        warn!(
+            "[config] replica_prefetch_workers={} exceeds max {}; clamping",
+            requested_prefetch_workers,
+            MAX_REPLICA_PREFETCH_WORKERS
+        );
+    }
+    let replica_prefetch = args.replica_prefetch;
+    if replica_prefetch == 0 {
+        bail!("--replica-prefetch must be >= 1");
+    }
+    let replica_s3_connections = args.replica_s3_connections;
+    if replica_s3_connections == 0 {
+        bail!("--replica-s3-connections must be >= 1");
+    }
+    let replica_prefetch_buffer_mb = args.replica_prefetch_buffer_mb;
+    if replica_prefetch_buffer_mb == 0 {
+        bail!("--replica-prefetch-buffer-mb must be >= 1");
+    }
+    let requester_pays = REQUESTER_PAYS_ALWAYS;
+    let startup_started_at = Instant::now();
+    info!(
+        "[config] json_parser=simd-json replica_prefetch={} replica_prefetch_workers={} replica_s3_connections={} replica_prefetch_buffer_mb={}",
+        replica_prefetch,
+        replica_prefetch_workers,
+        replica_s3_connections,
+        replica_prefetch_buffer_mb
+    );
+    if args.start.is_some() ^ args.span.is_some() {
+        bail!("--start and --span must be provided together");
+    }
+    let output_block_range = match (args.start, args.span) {
         (Some(start_height), Some(height_span)) => {
             if height_span == 0 {
-                bail!("--height-span must be > 0");
+                bail!("--span must be > 0");
             }
             let end_height = start_height
                 .checked_add(height_span - 1)
@@ -3096,15 +4515,80 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
-    let read_block_range = output_block_range.map(|(start_height, end_height)| {
-        let warmup_start = start_height.saturating_sub(args.warmup).max(1);
+    let warmup_blocks = args.warmup.unwrap_or(0);
+    let mut selected_warmup_state_path = args.warmup_state_file.clone();
+    let mut auto_matched_warmup_state = false;
+    if selected_warmup_state_path.is_none() {
+        selected_warmup_state_path = auto_match_warmup_state_path(
+            args.warmup_state_output_dir.as_deref(),
+            output_block_range,
+            warmup_blocks,
+        );
+        auto_matched_warmup_state = selected_warmup_state_path.is_some();
+    }
+
+    let warmup_state_snapshot = if let Some(path) = selected_warmup_state_path.as_deref() {
+        let source_flag = if auto_matched_warmup_state {
+            "auto-matched local warmup state"
+        } else {
+            "--warmup-state-file"
+        };
+        Some(read_warmup_state_snapshot(path).with_context(|| {
+            format!("failed to load {} {}", source_flag, path.display())
+        })?)
+    } else {
+        None
+    };
+    let mut read_block_range = output_block_range.map(|(start_height, end_height)| {
+        let warmup_start = start_height.saturating_sub(warmup_blocks).max(1);
         (warmup_start, end_height)
     });
+
+    if let Some(snapshot) = warmup_state_snapshot.as_ref() {
+        let Some((output_start, output_end)) = output_block_range else {
+            bail!("--warmup-state-file requires --start and --span");
+        };
+        let resume_start = snapshot.checkpoint_block_number.saturating_add(1).max(1);
+        if resume_start > output_start {
+            bail!(
+                "warmup state checkpoint block {} is ahead of output start {}",
+                snapshot.checkpoint_block_number,
+                output_start
+            );
+        }
+        if resume_start > output_end {
+            bail!(
+                "warmup state checkpoint block {} implies replay start {} > output end {}",
+                snapshot.checkpoint_block_number,
+                resume_start,
+                output_end
+            );
+        }
+        read_block_range = Some((resume_start, output_end));
+        if let Some(path) = selected_warmup_state_path.as_deref() {
+            let warmup_skipped = resume_start >= output_start;
+            let source = if auto_matched_warmup_state {
+                "auto_local_match"
+            } else {
+                "explicit"
+            };
+            info!(
+                "[warmup.state] using_local_snapshot source={} file={} checkpoint_block={} replay_start={} output_start={} warmup_skipped={}",
+                source,
+                path.display(),
+                snapshot.checkpoint_block_number,
+                resume_start,
+                output_start,
+                warmup_skipped
+            );
+        }
+    }
+
     let mut warmup_end_logged = false;
     if let (Some((warmup_start, _)), Some((output_start, _))) = (read_block_range, output_block_range)
         && warmup_start < output_start
     {
-        eprintln!(
+        info!(
             "[warmup] start warmup_blocks={} warmup_range={}..{} output_start={}",
             output_start - warmup_start,
             warmup_start,
@@ -3115,8 +4599,14 @@ async fn main() -> Result<()> {
 
     let replica_source = InputSource::parse(&args.replica_cmds).context("parsing --replica_cmds")?;
     let node_fills_source = InputSource::parse(&args.node_fills_by_block).context("parsing --node_fills_by_block")?;
-    let s3_client = if replica_source.requires_s3() || node_fills_source.requires_s3() {
+    let uses_s3 = replica_source.requires_s3() || node_fills_source.requires_s3();
+    let mut startup_aws_config_secs: Option<f64> = None;
+    let mut startup_replica_keys_resolve_secs: Option<f64> = None;
+    let mut startup_replica_keys_count: Option<usize> = None;
+    let s3_client = if uses_s3 {
+        let aws_config_started_at = Instant::now();
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest()).load().await;
+        startup_aws_config_secs = Some(aws_config_started_at.elapsed().as_secs_f64());
         Some(Arc::new(S3Client::new(&config)))
     } else {
         None
@@ -3125,22 +4615,25 @@ async fn main() -> Result<()> {
     let replica_reader_source = match &replica_source {
         InputSource::LocalFile(path) => {
             if output_block_range.is_some() {
-                bail!("--start-height/--height-span currently require S3 replica_cmds prefix input");
+                bail!("--start/--span currently require S3 replica_cmds prefix input");
             }
             ReaderSource::LocalFile(path.clone())
         }
         InputSource::S3Prefix { bucket, prefix } => {
             let Some((start_height, end_height)) = read_block_range else {
-                bail!("S3 replica_cmds requires --start-height and --height-span");
+                bail!("S3 replica_cmds requires --start and --span");
             };
             let height_span = end_height - start_height + 1;
             let Some(client) = s3_client.as_ref() else {
                 bail!("S3 replica_cmds requires initialized S3 client");
             };
+            let resolve_replica_keys_started_at = Instant::now();
             let keys =
                 resolve_replica_keys_for_range(client, bucket, prefix, start_height, height_span, requester_pays)
                     .await
                     .context("resolving replica_cmds keys from S3 layout")?;
+            startup_replica_keys_resolve_secs = Some(resolve_replica_keys_started_at.elapsed().as_secs_f64());
+            startup_replica_keys_count = Some(keys.len());
             ReaderSource::S3Keys { bucket: bucket.clone(), keys }
         }
     };
@@ -3164,16 +4657,17 @@ async fn main() -> Result<()> {
         NodeFillsReader::new(fills_reader_source.clone(), s3_client.clone(), requester_pays, read_block_range)
             .await
             .context("opening node_fills_by_block")?;
-    let mut replica_reader = ReplicaCmdsReader::new(
+    let mut replica_reader = ReplicaPrefetchReader::new(
         replica_reader_source,
-        fills_reader_source.clone(),
-        args.block_time_tolerance_ns,
         s3_client.clone(),
         requester_pays,
-        read_block_range,
+        replica_prefetch,
+        replica_prefetch_workers,
+        replica_s3_connections,
+        replica_prefetch_buffer_mb,
     )
     .await
-    .context("opening replica_cmds")?;
+    .context("opening replica_cmds with prefetch workers")?;
 
     if args.output_parquet.exists() && !args.output_parquet.is_dir() {
         bail!(
@@ -3183,6 +4677,32 @@ async fn main() -> Result<()> {
     }
     create_dir_all(&args.output_parquet)
         .with_context(|| format!("failed to create output parquet directory: {}", args.output_parquet.display()))?;
+    let cleaned_stale_tmp_files = cleanup_stale_parquet_tmp_files(&args.output_parquet)?;
+    if cleaned_stale_tmp_files > 0 {
+        info!(
+            "[startup] cleaned_stale_parquet_tmp_files={} dir={}",
+            cleaned_stale_tmp_files,
+            args.output_parquet.display()
+        );
+    }
+    if let Some(parent) = args.unknown_oid_log_sqlite.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create unknown oid sqlite parent directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+    if let Some(path) = args.warmup_state_output_dir.as_deref() {
+        create_dir_all(path).with_context(|| {
+            format!(
+                "failed to create warmup state output directory: {}",
+                path.display()
+            )
+        })?;
+    }
 
     let schema = output_schema();
     let mut writer: Option<ArrowWriter<File>> = None;
@@ -3196,61 +4716,267 @@ async fn main() -> Result<()> {
     let mut rows = RowBuffer::default();
     let mut orders: HashMap<u64, OrderState> = HashMap::new();
     let mut cloid_to_oid: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    let mut order_expiry_index: BTreeSet<(i64, u64)> = BTreeSet::new();
     let mut trigger_refs = TriggerOrderRefs::default();
-    let mut known_non_trigger_oids: HashMap<u64, KnownOidState> = HashMap::new();
+
+    if let Some(snapshot) = warmup_state_snapshot {
+        let checkpoint_block_number = snapshot.checkpoint_block_number;
+        restore_warmup_state_snapshot(
+            snapshot,
+            &mut orders,
+            &mut cloid_to_oid,
+            &mut order_expiry_index,
+            &mut trigger_refs,
+        )?;
+        info!(
+            "[warmup.state] restored checkpoint_block={} live_orders={} cloid={} trigger={}",
+            checkpoint_block_number,
+            orders.len(),
+            cloid_mapping_entry_count(&cloid_to_oid),
+            trigger_refs.oid_to_cloid.len()
+        );
+    }
+
     let mut unknown_oid_logger = UnknownOidWindowLogger::new(&args.unknown_oid_log_sqlite)?;
     let started_at = Instant::now();
-    let mut processed_blocks: u64 = 0;
-    eprintln!("[phase] processing blocks ...");
+    let mut processed_blocks_total: u64 = 0;
+    let mut warmup_processed_blocks: u64 = 0;
+    let mut progress_processed_blocks: u64 = 0;
+    let warmup_phase_started_at = Instant::now();
+    let mut warmup_interval_started_at = warmup_phase_started_at;
+    let mut progress_phase_started_at = Instant::now();
+    let mut progress_interval_started_at = progress_phase_started_at;
+    let mut warmup_pruned_live_orders_interval: u64 = 0;
+    let mut warmup_pruned_trigger_oids_interval: u64 = 0;
+    let mut progress_pruned_live_orders_interval: u64 = 0;
+    let mut progress_pruned_trigger_oids_interval: u64 = 0;
+    let mut last_seen_fills_ts_ns: Option<i64> = None;
+    let mut perf_stats = ProcessingPerfStats::default();
+    let startup_aws_config = startup_aws_config_secs
+        .map(|secs| format!("{secs:.3}s"))
+        .unwrap_or_else(|| "-".to_owned());
+    let startup_replica_keys_resolve = startup_replica_keys_resolve_secs
+        .map(|secs| format!("{secs:.3}s"))
+        .unwrap_or_else(|| "-".to_owned());
+    let startup_replica_keys = startup_replica_keys_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "-".to_owned());
+    let read_range_text = read_block_range
+        .map(|(start_height, end_height)| format!("{start_height}..{end_height}"))
+        .unwrap_or_else(|| "all".to_owned());
+    let output_range_text = output_block_range
+        .map(|(start_height, end_height)| format!("{start_height}..{end_height}"))
+        .unwrap_or_else(|| "all".to_owned());
+    info!(
+        "[startup] ready_for_processing elapsed_total={:.3}s s3={} aws_cfg={} replica_keys={} key_resolve={} prefetch_workers={} cleaned_tmp={} read_range={} output_range={}",
+        startup_started_at.elapsed().as_secs_f64(),
+        uses_s3,
+        startup_aws_config,
+        startup_replica_keys,
+        startup_replica_keys_resolve,
+        replica_reader.worker_count(),
+        cleaned_stale_tmp_files,
+        read_range_text,
+        output_range_text
+    );
+    info!("[phase] processing blocks ...");
+    let fetch_pair_started_at = Instant::now();
     let (mut next_replica, mut next_fills) = fetch_next_pair(&mut replica_reader, &mut fills_reader).await?;
+    perf_stats.fetch_pair_ns += fetch_pair_started_at.elapsed().as_nanos();
 
     while next_replica.is_some() || next_fills.is_some() {
         match (&next_replica, &next_fills) {
-            (Some(replica), Some(fills)) if replica.block_number == fills.block_number => {
-                let block_time_delta = (replica.block_time_ms - fills.block_time_ms).abs();
-                if block_time_delta > args.block_time_match_tolerance_ms {
-                    unknown_oid_logger.finish()?;
-                    if let Some(active_writer) = writer.take() {
-                        let closed_start = current_file_actual_start_block.unwrap_or(replica.block_number);
-                        let closed_end = last_emitted_block.unwrap_or(replica.block_number);
-                        let tmp_path = current_tmp_output_path
-                            .take()
-                            .ok_or_else(|| anyhow!("missing current tmp parquet path at timestamp mismatch"))?;
-                        let final_path = close_and_finalize_output_file(
-                            &args.output_parquet,
-                            active_writer,
-                            &mut rows,
-                            &schema,
-                            &tmp_path,
-                            closed_start,
-                            closed_end,
-                        )?;
-                        generated_output_files.push(final_path.clone());
-                        eprintln!(
-                            "[file] close parquet={} actual_range={}..{}",
-                            final_path.display(),
-                            closed_start,
-                            closed_end
+            (Some(replica), Some(fills)) => {
+                let delta_ns = (replica.block_time_ns - fills.block_time_ns).abs();
+                if delta_ns <= args.block_time_tolerance_ns {
+                    let block_time_delta = (replica.block_time_ms - fills.block_time_ms).abs();
+                    if block_time_delta > args.block_time_match_tolerance_ms {
+                        unknown_oid_logger.finish()?;
+                        if let Some(active_writer) = writer.take() {
+                            let closed_start = current_file_actual_start_block.unwrap_or(fills.block_number);
+                            let closed_end = last_emitted_block.unwrap_or(fills.block_number);
+                            let tmp_path = current_tmp_output_path
+                                .take()
+                                .ok_or_else(|| anyhow!("missing current tmp parquet path at timestamp mismatch"))?;
+                            let final_path = close_and_finalize_output_file(
+                                &args.output_parquet,
+                                active_writer,
+                                &mut rows,
+                                &schema,
+                                &tmp_path,
+                                closed_start,
+                                closed_end,
+                            )?;
+                            generated_output_files.push(final_path.clone());
+                            info!(
+                                "[file] close parquet={} actual_range={}..{}",
+                                final_path.display(),
+                                closed_start,
+                                closed_end
+                            );
+                        }
+                        bail!(
+                            "block {} timestamp mismatch: replica={}ms fills={}ms delta={}ms tolerance={}ms",
+                            fills.block_number,
+                            replica.block_time_ms,
+                            fills.block_time_ms,
+                            block_time_delta,
+                            args.block_time_match_tolerance_ms
                         );
                     }
-                    bail!(
-                        "block {} timestamp mismatch: replica={}ms fills={}ms delta={}ms tolerance={}ms",
-                        replica.block_number,
-                        replica.block_time_ms,
+
+                    let replica = next_replica.take().unwrap();
+                    let fills = next_fills.take().unwrap();
+                    let block_number = fills.block_number;
+                    last_seen_fills_ts_ns = Some(fills.block_time_ns);
+                    let emit_rows =
+                        output_block_range.map(|(start_height, _)| block_number >= start_height).unwrap_or(true);
+                    let ensure_output_started_at = Instant::now();
+                    ensure_output_ready_for_block(
+                        &args.output_parquet,
+                        &schema,
+                        block_number,
+                        emit_rows,
+                        &mut writer,
+                        &mut current_tmp_output_path,
+                        &mut current_file_window_start,
+                        &mut current_row_group_window_start,
+                        &mut current_file_actual_start_block,
+                        last_emitted_block,
+                        &mut generated_output_files,
+                        &mut rows,
+                    )?;
+                    perf_stats.ensure_output_ns += ensure_output_started_at.elapsed().as_nanos();
+                    let block_prune_stats = process_block(
+                        block_number,
                         fills.block_time_ms,
-                        block_time_delta,
-                        args.block_time_match_tolerance_ms
-                    );
+                        Some(replica.events),
+                        Some(fills.fills),
+                        emit_rows,
+                        emit_rows,
+                        &mut rows,
+                        &mut orders,
+                        &mut cloid_to_oid,
+                        &mut order_expiry_index,
+                        &mut trigger_refs,
+                        &mut unknown_oid_logger,
+                        &mut perf_stats,
+                    )?;
+                    let warmup_just_ended =
+                        warmup_just_finished(warmup_end_logged, read_block_range, output_block_range, block_number);
+                    if warmup_just_ended {
+                        let output_start = output_block_range
+                            .map(|(start_height, _)| start_height)
+                            .unwrap_or(block_number.saturating_add(1));
+                        info!("[warmup] end at block={} (output starts from block {})", block_number, output_start);
+                        progress_processed_blocks = 0;
+                        progress_phase_started_at = Instant::now();
+                        progress_interval_started_at = progress_phase_started_at;
+                        progress_pruned_live_orders_interval = 0;
+                        progress_pruned_trigger_oids_interval = 0;
+                        warmup_end_logged = true;
+                    }
+                    if emit_rows {
+                        last_emitted_block = Some(block_number);
+                    }
+                    processed_blocks_total += 1;
+                    if !emit_rows {
+                        warmup_processed_blocks += 1;
+                        warmup_pruned_live_orders_interval += block_prune_stats.live_pruned_orders;
+                        warmup_pruned_trigger_oids_interval += block_prune_stats.trigger_pruned_oids;
+                    } else {
+                        progress_processed_blocks += 1;
+                        progress_pruned_live_orders_interval += block_prune_stats.live_pruned_orders;
+                        progress_pruned_trigger_oids_interval += block_prune_stats.trigger_pruned_oids;
+                    }
+
+                    if !emit_rows && warmup_processed_blocks % PROGRESS_LOG_INTERVAL_BLOCKS == 0 {
+                        let cloid_map_entries = cloid_mapping_entry_count(&cloid_to_oid);
+                        let trigger_oids = trigger_refs.oid_to_cloid.len();
+                        let elapsed_secs = warmup_interval_started_at.elapsed().as_secs_f64();
+                        let total_secs = warmup_phase_started_at.elapsed().as_secs_f64();
+                        log_processing_progress(
+                            warmup_processed_blocks,
+                            block_number,
+                            fills.block_time_ms,
+                            orders.len(),
+                            cloid_map_entries,
+                            trigger_oids,
+                            rows.len(),
+                            warmup_pruned_live_orders_interval,
+                            warmup_pruned_trigger_oids_interval,
+                            elapsed_secs,
+                            total_secs,
+                            true,
+                        );
+                        warmup_interval_started_at = Instant::now();
+                        warmup_pruned_live_orders_interval = 0;
+                        warmup_pruned_trigger_oids_interval = 0;
+                    }
+
+                    if emit_rows && progress_processed_blocks % PROGRESS_LOG_INTERVAL_BLOCKS == 0 {
+                        let cloid_map_entries = cloid_mapping_entry_count(&cloid_to_oid);
+                        let trigger_oids = trigger_refs.oid_to_cloid.len();
+                        let elapsed_secs = progress_interval_started_at.elapsed().as_secs_f64();
+                        let total_secs = progress_phase_started_at.elapsed().as_secs_f64();
+                        log_processing_progress(
+                            progress_processed_blocks,
+                            block_number,
+                            fills.block_time_ms,
+                            orders.len(),
+                            cloid_map_entries,
+                            trigger_oids,
+                            rows.len(),
+                            progress_pruned_live_orders_interval,
+                            progress_pruned_trigger_oids_interval,
+                            elapsed_secs,
+                            total_secs,
+                            false,
+                        );
+                        progress_interval_started_at = Instant::now();
+                        progress_pruned_live_orders_interval = 0;
+                        progress_pruned_trigger_oids_interval = 0;
+                    }
+                    maybe_write_warmup_state_snapshot(
+                        args.warmup_state_output_dir.as_deref(),
+                        block_number,
+                        fills.block_time_ms,
+                        !emit_rows,
+                        warmup_just_ended,
+                        block_prune_stats,
+                        &orders,
+                        &cloid_to_oid,
+                        &trigger_refs,
+                    )?;
+                    let (fetched_replica, fetched_fills) =
+                        {
+                            let fetch_pair_started_at = Instant::now();
+                            let pair = fetch_next_pair(&mut replica_reader, &mut fills_reader).await?;
+                            perf_stats.fetch_pair_ns += fetch_pair_started_at.elapsed().as_nanos();
+                            pair
+                        };
+                    next_replica = fetched_replica;
+                    next_fills = fetched_fills;
+                    continue;
                 }
 
-                let replica = next_replica.take().unwrap();
+                if replica.block_time_ns < fills.block_time_ns {
+                    let fetch_replica_started_at = Instant::now();
+                    next_replica = replica_reader.next_batch().await?;
+                    perf_stats.fetch_replica_only_ns += fetch_replica_started_at.elapsed().as_nanos();
+                    continue;
+                }
+
                 let fills = next_fills.take().unwrap();
+                let block_number = fills.block_number;
+                last_seen_fills_ts_ns = Some(fills.block_time_ns);
                 let emit_rows =
-                    output_block_range.map(|(start_height, _)| replica.block_number >= start_height).unwrap_or(true);
+                    output_block_range.map(|(start_height, _)| block_number >= start_height).unwrap_or(true);
+                let ensure_output_started_at = Instant::now();
                 ensure_output_ready_for_block(
                     &args.output_parquet,
                     &schema,
-                    replica.block_number,
+                    block_number,
                     emit_rows,
                     &mut writer,
                     &mut current_tmp_output_path,
@@ -3261,128 +4987,9 @@ async fn main() -> Result<()> {
                     &mut generated_output_files,
                     &mut rows,
                 )?;
-                process_block(
-                    replica.block_number,
-                    replica.block_time_ms,
-                    Some(replica.events),
-                    Some(fills.fills),
-                    emit_rows,
-                    emit_rows,
-                    &mut rows,
-                    &mut orders,
-                    &mut cloid_to_oid,
-                    &mut trigger_refs,
-                    &mut known_non_trigger_oids,
-                    &mut unknown_oid_logger,
-                )?;
-                if emit_rows {
-                    last_emitted_block = Some(replica.block_number);
-                    if !warmup_end_logged
-                        && let (Some((warmup_start, _)), Some((output_start, _))) =
-                            (read_block_range, output_block_range)
-                        && warmup_start < output_start
-                    {
-                        eprintln!(
-                            "[warmup] end at block={} (output starts from block {})",
-                            replica.block_number, output_start
-                        );
-                        warmup_end_logged = true;
-                    }
-                }
-                processed_blocks += 1;
-                if processed_blocks % 100 == 0 {
-                    eprintln!(
-                        "[progress] blocks={} last_block={} live_orders={} buffered_rows={} elapsed={:.1}s",
-                        processed_blocks,
-                        replica.block_number,
-                        orders.len(),
-                        rows.len(),
-                        started_at.elapsed().as_secs_f64()
-                    );
-                }
-                let (fetched_replica, fetched_fills) = fetch_next_pair(&mut replica_reader, &mut fills_reader).await?;
-                next_replica = fetched_replica;
-                next_fills = fetched_fills;
-            }
-            (Some(replica), Some(fills)) if replica.block_number < fills.block_number => {
-                let replica = next_replica.take().unwrap();
-                let emit_rows =
-                    output_block_range.map(|(start_height, _)| replica.block_number >= start_height).unwrap_or(true);
-                ensure_output_ready_for_block(
-                    &args.output_parquet,
-                    &schema,
-                    replica.block_number,
-                    emit_rows,
-                    &mut writer,
-                    &mut current_tmp_output_path,
-                    &mut current_file_window_start,
-                    &mut current_row_group_window_start,
-                    &mut current_file_actual_start_block,
-                    last_emitted_block,
-                    &mut generated_output_files,
-                    &mut rows,
-                )?;
-                process_block(
-                    replica.block_number,
-                    replica.block_time_ms,
-                    Some(replica.events),
-                    None,
-                    emit_rows,
-                    emit_rows,
-                    &mut rows,
-                    &mut orders,
-                    &mut cloid_to_oid,
-                    &mut trigger_refs,
-                    &mut known_non_trigger_oids,
-                    &mut unknown_oid_logger,
-                )?;
-                if emit_rows {
-                    last_emitted_block = Some(replica.block_number);
-                    if !warmup_end_logged
-                        && let (Some((warmup_start, _)), Some((output_start, _))) =
-                            (read_block_range, output_block_range)
-                        && warmup_start < output_start
-                    {
-                        eprintln!(
-                            "[warmup] end at block={} (output starts from block {})",
-                            replica.block_number, output_start
-                        );
-                        warmup_end_logged = true;
-                    }
-                }
-                processed_blocks += 1;
-                if processed_blocks % 100 == 0 {
-                    eprintln!(
-                        "[progress] blocks={} last_block={} live_orders={} buffered_rows={} elapsed={:.1}s",
-                        processed_blocks,
-                        replica.block_number,
-                        orders.len(),
-                        rows.len(),
-                        started_at.elapsed().as_secs_f64()
-                    );
-                }
-                next_replica = replica_reader.next_batch().await?;
-            }
-            (Some(_), Some(_)) => {
-                let fills = next_fills.take().unwrap();
-                let emit_rows =
-                    output_block_range.map(|(start_height, _)| fills.block_number >= start_height).unwrap_or(true);
-                ensure_output_ready_for_block(
-                    &args.output_parquet,
-                    &schema,
-                    fills.block_number,
-                    emit_rows,
-                    &mut writer,
-                    &mut current_tmp_output_path,
-                    &mut current_file_window_start,
-                    &mut current_row_group_window_start,
-                    &mut current_file_actual_start_block,
-                    last_emitted_block,
-                    &mut generated_output_files,
-                    &mut rows,
-                )?;
-                process_block(
-                    fills.block_number,
+                perf_stats.ensure_output_ns += ensure_output_started_at.elapsed().as_nanos();
+                let block_prune_stats = process_block(
+                    block_number,
                     fills.block_time_ms,
                     None,
                     Some(fills.fills),
@@ -3391,42 +4998,113 @@ async fn main() -> Result<()> {
                     &mut rows,
                     &mut orders,
                     &mut cloid_to_oid,
+                    &mut order_expiry_index,
                     &mut trigger_refs,
-                    &mut known_non_trigger_oids,
                     &mut unknown_oid_logger,
+                    &mut perf_stats,
                 )?;
+                let warmup_just_ended =
+                    warmup_just_finished(warmup_end_logged, read_block_range, output_block_range, block_number);
+                if warmup_just_ended {
+                    let output_start = output_block_range
+                        .map(|(start_height, _)| start_height)
+                        .unwrap_or(block_number.saturating_add(1));
+                    info!("[warmup] end at block={} (output starts from block {})", block_number, output_start);
+                    progress_processed_blocks = 0;
+                    progress_phase_started_at = Instant::now();
+                    progress_interval_started_at = progress_phase_started_at;
+                    progress_pruned_live_orders_interval = 0;
+                    progress_pruned_trigger_oids_interval = 0;
+                    warmup_end_logged = true;
+                }
                 if emit_rows {
-                    last_emitted_block = Some(fills.block_number);
-                    if !warmup_end_logged
-                        && let (Some((warmup_start, _)), Some((output_start, _))) =
-                            (read_block_range, output_block_range)
-                        && warmup_start < output_start
-                    {
-                        eprintln!(
-                            "[warmup] end at block={} (output starts from block {})",
-                            fills.block_number, output_start
-                        );
-                        warmup_end_logged = true;
-                    }
+                    last_emitted_block = Some(block_number);
                 }
-                processed_blocks += 1;
-                if processed_blocks % 100 == 0 {
-                    eprintln!(
-                        "[progress] blocks={} last_block={} live_orders={} buffered_rows={} elapsed={:.1}s",
-                        processed_blocks,
-                        fills.block_number,
+                processed_blocks_total += 1;
+                if !emit_rows {
+                    warmup_processed_blocks += 1;
+                    warmup_pruned_live_orders_interval += block_prune_stats.live_pruned_orders;
+                    warmup_pruned_trigger_oids_interval += block_prune_stats.trigger_pruned_oids;
+                } else {
+                    progress_processed_blocks += 1;
+                    progress_pruned_live_orders_interval += block_prune_stats.live_pruned_orders;
+                    progress_pruned_trigger_oids_interval += block_prune_stats.trigger_pruned_oids;
+                }
+
+                if !emit_rows && warmup_processed_blocks % PROGRESS_LOG_INTERVAL_BLOCKS == 0 {
+                    let cloid_map_entries = cloid_mapping_entry_count(&cloid_to_oid);
+                    let trigger_oids = trigger_refs.oid_to_cloid.len();
+                    let elapsed_secs = warmup_interval_started_at.elapsed().as_secs_f64();
+                    let total_secs = warmup_phase_started_at.elapsed().as_secs_f64();
+                    log_processing_progress(
+                        warmup_processed_blocks,
+                        block_number,
+                        fills.block_time_ms,
                         orders.len(),
+                        cloid_map_entries,
+                        trigger_oids,
                         rows.len(),
-                        started_at.elapsed().as_secs_f64()
+                        warmup_pruned_live_orders_interval,
+                        warmup_pruned_trigger_oids_interval,
+                        elapsed_secs,
+                        total_secs,
+                        true,
                     );
+                    warmup_interval_started_at = Instant::now();
+                    warmup_pruned_live_orders_interval = 0;
+                    warmup_pruned_trigger_oids_interval = 0;
                 }
+
+                if emit_rows && progress_processed_blocks % PROGRESS_LOG_INTERVAL_BLOCKS == 0 {
+                    let cloid_map_entries = cloid_mapping_entry_count(&cloid_to_oid);
+                    let trigger_oids = trigger_refs.oid_to_cloid.len();
+                    let elapsed_secs = progress_interval_started_at.elapsed().as_secs_f64();
+                    let total_secs = progress_phase_started_at.elapsed().as_secs_f64();
+                    log_processing_progress(
+                        progress_processed_blocks,
+                        block_number,
+                        fills.block_time_ms,
+                        orders.len(),
+                        cloid_map_entries,
+                        trigger_oids,
+                        rows.len(),
+                        progress_pruned_live_orders_interval,
+                        progress_pruned_trigger_oids_interval,
+                        elapsed_secs,
+                        total_secs,
+                        false,
+                    );
+                    progress_interval_started_at = Instant::now();
+                    progress_pruned_live_orders_interval = 0;
+                    progress_pruned_trigger_oids_interval = 0;
+                }
+                maybe_write_warmup_state_snapshot(
+                    args.warmup_state_output_dir.as_deref(),
+                    block_number,
+                    fills.block_time_ms,
+                    !emit_rows,
+                    warmup_just_ended,
+                    block_prune_stats,
+                    &orders,
+                    &cloid_to_oid,
+                    &trigger_refs,
+                )?;
+                let fetch_fills_started_at = Instant::now();
                 next_fills = fills_reader.next_batch().await?;
+                perf_stats.fetch_fills_only_ns += fetch_fills_started_at.elapsed().as_nanos();
             }
             (Some(replica), None) => {
+                if last_seen_fills_ts_ns
+                    .is_some_and(|last_ts_ns| {
+                        replica.block_time_ns > last_ts_ns.saturating_add(args.block_time_tolerance_ns)
+                    })
+                {
+                    break;
+                }
                 unknown_oid_logger.finish()?;
                 if let Some(active_writer) = writer.take() {
-                    let closed_start = current_file_actual_start_block.unwrap_or(replica.block_number);
-                    let closed_end = last_emitted_block.unwrap_or(replica.block_number);
+                    let closed_start = current_file_actual_start_block.unwrap_or(last_emitted_block.unwrap_or(0));
+                    let closed_end = last_emitted_block.unwrap_or(0);
                     let tmp_path = current_tmp_output_path
                         .take()
                         .ok_or_else(|| anyhow!("missing current tmp parquet path at replica eof"))?;
@@ -3440,7 +5118,7 @@ async fn main() -> Result<()> {
                         closed_end,
                     )?;
                     generated_output_files.push(final_path.clone());
-                    eprintln!(
+                    info!(
                         "[file] close parquet={} actual_range={}..{}",
                         final_path.display(),
                         closed_start,
@@ -3448,8 +5126,8 @@ async fn main() -> Result<()> {
                     );
                 }
                 bail!(
-                    "node_fills_by_block hit EOF before replica_cmds; unpaired replica block {} remains",
-                    replica.block_number
+                    "node_fills_by_block hit EOF before replica_cmds; unpaired replica timestamp remains: {}ms",
+                    replica.block_time_ms
                 );
             }
             (None, Some(fills)) => {
@@ -3470,7 +5148,7 @@ async fn main() -> Result<()> {
                         closed_end,
                     )?;
                     generated_output_files.push(final_path.clone());
-                    eprintln!(
+                    info!(
                         "[file] close parquet={} actual_range={}..{}",
                         final_path.display(),
                         closed_start,
@@ -3502,10 +5180,13 @@ async fn main() -> Result<()> {
             closed_end,
         )?;
         generated_output_files.push(final_path.clone());
-        eprintln!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
+        info!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
     }
 
-    println!(
+    perf_stats.log_summary(processed_blocks_total, started_at.elapsed().as_secs_f64());
+    perf_stats.log_read_pair_breakdown(replica_reader.perf_snapshot(), fills_reader.perf_snapshot());
+
+    info!(
         "Wrote BTC diff parquet files={} output_dir={} unknown_oid_sqlite={} requester_pays={} remaining_live_orders={}",
         generated_output_files.len(),
         args.output_parquet.display(),
@@ -3514,7 +5195,7 @@ async fn main() -> Result<()> {
         orders.len()
     );
     for path in &generated_output_files {
-        println!("  - {}", path.display());
+        info!("  - {}", path.display());
     }
 
     Ok(())
