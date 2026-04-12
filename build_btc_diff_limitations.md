@@ -8,6 +8,13 @@
 - 当前程序输出样本：`/tmp/btc_diff_951980001_span20000_triggerfix_waitfill.parquet`
 - 重叠区间：`951980001..952000000`
 
+本轮代码变更后做了快速回归验证（`2026-04-12`, `span=2000`）：
+
+- 执行命令：`./target/release/build_btc_diff --output-parquet /tmp/btc_diff_out --start-height 951980001 --height-span 2000`
+- 输出目录：`/tmp/btc_diff_out`（文件名由程序按实际起止高度生成）
+- `remove/fill` 行数：`0`
+- `remove/cancel` 中 `oid IS NULL` 行数：`0`
+
 ## 输入与基本假设
 
 程序只使用两类输入：
@@ -32,12 +39,56 @@
 - 非 trigger `order` 产生 `new/add`
 - 非 trigger `modify/batchModify` 产生旧单 `remove/cancel`，以及在 response 可恢复时产生新单 `new/add`
 - `update/fill` 只由 `node_fills_by_block` 生成
-- `remove/fill` 只在 live state 已知且剩余数量被 fill 扣到 0 时生成
+- `remove/fill` 已禁用（即使订单在 fill 后归零，也只从 live state 删除，不落 parquet）
 - trigger 单不进入 live state，不落 parquet
 - trigger 的 `modify / batchModify / cancel` 当前直接跳过
 - `modify / batchModify` 命中 `Cannot modify canceled or filled order` 时直接跳过
-- 非 trigger `cancel success` 若当前没有 live state，仍保留 non-null fallback `remove/cancel`
-- 非 trigger `modify type=default` 若没有 `statuses`，仍保留 non-null fallback `remove/cancel`
+- 未知 `oid` 的 `cancel` fallback 已禁用（不再落 `remove/cancel`）
+- 未知旧单的 `modify` cancel fallback 已禁用（不再落 `remove/cancel`）
+- live state 引入 24 小时 TTL：订单入 state 时记录创建 `block/time`，仅在 10000 block 边界执行一次过期清理，避免内存无限增长
+- 未知 `oid` 的 `modify/cancel` 诊断日志按 10000 block 窗口写入 SQLite
+- parquet row-group 按 `10000 block` 边界切分（按区块窗口落组，而非按固定行数）
+- parquet 文件按 `1000000 block` 边界轮转：跨 1m 边界会先关闭当前文件再打开新文件
+- `--output-parquet` 现在传入输出目录，产物命名改为 `btc_diff_<actual_start>_<actual_end>.parquet`，重名自动 `_dupN`
+- `replica_cmds` 在 `20250720..20260331` 区间使用硬编码日索引直达 S3 key，不再递归扫描目录
+- 支持 `--warmup <blocks>`（默认 `1200000`）：读取区间会向前扩展 warmup，但 warmup 期间不写 parquet、不写 unknown-oid SQLite，仅用于恢复 live state
+- 控制台会打印 warmup 开始/结束
+
+## replica_cmds 硬编码索引
+
+- 索引文件：`binaries/src/bin/build_btc_diff_replica_day_index.rs`
+- 覆盖范围：`20250720..20260331`（共 `255` 天）
+- 探索结果：原桶下该区间存在 `31` 个“同日多 snapshot”重叠日期，索引固定选择该日期的最新 snapshot
+- 结构：
+  - `REPLICA_SNAPSHOT_DIRS`：snapshot 目录表（`32` 个）
+  - `REPLICA_DAY_INDEX`：按天顺序记录 `snapshot_idx + start_chunk`
+- 解析方式：
+  - 先把目标高度转成 chunk（`<height-1>` 对齐 `10000`）
+  - 对 `REPLICA_DAY_INDEX.start_chunk` 做二分，定位所属日期
+  - 直接拼接 `replica_cmds/<snapshot>/<yyyymmdd>/<chunk>.lz4`
+- 范围外（早于 `20250720` 或晚于 `20260331`）仍回退到原有动态查找逻辑
+
+## unknown oid 调试日志（SQLite）
+
+- 参数：`--unknown-oid-log-sqlite`（默认 `/tmp/build_btc_diff_unknown_oid.sqlite`）
+- 对齐规则：窗口按 `...00001.. ...10000`（每 `10000` 块一窗口）
+- 输出策略：
+  - 能定位到具体引用（如 `oid` 或已映射 `cloid->oid`）时，写入 `unknown_oid_samples`
+  - 不能通过 `user+cloid` 映射到 `oid` 时，只计数，不写样本明细
+- 单窗口样本上限：`200`，超出计入 `sample_dropped`
+- stale prune 仅在窗口边界触发；每次触发写入 `stale_prune_runs` 和 `stale_prune_samples`
+- 并发写同一个 sqlite 时，如果 `window_start_block` 主键冲突会跳过该窗口并打印 warn，不抛异常
+
+## parquet 切分与命名
+
+- row-group:
+  - 以 `10000 block` 窗口触发 flush
+  - 可通过 `parquet_metadata(...)` 看到 `block_number` 的 row-group 统计范围对应窗口边界
+- 文件轮转:
+  - 以 `1000000 block` 窗口轮转
+  - 例如跨越 `952000001` 时，会结束旧文件并命名为 `btc_diff_<start>_<end>.parquet`，再新开下一文件
+- 命名冲突规避:
+  - 同区间重复运行时，自动输出为 `btc_diff_<start>_<end>_dup1.parquet`, `_dup2.parquet` 等
 
 ## new/add
 
@@ -102,32 +153,23 @@
 
 ### 当前可做的事
 
-- 当某个 live order 已知存在，并且累计 fill 把 `remaining_sz` 扣到 `0`，程序会生成 `remove/fill`
+- 当某个 live order 已知存在，并且累计 fill 把 `remaining_sz` 扣到 `0`，程序只会从 live state 移除，不写 parquet
 
 ### 局限
 
-- 没有 warmup 时，区间开始前就已存在的 live order 不在内存 state 中
-- 如果前序 `new/add` 丢失，后续 fill 无法触发 `remove/fill`
-- 参考里的 `update/cancel` 缩量链当前不输出，且内部 state 也未完全吸收，因此部分订单最终不会被扣到 `0`
+- `remove/fill` 当前策略是“完全不输出”，因此和任何包含该类型的参考文件都会有系统性差异
+- 没有 warmup 时，区间开始前订单仍不可见，但这只影响 live state 内部一致性，不再影响 `remove/fill` 输出（因为该输出已禁用）
 
 ### 当前和参考的差异
 
-当前结果：
-
-- `remove/fill`: `missing=142`, `extra=0`
-
-主要原因：
-
-- 绝大多数是 no-warmup 导致的前序 live order 不存在
-- 少量是前序 `new/add` 缺失的下游结果
-- 少量是 reference 依赖 `update/cancel` 先缩量再最终 fill 清零
+当前版本下，`remove/fill` 期望始终为 `0` 行；如参考文件存在 `remove/fill`，会全部体现为 `missing`。
 
 ## remove/cancel
 
 ### 当前可做的事
 
 - 如果 cancel / modify 命中的 old order 当前在 live state 中，程序会输出带 `side / px / orig_sz` 的 rich `remove/cancel`
-- 如果无法解析出 live state，但 action 明确引用了 non-trigger `oid`，程序仍可输出 non-null fallback `remove/cancel`
+- 如果无法解析出 live state，当前版本不再输出未知 `oid` 的 fallback `remove/cancel`
 
 ### 局限
 
@@ -135,16 +177,18 @@
   - `reduceOnlyCanceled`
   - `selfTradeCanceled`
   - 以及更多细粒度 reason
-- `cancelByCloid` 如果映射链不完整，可能只能降级成 `oid=NULL`
+- `cancelByCloid` 如果映射链不完整，当前策略是直接不落 `remove/cancel`
 - 对于 non-trigger `cancel success`，上游返回成功不等于参考文件一定记录这条 cancel
-- 对于 non-trigger `modify type=default`，只能保守地把旧单当成 fallback cancel，无法确认参考是否应记录
+- 对于 non-trigger `modify type=default`，当前不会再写未知旧单的 fallback cancel，因此可能相对参考增加 `missing`
 
 ### 当前和参考的差异
 
-当前结果：
+当前版本特征：
 
-- `remove/cancel`: `missing=1013`, `extra=80`
-- 新文件里的 `oid=NULL remove/cancel`: `597`
+- 未知 oid 的 `cancel` fallback 禁用后，`oid=NULL` 的 `remove/cancel` 应接近 `0`（短区间实测为 `0`）
+- 相比参考文件，`remove/cancel` 的缺失会增多，但“伪造 fallback 行”会显著减少
+
+以下分解来自历史样本（开启未知 cancel fallback 的版本），用于解释差异来源：
 
 `missing=1013` 的构成：
 
@@ -152,15 +196,15 @@
 - `397` 条：`reduceOnlyCanceled`
 - `10` 条：`selfTradeCanceled`
 
-`extra=80` 的构成：
+`extra=80`（历史样本）的构成：
 
 - 全部是 trigger `cancel` 的非空 `oid` 样本
 - 这类行当前都有 `status=canceled`，但参考里没有对应 `user+oid+block` 的 `remove/cancel`
 - 触发单里 `open->canceled` 的残差已压到 `0`（`has_open=0`）
 
-这组 extra 仍是当前程序和参考文件最主要的剩余策略差异之一：
+这组 extra 仍是当前程序和参考文件的主要策略差异之一：
 
-- 当前程序：当 cancel 成功但本地无法证明是 trigger 时，仍会保留 non-null fallback
+- 当前程序：未知 oid fallback 已禁用，extra 主体收敛到触发链路与历史可见性差异
 - 参考文件：并不总是记录这类 cancel（尤其是区间前状态不可见时）
 
 补充（触发单修复后）：
@@ -202,9 +246,9 @@
 
 - 当前程序不输出 `update/cancel`
 - 当前程序不维护 trigger 单 diff
-- 当前程序保留 non-trigger `cancel success` 的 fallback cancel，而参考并不总保留
+- 当前程序已禁用未知 oid cancel fallback（相对参考会增加 `remove/cancel missing`，但减少伪造行）
 - 当前程序无法恢复所有 `type=default / no-status` 场景下的新 `oid`
-- 当前程序在 no-warmup 模式下天然会丢掉一部分 `remove/fill`
+- 当前程序已禁用 `remove/fill` 输出（和含该类型的参考会系统性不一致）
 
 ## 仍未完全还原的逻辑
 
@@ -243,7 +287,7 @@
 当前程序在这类场景里仍可能出现：
 
 - old oid 已正确 cancel
-- 同块又多打一条 old oid fallback cancel
+- 在旧版本里同块可能多打一条 old oid fallback cancel（当前版本已禁用未知 cancel fallback）
 - new oid 的同块 cancel 漏掉
 
 因此这部分 block 内时序和 `cloid -> oid` 重绑定逻辑还未完全还原。
@@ -282,15 +326,14 @@
 
 可明显降低或消除的项：
 
-- `remove/fill` 中由 no-warmup 造成的缺失
-  - 起点前已在簿订单若能被 warmup，后续 fill 扣减到 `0` 可正常产出 `remove/fill`
-- `remove/cancel` 中一部分 `oid=NULL` 降级
-  - 起点前已存在订单的 `cloid->oid` 可直接命中，不再走 fallback
+- `remove/cancel` 中由“区间前 live state 不可见”导致的误差
+  - 起点前已存在订单的 `cloid->oid` 可直接命中，减少未知 old order 的漏删/错删
 - 触发单 `remove/cancel extra` 中由“区间前已存在 trigger 订单”造成的残差
   - 当前剩余 `extra=80` 基本都属于此类可见性问题
 
 即使有完整 snapshot 仍不能完全消除的项：
 
+- `remove/fill` 全缺失（当前实现已显式禁用该输出）
 - `update/cancel` 全缺失（当前实现未输出该类型）
 - `type=default` / `no-status` 返回导致的新 `oid` 不可恢复
 - `filled-only GTC` 的入簿判断偏差（当前仍有 `new/add extra=2`）

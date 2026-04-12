@@ -1,8 +1,10 @@
 #![allow(unused_crate_dependencies)]
 
+mod build_btc_diff_replica_day_index;
+
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::File;
-use std::path::PathBuf;
+use std::fs::{File, create_dir_all, rename};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,22 +18,34 @@ use async_compression::tokio::bufread::Lz4Decoder;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::RequestPayer;
-use chrono::{Datelike, NaiveDateTime, Timelike};
+use chrono::{Datelike, Days, NaiveDate, NaiveDateTime, Timelike};
 use clap::Parser;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use rusqlite::{Connection, params};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader as TokioBufReader};
 
+use crate::build_btc_diff_replica_day_index::{
+    REPLICA_DAY_INDEX, REPLICA_INDEX_END_DATE_YYYYMMDD, REPLICA_INDEX_END_EXCLUSIVE_CHUNK,
+    REPLICA_INDEX_START_DATE_YYYYMMDD, REPLICA_SNAPSHOT_DIRS,
+};
+
 const BTC_ASSET_ID: u64 = 0;
-const ROW_GROUP_SIZE: usize = 10_000;
+const ROW_GROUP_BLOCKS: u64 = 10_000;
+const FILE_ROTATION_BLOCKS: u64 = 1_000_000;
+const PARQUET_MAX_ROW_GROUP_ROWS: usize = 10_000_000;
 const DECIMAL_PRECISION: u8 = 18;
 const PX_SCALE: i8 = 1;
 const SZ_SCALE: i8 = 5;
 const HOUR_MS: i64 = 3_600_000;
+const LIVE_STATE_TTL_MS: i64 = 24 * HOUR_MS;
+const UNKNOWN_OID_WINDOW_BLOCKS: u64 = 10_000;
+const UNKNOWN_OID_SAMPLE_LIMIT_PER_WINDOW: usize = 200;
+const PRUNE_SAMPLE_LIMIT_PER_RUN: usize = 200;
 const REQUESTER_PAYS_ALWAYS: bool = true;
 const CANCEL_STATUS_CANCELED: &str = "canceled";
 #[derive(Debug, Parser)]
@@ -47,14 +61,20 @@ struct Args {
     )]
     node_fills_by_block: String,
 
-    #[arg(long)]
+    #[arg(long, help = "Output parquet directory (files are named by actual start/end heights)")]
     output_parquet: PathBuf,
+
+    #[arg(long, default_value = "/tmp/build_btc_diff_unknown_oid.sqlite")]
+    unknown_oid_log_sqlite: PathBuf,
 
     #[arg(long)]
     start_height: Option<u64>,
 
     #[arg(long)]
     height_span: Option<u64>,
+
+    #[arg(long, default_value_t = 1_200_000)]
+    warmup: u64,
 
     #[arg(long, default_value_t = 2_000_000)]
     block_time_tolerance_ns: i64,
@@ -197,6 +217,423 @@ enum OrderRef {
     Cloid(String),
 }
 
+#[derive(Debug, Serialize)]
+struct UnknownOidSample {
+    block_number: u64,
+    block_time_ms: i64,
+    event: &'static str,
+    phase: &'static str,
+    reason: &'static str,
+    user: Option<String>,
+    ref_kind: &'static str,
+    ref_oid: Option<u64>,
+    ref_cloid: Option<String>,
+    mapped_oid: Option<u64>,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct UnknownOidWindowStats {
+    unknown_cancel_total: u64,
+    unknown_modify_total: u64,
+    unresolved_user_cloid_cancel: u64,
+    unresolved_user_cloid_modify: u64,
+    sampled: u64,
+    sample_dropped: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PrunedOrderSample {
+    oid: u64,
+    user: String,
+    cloid: Option<String>,
+    created_block_number: u64,
+    created_time_ms: i64,
+    pruned_at_block_number: u64,
+    pruned_at_time_ms: i64,
+    age_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct StalePruneRun {
+    trigger_block_number: u64,
+    trigger_block_time_ms: i64,
+    cutoff_time_ms: i64,
+    pruned_total: u64,
+    sampled: u64,
+    sample_dropped: u64,
+    samples: Vec<PrunedOrderSample>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrunedKnownOidSample {
+    oid: u64,
+    created_block_number: u64,
+    created_time_ms: i64,
+    pruned_at_block_number: u64,
+    pruned_at_time_ms: i64,
+    age_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct KnownOidPruneRun {
+    trigger_block_number: u64,
+    trigger_block_time_ms: i64,
+    cutoff_time_ms: i64,
+    pruned_total: u64,
+    sampled: u64,
+    sample_dropped: u64,
+    samples: Vec<PrunedKnownOidSample>,
+}
+
+#[derive(Debug)]
+struct UnknownOidWindowLogger {
+    conn: Connection,
+    enabled: bool,
+    current_window_start: Option<u64>,
+    stats: UnknownOidWindowStats,
+    samples: Vec<UnknownOidSample>,
+    stale_prune_runs: Vec<StalePruneRun>,
+    known_oid_prune_runs: Vec<KnownOidPruneRun>,
+}
+
+impl UnknownOidWindowLogger {
+    fn new(path: &PathBuf) -> Result<Self> {
+        let conn = Connection::open(path)
+            .with_context(|| format!("failed to open unknown oid sqlite for read/write: {}", path.display()))?;
+        conn.execute_batch(
+            r#"
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=5000;
+
+CREATE TABLE IF NOT EXISTS unknown_oid_windows (
+    window_start_block INTEGER PRIMARY KEY,
+    window_end_block INTEGER NOT NULL,
+    window_type TEXT NOT NULL,
+    unknown_cancel_total INTEGER NOT NULL,
+    unknown_modify_total INTEGER NOT NULL,
+    unresolved_user_cloid_cancel INTEGER NOT NULL,
+    unresolved_user_cloid_modify INTEGER NOT NULL,
+    sampled INTEGER NOT NULL,
+    sample_dropped INTEGER NOT NULL,
+    stale_prune_runs INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS unknown_oid_samples (
+    window_start_block INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    block_number INTEGER NOT NULL,
+    block_time_ms INTEGER NOT NULL,
+    event TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    user_addr TEXT,
+    ref_kind TEXT NOT NULL,
+    ref_oid INTEGER,
+    ref_cloid TEXT,
+    mapped_oid INTEGER,
+    PRIMARY KEY (window_start_block, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_unknown_oid_samples_block ON unknown_oid_samples(block_number);
+CREATE INDEX IF NOT EXISTS idx_unknown_oid_samples_ref_oid ON unknown_oid_samples(ref_oid);
+CREATE INDEX IF NOT EXISTS idx_unknown_oid_samples_mapped_oid ON unknown_oid_samples(mapped_oid);
+CREATE INDEX IF NOT EXISTS idx_unknown_oid_samples_user_cloid ON unknown_oid_samples(user_addr, ref_cloid);
+
+CREATE TABLE IF NOT EXISTS stale_prune_runs (
+    window_start_block INTEGER NOT NULL,
+    run_seq INTEGER NOT NULL,
+    trigger_block_number INTEGER NOT NULL,
+    trigger_block_time_ms INTEGER NOT NULL,
+    cutoff_time_ms INTEGER NOT NULL,
+    pruned_total INTEGER NOT NULL,
+    sampled INTEGER NOT NULL,
+    sample_dropped INTEGER NOT NULL,
+    PRIMARY KEY (window_start_block, run_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_stale_prune_runs_trigger_block ON stale_prune_runs(trigger_block_number);
+
+CREATE TABLE IF NOT EXISTS stale_prune_samples (
+    window_start_block INTEGER NOT NULL,
+    run_seq INTEGER NOT NULL,
+    sample_seq INTEGER NOT NULL,
+    oid INTEGER NOT NULL,
+    user_addr TEXT NOT NULL,
+    cloid TEXT,
+    created_block_number INTEGER NOT NULL,
+    created_time_ms INTEGER NOT NULL,
+    pruned_at_block_number INTEGER NOT NULL,
+    pruned_at_time_ms INTEGER NOT NULL,
+    age_ms INTEGER NOT NULL,
+    PRIMARY KEY (window_start_block, run_seq, sample_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_stale_prune_samples_oid ON stale_prune_samples(oid);
+CREATE INDEX IF NOT EXISTS idx_stale_prune_samples_created_block ON stale_prune_samples(created_block_number);
+
+CREATE TABLE IF NOT EXISTS known_oid_prune_runs (
+    window_start_block INTEGER NOT NULL,
+    run_seq INTEGER NOT NULL,
+    trigger_block_number INTEGER NOT NULL,
+    trigger_block_time_ms INTEGER NOT NULL,
+    cutoff_time_ms INTEGER NOT NULL,
+    pruned_total INTEGER NOT NULL,
+    sampled INTEGER NOT NULL,
+    sample_dropped INTEGER NOT NULL,
+    PRIMARY KEY (window_start_block, run_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_known_oid_prune_runs_trigger_block ON known_oid_prune_runs(trigger_block_number);
+
+CREATE TABLE IF NOT EXISTS known_oid_prune_samples (
+    window_start_block INTEGER NOT NULL,
+    run_seq INTEGER NOT NULL,
+    sample_seq INTEGER NOT NULL,
+    oid INTEGER NOT NULL,
+    created_block_number INTEGER NOT NULL,
+    created_time_ms INTEGER NOT NULL,
+    pruned_at_block_number INTEGER NOT NULL,
+    pruned_at_time_ms INTEGER NOT NULL,
+    age_ms INTEGER NOT NULL,
+    PRIMARY KEY (window_start_block, run_seq, sample_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_oid ON known_oid_prune_samples(oid);
+CREATE INDEX IF NOT EXISTS idx_known_oid_prune_samples_created_block ON known_oid_prune_samples(created_block_number);
+"#,
+        )
+        .context("initializing unknown oid sqlite schema")?;
+
+        Ok(Self {
+            conn,
+            enabled: true,
+            current_window_start: None,
+            stats: UnknownOidWindowStats::default(),
+            samples: Vec::new(),
+            stale_prune_runs: Vec::new(),
+            known_oid_prune_runs: Vec::new(),
+        })
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    fn observe_block(&mut self, block_number: u64) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let window_start = window_start_block(block_number);
+        match self.current_window_start {
+            None => {
+                self.current_window_start = Some(window_start);
+            }
+            Some(current) if current != window_start => {
+                self.flush_current()?;
+                self.current_window_start = Some(window_start);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn record_unresolved_user_cloid(&mut self, event: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        match event {
+            "cancel" => {
+                self.stats.unknown_cancel_total += 1;
+                self.stats.unresolved_user_cloid_cancel += 1;
+            }
+            "modify" => {
+                self.stats.unknown_modify_total += 1;
+                self.stats.unresolved_user_cloid_modify += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn record_sample(&mut self, sample: UnknownOidSample) {
+        if !self.enabled {
+            return;
+        }
+        match sample.event {
+            "cancel" => self.stats.unknown_cancel_total += 1,
+            "modify" => self.stats.unknown_modify_total += 1,
+            _ => {}
+        }
+        if self.samples.len() < UNKNOWN_OID_SAMPLE_LIMIT_PER_WINDOW {
+            self.samples.push(sample);
+            self.stats.sampled += 1;
+        } else {
+            self.stats.sample_dropped += 1;
+        }
+    }
+
+    fn record_stale_prune_run(&mut self, run: StalePruneRun) {
+        if !self.enabled {
+            return;
+        }
+        self.stale_prune_runs.push(run);
+    }
+
+    fn record_known_oid_prune_run(&mut self, run: KnownOidPruneRun) {
+        if !self.enabled {
+            return;
+        }
+        self.known_oid_prune_runs.push(run);
+    }
+
+    fn flush_current(&mut self) -> Result<()> {
+        let Some(window_start_block) = self.current_window_start else {
+            return Ok(());
+        };
+        let window_end_block = window_start_block + UNKNOWN_OID_WINDOW_BLOCKS - 1;
+        let stats = std::mem::take(&mut self.stats);
+        let samples = std::mem::take(&mut self.samples);
+        let stale_prune_runs = std::mem::take(&mut self.stale_prune_runs);
+        let known_oid_prune_runs = std::mem::take(&mut self.known_oid_prune_runs);
+
+        let tx = self.conn.transaction().context("begin unknown oid sqlite txn")?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO unknown_oid_windows (
+                window_start_block, window_end_block, window_type,
+                unknown_cancel_total, unknown_modify_total,
+                unresolved_user_cloid_cancel, unresolved_user_cloid_modify,
+                sampled, sample_dropped, stale_prune_runs
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                i64::try_from(window_start_block)?,
+                i64::try_from(window_end_block)?,
+                "unknown_oid_window_v3_sqlite",
+                i64::try_from(stats.unknown_cancel_total)?,
+                i64::try_from(stats.unknown_modify_total)?,
+                i64::try_from(stats.unresolved_user_cloid_cancel)?,
+                i64::try_from(stats.unresolved_user_cloid_modify)?,
+                i64::try_from(stats.sampled)?,
+                i64::try_from(stats.sample_dropped)?,
+                i64::try_from(stale_prune_runs.len())?,
+            ],
+        )?;
+
+        if inserted == 0 {
+            eprintln!(
+                "[warn] unknown-oid sqlite conflict at window_start_block={} (already exists); skipping this window",
+                window_start_block
+            );
+            tx.commit()?;
+            return Ok(());
+        }
+
+        for (seq, sample) in samples.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO unknown_oid_samples (
+                    window_start_block, seq, block_number, block_time_ms,
+                    event, phase, reason, user_addr, ref_kind, ref_oid, ref_cloid, mapped_oid
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    i64::try_from(window_start_block)?,
+                    i64::try_from(seq)?,
+                    i64::try_from(sample.block_number)?,
+                    sample.block_time_ms,
+                    sample.event,
+                    sample.phase,
+                    sample.reason,
+                    sample.user.as_deref(),
+                    sample.ref_kind,
+                    sample.ref_oid.map(i64::try_from).transpose()?,
+                    sample.ref_cloid.as_deref(),
+                    sample.mapped_oid.map(i64::try_from).transpose()?,
+                ],
+            )?;
+        }
+
+        for (run_seq, run) in stale_prune_runs.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO stale_prune_runs (
+                    window_start_block, run_seq, trigger_block_number, trigger_block_time_ms,
+                    cutoff_time_ms, pruned_total, sampled, sample_dropped
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    i64::try_from(window_start_block)?,
+                    i64::try_from(run_seq)?,
+                    i64::try_from(run.trigger_block_number)?,
+                    run.trigger_block_time_ms,
+                    run.cutoff_time_ms,
+                    i64::try_from(run.pruned_total)?,
+                    i64::try_from(run.sampled)?,
+                    i64::try_from(run.sample_dropped)?,
+                ],
+            )?;
+
+            for (sample_seq, sample) in run.samples.iter().enumerate() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO stale_prune_samples (
+                        window_start_block, run_seq, sample_seq, oid, user_addr, cloid,
+                        created_block_number, created_time_ms, pruned_at_block_number, pruned_at_time_ms, age_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        i64::try_from(window_start_block)?,
+                        i64::try_from(run_seq)?,
+                        i64::try_from(sample_seq)?,
+                        i64::try_from(sample.oid)?,
+                        sample.user.as_str(),
+                        sample.cloid.as_deref(),
+                        i64::try_from(sample.created_block_number)?,
+                        sample.created_time_ms,
+                        i64::try_from(sample.pruned_at_block_number)?,
+                        sample.pruned_at_time_ms,
+                        sample.age_ms,
+                    ],
+                )?;
+            }
+        }
+
+        for (run_seq, run) in known_oid_prune_runs.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO known_oid_prune_runs (
+                    window_start_block, run_seq, trigger_block_number, trigger_block_time_ms,
+                    cutoff_time_ms, pruned_total, sampled, sample_dropped
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    i64::try_from(window_start_block)?,
+                    i64::try_from(run_seq)?,
+                    i64::try_from(run.trigger_block_number)?,
+                    run.trigger_block_time_ms,
+                    run.cutoff_time_ms,
+                    i64::try_from(run.pruned_total)?,
+                    i64::try_from(run.sampled)?,
+                    i64::try_from(run.sample_dropped)?,
+                ],
+            )?;
+
+            for (sample_seq, sample) in run.samples.iter().enumerate() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO known_oid_prune_samples (
+                        window_start_block, run_seq, sample_seq, oid,
+                        created_block_number, created_time_ms, pruned_at_block_number, pruned_at_time_ms, age_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        i64::try_from(window_start_block)?,
+                        i64::try_from(run_seq)?,
+                        i64::try_from(sample_seq)?,
+                        i64::try_from(sample.oid)?,
+                        i64::try_from(sample.created_block_number)?,
+                        sample.created_time_ms,
+                        i64::try_from(sample.pruned_at_block_number)?,
+                        sample.pruned_at_time_ms,
+                        sample.age_ms,
+                    ],
+                )?;
+            }
+        }
+
+        tx.commit().context("commit unknown oid sqlite txn")?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.flush_current()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct OrderMeta {
     tif: Option<String>,
@@ -285,6 +722,7 @@ enum CmdEvent {
 struct OrderState {
     user: String,
     cloid: Option<String>,
+    created_block_number: u64,
     created_time_ms: i64,
     side: String,
     px: Decimal,
@@ -300,10 +738,16 @@ struct OrderState {
     sl_trigger_px: Option<Decimal>,
 }
 
+#[derive(Debug, Clone)]
+struct KnownOidState {
+    created_block_number: u64,
+    created_time_ms: i64,
+}
+
 #[derive(Debug, Default)]
 struct TriggerOrderRefs {
     oid_to_cloid: HashMap<u64, Option<UserCloidKey>>,
-    cloid_to_oid: HashMap<UserCloidKey, u64>,
+    cloid_to_oid: HashMap<String, HashMap<String, u64>>,
     pending_by_user: HashMap<String, VecDeque<Option<String>>>,
 }
 
@@ -896,6 +1340,52 @@ fn replica_chunk_starts_for_range(start_height: u64, height_span: u64) -> Result
     Ok(chunks)
 }
 
+fn resolve_replica_keys_via_hardcoded_day_index(
+    normalized_prefix: &str,
+    required_chunks: &[u64],
+) -> Result<Option<Vec<String>>> {
+    if normalized_prefix != "replica_cmds" || required_chunks.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(first_entry) = REPLICA_DAY_INDEX.first() else {
+        return Ok(None);
+    };
+    let first_chunk = first_entry.start_chunk;
+
+    let base_date = NaiveDate::parse_from_str(REPLICA_INDEX_START_DATE_YYYYMMDD, "%Y%m%d")
+        .with_context(|| format!("invalid hardcoded start date: {REPLICA_INDEX_START_DATE_YYYYMMDD}"))?;
+    let end_date = NaiveDate::parse_from_str(REPLICA_INDEX_END_DATE_YYYYMMDD, "%Y%m%d")
+        .with_context(|| format!("invalid hardcoded end date: {REPLICA_INDEX_END_DATE_YYYYMMDD}"))?;
+
+    let mut resolved = Vec::with_capacity(required_chunks.len());
+    for &chunk in required_chunks {
+        if chunk < first_chunk || chunk >= REPLICA_INDEX_END_EXCLUSIVE_CHUNK {
+            return Ok(None);
+        }
+
+        let pos = REPLICA_DAY_INDEX.partition_point(|entry| entry.start_chunk <= chunk);
+        if pos == 0 {
+            return Ok(None);
+        }
+        let day_idx = pos - 1;
+        let day_entry = REPLICA_DAY_INDEX[day_idx];
+        let snapshot = REPLICA_SNAPSHOT_DIRS
+            .get(usize::from(day_entry.snapshot_idx))
+            .ok_or_else(|| anyhow!("invalid snapshot idx in hardcoded replica index: {}", day_entry.snapshot_idx))?;
+        let date = base_date
+            .checked_add_days(Days::new(day_idx as u64))
+            .ok_or_else(|| anyhow!("hardcoded replica day index overflow at idx {}", day_idx))?;
+        if date > end_date {
+            return Ok(None);
+        }
+        let date_str = date.format("%Y%m%d");
+        resolved.push(format!("{normalized_prefix}/{snapshot}/{date_str}/{chunk}.lz4"));
+    }
+
+    Ok(Some(resolved))
+}
+
 async fn resolve_replica_keys_for_range(
     client: &S3Client,
     bucket: &str,
@@ -906,6 +1396,16 @@ async fn resolve_replica_keys_for_range(
 ) -> Result<Vec<String>> {
     let required_chunks = replica_chunk_starts_for_range(start_height, height_span)?;
     let normalized_prefix = prefix.trim_matches('/');
+
+    if let Some(resolved) = resolve_replica_keys_via_hardcoded_day_index(normalized_prefix, &required_chunks)? {
+        eprintln!(
+            "[index] resolved replica_cmds via hardcoded day index for {} chunks (range {}..{})",
+            resolved.len(),
+            start_height,
+            start_height + height_span - 1
+        );
+        return Ok(resolved);
+    }
 
     // Fast path: try deterministic keys directly under the provided prefix.
     let mut direct_keys = Vec::with_capacity(required_chunks.len());
@@ -1657,14 +2157,37 @@ fn clamp_lifetime_ms(created_time_ms: i64, current_time_ms: i64) -> Option<i32> 
 fn resolve_order_ref(
     order_ref: &OrderRef,
     user: Option<&str>,
-    cloid_to_oid: &HashMap<UserCloidKey, u64>,
+    cloid_to_oid: &HashMap<String, HashMap<String, u64>>,
 ) -> Option<u64> {
     match order_ref {
         OrderRef::Oid(oid) => Some(*oid),
         OrderRef::Cloid(cloid) => {
             let user = user?;
-            cloid_to_oid.get(&UserCloidKey { user: user.to_owned(), cloid: cloid.clone() }).copied()
+            cloid_to_oid.get(user).and_then(|by_cloid| by_cloid.get(cloid)).copied()
         }
+    }
+}
+
+fn window_start_by_span(block_number: u64, span: u64) -> u64 {
+    ((block_number - 1) / span) * span + 1
+}
+
+fn window_start_block(block_number: u64) -> u64 {
+    window_start_by_span(block_number, UNKNOWN_OID_WINDOW_BLOCKS)
+}
+
+fn row_group_window_start_block(block_number: u64) -> u64 {
+    window_start_by_span(block_number, ROW_GROUP_BLOCKS)
+}
+
+fn file_window_start_block(block_number: u64) -> u64 {
+    window_start_by_span(block_number, FILE_ROTATION_BLOCKS)
+}
+
+fn order_ref_parts(order_ref: &OrderRef) -> (&'static str, Option<u64>, Option<String>) {
+    match order_ref {
+        OrderRef::Oid(oid) => ("oid", Some(*oid), None),
+        OrderRef::Cloid(cloid) => ("cloid", None, Some(cloid.clone())),
     }
 }
 
@@ -1673,7 +2196,7 @@ fn resolve_trigger_ref(order_ref: &OrderRef, user: Option<&str>, trigger_refs: &
         OrderRef::Oid(oid) => trigger_refs.oid_to_cloid.contains_key(oid).then_some(*oid),
         OrderRef::Cloid(cloid) => {
             let user = user?;
-            trigger_refs.cloid_to_oid.get(&UserCloidKey { user: user.to_owned(), cloid: cloid.clone() }).copied()
+            trigger_refs.cloid_to_oid.get(user).and_then(|by_cloid| by_cloid.get(cloid)).copied()
         }
     }
 }
@@ -1683,17 +2206,20 @@ fn remove_trigger_ref(trigger_refs: &mut TriggerOrderRefs, oid: u64) -> bool {
         return false;
     };
     if let Some(ref cloid_key) = cloid_key {
-        trigger_refs.cloid_to_oid.remove(&cloid_key);
+        let mut remove_user_bucket = false;
+        if let Some(by_cloid) = trigger_refs.cloid_to_oid.get_mut(&cloid_key.user) {
+            by_cloid.remove(&cloid_key.cloid);
+            remove_user_bucket = by_cloid.is_empty();
+        }
+        if remove_user_bucket {
+            trigger_refs.cloid_to_oid.remove(&cloid_key.user);
+        }
     }
     true
 }
 
 fn insert_pending_trigger_ref(trigger_refs: &mut TriggerOrderRefs, user: &str, cloid: Option<&str>) {
-    trigger_refs
-        .pending_by_user
-        .entry(user.to_owned())
-        .or_default()
-        .push_back(cloid.map(ToOwned::to_owned));
+    trigger_refs.pending_by_user.entry(user.to_owned()).or_default().push_back(cloid.map(ToOwned::to_owned));
 }
 
 fn remove_pending_trigger_ref_by_cloid(trigger_refs: &mut TriggerOrderRefs, user: &str, cloid: &str) -> bool {
@@ -1730,29 +2256,37 @@ fn insert_trigger_ref(trigger_refs: &mut TriggerOrderRefs, user: &str, oid: u64,
     }
     let cloid_key = cloid.map(|cloid| UserCloidKey { user: user.to_owned(), cloid: cloid.to_owned() });
     if let Some(cloid_key) = &cloid_key {
-        trigger_refs.cloid_to_oid.insert(cloid_key.clone(), oid);
+        trigger_refs.cloid_to_oid.entry(cloid_key.user.clone()).or_default().insert(cloid_key.cloid.clone(), oid);
     }
     trigger_refs.oid_to_cloid.insert(oid, cloid_key);
 }
 
 fn remove_live_order(
     orders: &mut HashMap<u64, OrderState>,
-    cloid_to_oid: &mut HashMap<UserCloidKey, u64>,
+    cloid_to_oid: &mut HashMap<String, HashMap<String, u64>>,
     oid: u64,
 ) -> Option<OrderState> {
     let state = orders.remove(&oid)?;
     if let Some(cloid) = &state.cloid {
-        cloid_to_oid.remove(&UserCloidKey { user: state.user.clone(), cloid: cloid.clone() });
+        let mut remove_user_bucket = false;
+        if let Some(by_cloid) = cloid_to_oid.get_mut(&state.user) {
+            by_cloid.remove(cloid);
+            remove_user_bucket = by_cloid.is_empty();
+        }
+        if remove_user_bucket {
+            cloid_to_oid.remove(&state.user);
+        }
     }
     Some(state)
 }
 
 fn insert_live_order(
     orders: &mut HashMap<u64, OrderState>,
-    cloid_to_oid: &mut HashMap<UserCloidKey, u64>,
+    cloid_to_oid: &mut HashMap<String, HashMap<String, u64>>,
     user: &str,
     oid: u64,
     cloid: Option<&str>,
+    created_block_number: u64,
     created_time_ms: i64,
     side: &str,
     px: Decimal,
@@ -1760,13 +2294,14 @@ fn insert_live_order(
     meta: &OrderMeta,
 ) {
     if let Some(cloid) = cloid {
-        cloid_to_oid.insert(UserCloidKey { user: user.to_owned(), cloid: cloid.to_owned() }, oid);
+        cloid_to_oid.entry(user.to_owned()).or_default().insert(cloid.to_owned(), oid);
     }
     orders.insert(
         oid,
         OrderState {
             user: user.to_owned(),
             cloid: cloid.map(ToOwned::to_owned),
+            created_block_number,
             created_time_ms,
             side: side.to_owned(),
             px,
@@ -1782,6 +2317,87 @@ fn insert_live_order(
             sl_trigger_px: meta.sl_trigger_px,
         },
     );
+}
+
+fn prune_stale_live_orders(
+    orders: &mut HashMap<u64, OrderState>,
+    cloid_to_oid: &mut HashMap<String, HashMap<String, u64>>,
+    current_block_number: u64,
+    current_time_ms: i64,
+) -> StalePruneRun {
+    let cutoff_ms = current_time_ms.saturating_sub(LIVE_STATE_TTL_MS);
+    let stale_oids: Vec<u64> =
+        orders.iter().filter_map(|(oid, state)| (state.created_time_ms <= cutoff_ms).then_some(*oid)).collect();
+    let mut samples = Vec::new();
+    let mut pruned_total = 0u64;
+    for oid in stale_oids {
+        if let Some(state) = remove_live_order(orders, cloid_to_oid, oid) {
+            pruned_total += 1;
+            if samples.len() < PRUNE_SAMPLE_LIMIT_PER_RUN {
+                samples.push(PrunedOrderSample {
+                    oid,
+                    user: state.user,
+                    cloid: state.cloid,
+                    created_block_number: state.created_block_number,
+                    created_time_ms: state.created_time_ms,
+                    pruned_at_block_number: current_block_number,
+                    pruned_at_time_ms: current_time_ms,
+                    age_ms: current_time_ms.saturating_sub(state.created_time_ms),
+                });
+            }
+        }
+    }
+    let sampled = u64::try_from(samples.len()).unwrap_or(0);
+    let sample_dropped = pruned_total.saturating_sub(sampled);
+    StalePruneRun {
+        trigger_block_number: current_block_number,
+        trigger_block_time_ms: current_time_ms,
+        cutoff_time_ms: cutoff_ms,
+        pruned_total,
+        sampled,
+        sample_dropped,
+        samples,
+    }
+}
+
+fn prune_known_non_trigger_oids(
+    known_non_trigger_oids: &mut HashMap<u64, KnownOidState>,
+    current_block_number: u64,
+    current_time_ms: i64,
+) -> KnownOidPruneRun {
+    let cutoff_ms = current_time_ms.saturating_sub(LIVE_STATE_TTL_MS);
+    let stale_oids: Vec<u64> = known_non_trigger_oids
+        .iter()
+        .filter_map(|(oid, state)| (state.created_time_ms <= cutoff_ms).then_some(*oid))
+        .collect();
+    let mut samples = Vec::new();
+    let mut pruned_total = 0u64;
+    for oid in stale_oids {
+        if let Some(state) = known_non_trigger_oids.remove(&oid) {
+            pruned_total += 1;
+            if samples.len() < PRUNE_SAMPLE_LIMIT_PER_RUN {
+                samples.push(PrunedKnownOidSample {
+                    oid,
+                    created_block_number: state.created_block_number,
+                    created_time_ms: state.created_time_ms,
+                    pruned_at_block_number: current_block_number,
+                    pruned_at_time_ms: current_time_ms,
+                    age_ms: current_time_ms.saturating_sub(state.created_time_ms),
+                });
+            }
+        }
+    }
+    let sampled = u64::try_from(samples.len()).unwrap_or(0);
+    let sample_dropped = pruned_total.saturating_sub(sampled);
+    KnownOidPruneRun {
+        trigger_block_number: current_block_number,
+        trigger_block_time_ms: current_time_ms,
+        cutoff_time_ms: cutoff_ms,
+        pruned_total,
+        sampled,
+        sample_dropped,
+        samples,
+    }
 }
 
 fn push_add_row(
@@ -1830,27 +2446,42 @@ fn process_block(
     cmd_events: Option<Vec<CmdEvent>>,
     fills: Option<Vec<FillRecord>>,
     emit_rows: bool,
+    emit_json_logs: bool,
     rows: &mut RowBuffer,
     orders: &mut HashMap<u64, OrderState>,
-    cloid_to_oid: &mut HashMap<UserCloidKey, u64>,
+    cloid_to_oid: &mut HashMap<String, HashMap<String, u64>>,
     trigger_refs: &mut TriggerOrderRefs,
-    known_non_trigger_oids: &mut HashSet<u64>,
-    writer: &mut ArrowWriter<File>,
-    schema: &Arc<Schema>,
+    known_non_trigger_oids: &mut HashMap<u64, KnownOidState>,
+    unknown_oid_logger: &mut UnknownOidWindowLogger,
 ) -> Result<()> {
+    unknown_oid_logger.set_enabled(emit_json_logs);
+    unknown_oid_logger.observe_block(block_number)?;
+    if block_number == row_group_window_start_block(block_number) {
+        let prune_run = prune_stale_live_orders(orders, cloid_to_oid, block_number, block_time_ms);
+        let known_oid_prune_run = prune_known_non_trigger_oids(known_non_trigger_oids, block_number, block_time_ms);
+        if emit_json_logs {
+            unknown_oid_logger.record_stale_prune_run(prune_run);
+            unknown_oid_logger.record_known_oid_prune_run(known_oid_prune_run);
+        }
+    }
+
     if let Some(events) = cmd_events {
         let mut canceled_oids_in_block: HashSet<u64> = HashSet::new();
         let mut deferred_cancels: Vec<(Option<String>, OrderRef, bool)> = Vec::new();
         for event in &events {
             match event {
                 CmdEvent::Add { user, oid, cloid, side, px, sz, raw_sz, meta } => {
-                    known_non_trigger_oids.insert(*oid);
+                    known_non_trigger_oids.insert(
+                        *oid,
+                        KnownOidState { created_block_number: block_number, created_time_ms: block_time_ms },
+                    );
                     insert_live_order(
                         orders,
                         cloid_to_oid,
                         user,
                         *oid,
                         cloid.as_deref(),
+                        block_number,
                         block_time_ms,
                         side,
                         *px,
@@ -1877,6 +2508,7 @@ fn process_block(
                         continue;
                     }
                     let mut emitted_remove = false;
+                    let mut logged_unknown = false;
 
                     if let Some(oid) = resolved_oid {
                         if canceled_oids_in_block.contains(&oid) {
@@ -1913,56 +2545,58 @@ fn process_block(
                             }
                             emitted_remove = true;
                         }
+                    } else {
+                        match order_ref {
+                            OrderRef::Cloid(_) => {
+                                unknown_oid_logger.record_unresolved_user_cloid("cancel");
+                                logged_unknown = true;
+                            }
+                            OrderRef::Oid(_) => {
+                                let (ref_kind, ref_oid, ref_cloid) = order_ref_parts(order_ref);
+                                unknown_oid_logger.record_sample(UnknownOidSample {
+                                    block_number,
+                                    block_time_ms,
+                                    event: "cancel",
+                                    phase: "immediate",
+                                    reason: "resolve_ref_none",
+                                    user: user.clone(),
+                                    ref_kind,
+                                    ref_oid,
+                                    ref_cloid,
+                                    mapped_oid: None,
+                                });
+                                logged_unknown = true;
+                            }
+                        }
                     }
 
-                    if !emitted_remove && *fallback_on_missing {
+                    if !emitted_remove {
                         if let (Some(user), OrderRef::Oid(oid)) = (user.as_deref(), order_ref)
-                            && !known_non_trigger_oids.contains(oid)
+                            && !known_non_trigger_oids.contains_key(oid)
                             && consume_pending_trigger_ref_for_user(trigger_refs, user)
                         {
                             continue;
                         }
-                    }
-
-                    if emit_rows && !emitted_remove && *fallback_on_missing {
-                        let fallback_oid = match order_ref {
-                            OrderRef::Oid(oid) => Some(i64::try_from(*oid)?),
-                            OrderRef::Cloid(_) => None,
-                        };
-                        if let Some(oid) = resolved_oid {
-                            canceled_oids_in_block.insert(oid);
+                        if !logged_unknown {
+                            let (ref_kind, ref_oid, ref_cloid) = order_ref_parts(order_ref);
+                            unknown_oid_logger.record_sample(UnknownOidSample {
+                                block_number,
+                                block_time_ms,
+                                event: "cancel",
+                                phase: "immediate",
+                                reason: "live_state_miss_on_cancel",
+                                user: user.clone(),
+                                ref_kind,
+                                ref_oid,
+                                ref_cloid,
+                                mapped_oid: resolved_oid,
+                            });
                         }
-                        rows.push(OutputRow {
-                            block_number: i64::try_from(block_number)?,
-                            block_time_ms,
-                            coin: "BTC".to_owned(),
-                            user: user.clone().unwrap_or_default(),
-                            oid: fallback_oid,
-                            side: None,
-                            px: None,
-                            diff_type: "remove".to_owned(),
-                            event: "cancel".to_owned(),
-                            sz: None,
-                            orig_sz: None,
-                            raw_sz: None,
-                            is_trigger: None,
-                            tif: None,
-                            reduce_only: None,
-                            order_type: None,
-                            trigger_condition: None,
-                            trigger_px: None,
-                            is_position_tpsl: None,
-                            tp_trigger_px: None,
-                            sl_trigger_px: None,
-                            status: Some(CANCEL_STATUS_CANCELED.to_owned()),
-                            lifetime: None,
-                        });
                     }
                 }
                 CmdEvent::Modify { user, old_order_ref, new_oid, new_cloid, side, px, sz, raw_sz, meta } => {
-                    let mut emitted_remove = false;
-
-                    if let Some(old_oid) = resolve_order_ref(old_order_ref, Some(user.as_str()), cloid_to_oid) {
+                    let resolved_old_oid = resolve_order_ref(old_order_ref, Some(user.as_str()), cloid_to_oid);
+                    if let Some(old_oid) = resolved_old_oid {
                         if let Some(old_state) = remove_live_order(orders, cloid_to_oid, old_oid) {
                             if emit_rows {
                                 rows.push(OutputRow {
@@ -1991,51 +2625,57 @@ fn process_block(
                                     lifetime: clamp_lifetime_ms(old_state.created_time_ms, block_time_ms),
                                 });
                             }
-                            emitted_remove = true;
+                        } else {
+                            let (ref_kind, ref_oid, ref_cloid) = order_ref_parts(old_order_ref);
+                            unknown_oid_logger.record_sample(UnknownOidSample {
+                                block_number,
+                                block_time_ms,
+                                event: "modify",
+                                phase: "immediate",
+                                reason: "live_state_miss_on_modify_old_ref",
+                                user: Some(user.clone()),
+                                ref_kind,
+                                ref_oid,
+                                ref_cloid,
+                                mapped_oid: Some(old_oid),
+                            });
                         }
-                    }
-
-                    if emit_rows && !emitted_remove {
-                        let fallback_oid = match old_order_ref {
-                            OrderRef::Oid(oid) => Some(i64::try_from(*oid)?),
-                            OrderRef::Cloid(_) => None,
-                        };
-                        rows.push(OutputRow {
-                            block_number: i64::try_from(block_number)?,
-                            block_time_ms,
-                            coin: "BTC".to_owned(),
-                            user: user.clone(),
-                            oid: fallback_oid,
-                            side: None,
-                            px: None,
-                            diff_type: "remove".to_owned(),
-                            event: "cancel".to_owned(),
-                            sz: None,
-                            orig_sz: None,
-                            raw_sz: None,
-                            is_trigger: None,
-                            tif: None,
-                            reduce_only: None,
-                            order_type: None,
-                            trigger_condition: None,
-                            trigger_px: None,
-                            is_position_tpsl: None,
-                            tp_trigger_px: None,
-                            sl_trigger_px: None,
-                            status: Some(CANCEL_STATUS_CANCELED.to_owned()),
-                            lifetime: None,
-                        });
+                    } else {
+                        match old_order_ref {
+                            OrderRef::Cloid(_) => {
+                                unknown_oid_logger.record_unresolved_user_cloid("modify");
+                            }
+                            OrderRef::Oid(_) => {
+                                let (ref_kind, ref_oid, ref_cloid) = order_ref_parts(old_order_ref);
+                                unknown_oid_logger.record_sample(UnknownOidSample {
+                                    block_number,
+                                    block_time_ms,
+                                    event: "modify",
+                                    phase: "immediate",
+                                    reason: "resolve_ref_none",
+                                    user: Some(user.clone()),
+                                    ref_kind,
+                                    ref_oid,
+                                    ref_cloid,
+                                    mapped_oid: None,
+                                });
+                            }
+                        }
                     }
 
                     if !meta.is_trigger {
                         if let Some(new_oid) = new_oid {
-                            known_non_trigger_oids.insert(*new_oid);
+                            known_non_trigger_oids.insert(
+                                *new_oid,
+                                KnownOidState { created_block_number: block_number, created_time_ms: block_time_ms },
+                            );
                             insert_live_order(
                                 orders,
                                 cloid_to_oid,
                                 user,
                                 *new_oid,
                                 new_cloid.as_deref(),
+                                block_number,
                                 block_time_ms,
                                 side,
                                 *px,
@@ -2108,15 +2748,9 @@ fn process_block(
                     }
                 }
             }
-
-            if rows.len() >= ROW_GROUP_SIZE
-                && let Some(batch) = rows.take_batch(schema)?
-            {
-                writer.write(&batch)?;
-            }
         }
 
-        for (user, order_ref, fallback_on_missing) in deferred_cancels.drain(..) {
+        for (user, order_ref, _fallback_on_missing) in deferred_cancels.drain(..) {
             if let Some(trigger_oid) = resolve_trigger_ref(&order_ref, user.as_deref(), trigger_refs) {
                 remove_trigger_ref(trigger_refs, trigger_oid);
                 continue;
@@ -2128,6 +2762,7 @@ fn process_block(
             }
             let resolved_oid = resolve_order_ref(&order_ref, user.as_deref(), cloid_to_oid);
             let mut emitted_remove = false;
+            let mut logged_unknown = false;
 
             if let Some(oid) = resolved_oid {
                 if canceled_oids_in_block.contains(&oid) {
@@ -2164,43 +2799,53 @@ fn process_block(
                     }
                     emitted_remove = true;
                 }
+            } else {
+                match &order_ref {
+                    OrderRef::Cloid(_) => {
+                        unknown_oid_logger.record_unresolved_user_cloid("cancel");
+                        logged_unknown = true;
+                    }
+                    OrderRef::Oid(_) => {
+                        let (ref_kind, ref_oid, ref_cloid) = order_ref_parts(&order_ref);
+                        unknown_oid_logger.record_sample(UnknownOidSample {
+                            block_number,
+                            block_time_ms,
+                            event: "cancel",
+                            phase: "deferred",
+                            reason: "resolve_ref_none",
+                            user: user.clone(),
+                            ref_kind,
+                            ref_oid,
+                            ref_cloid,
+                            mapped_oid: None,
+                        });
+                        logged_unknown = true;
+                    }
+                }
             }
 
-            if !emitted_remove && fallback_on_missing {
+            if !emitted_remove {
                 if let (Some(user), OrderRef::Oid(oid)) = (user.as_deref(), &order_ref)
-                    && !known_non_trigger_oids.contains(oid)
+                    && !known_non_trigger_oids.contains_key(oid)
                     && consume_pending_trigger_ref_for_user(trigger_refs, user)
                 {
                     continue;
                 }
-            }
-
-            if emit_rows && !emitted_remove && fallback_on_missing {
-                rows.push(OutputRow {
-                    block_number: i64::try_from(block_number)?,
-                    block_time_ms,
-                    coin: "BTC".to_owned(),
-                    user: user.unwrap_or_default(),
-                    oid: None,
-                    side: None,
-                    px: None,
-                    diff_type: "remove".to_owned(),
-                    event: "cancel".to_owned(),
-                    sz: None,
-                    orig_sz: None,
-                    raw_sz: None,
-                    is_trigger: None,
-                    tif: None,
-                    reduce_only: None,
-                    order_type: None,
-                    trigger_condition: None,
-                    trigger_px: None,
-                    is_position_tpsl: None,
-                    tp_trigger_px: None,
-                    sl_trigger_px: None,
-                    status: Some(CANCEL_STATUS_CANCELED.to_owned()),
-                    lifetime: None,
-                });
+                if !logged_unknown {
+                    let (ref_kind, ref_oid, ref_cloid) = order_ref_parts(&order_ref);
+                    unknown_oid_logger.record_sample(UnknownOidSample {
+                        block_number,
+                        block_time_ms,
+                        event: "cancel",
+                        phase: "deferred",
+                        reason: "live_state_miss_on_cancel",
+                        user: user.clone(),
+                        ref_kind,
+                        ref_oid,
+                        ref_cloid,
+                        mapped_oid: resolved_oid,
+                    });
+                }
             }
         }
     }
@@ -2212,11 +2857,6 @@ fn process_block(
             let fill_time_ms = fill.block_time_ms;
 
             if fill.crossed {
-                if rows.len() >= ROW_GROUP_SIZE
-                    && let Some(batch) = rows.take_batch(schema)?
-                {
-                    writer.write(&batch)?;
-                }
                 continue;
             }
 
@@ -2251,11 +2891,6 @@ fn process_block(
             }
 
             let Some(state) = orders.get_mut(&fill.oid) else {
-                if rows.len() >= ROW_GROUP_SIZE
-                    && let Some(batch) = rows.take_batch(schema)?
-                {
-                    writer.write(&batch)?;
-                }
                 continue;
             };
 
@@ -2264,8 +2899,7 @@ fn process_block(
                 continue;
             }
 
-            let old_remaining = state.remaining_sz;
-            let mut new_remaining = old_remaining - fill.sz;
+            let mut new_remaining = state.remaining_sz - fill.sz;
             if new_remaining < Decimal::ZERO {
                 new_remaining = Decimal::ZERO;
             }
@@ -2273,41 +2907,7 @@ fn process_block(
             state.remaining_sz = new_remaining;
 
             if new_remaining <= Decimal::ZERO {
-                let removed_state = remove_live_order(orders, cloid_to_oid, fill.oid)
-                    .ok_or_else(|| anyhow!("missing state for oid {} on remove", fill.oid))?;
-                if emit_rows {
-                    rows.push(OutputRow {
-                        block_number: i64::try_from(fill.block_number)?,
-                        block_time_ms: fill_time_ms,
-                        coin: "BTC".to_owned(),
-                        user: removed_state.user,
-                        oid: Some(i64::try_from(fill.oid)?),
-                        side: Some(removed_state.side),
-                        px: Some(removed_state.px),
-                        diff_type: "remove".to_owned(),
-                        event: "fill".to_owned(),
-                        sz: Some(Decimal::ZERO),
-                        orig_sz: Some(old_remaining),
-                        raw_sz: None,
-                        is_trigger: Some(removed_state.is_trigger),
-                        tif: removed_state.tif.clone(),
-                        reduce_only: removed_state.reduce_only,
-                        order_type: removed_state.order_type.clone(),
-                        trigger_condition: removed_state.trigger_condition.clone(),
-                        trigger_px: removed_state.trigger_px,
-                        is_position_tpsl: removed_state.is_position_tpsl,
-                        tp_trigger_px: removed_state.tp_trigger_px,
-                        sl_trigger_px: removed_state.sl_trigger_px,
-                        status: None,
-                        lifetime: clamp_lifetime_ms(removed_state.created_time_ms, fill_time_ms),
-                    });
-                }
-            }
-
-            if rows.len() >= ROW_GROUP_SIZE
-                && let Some(batch) = rows.take_batch(schema)?
-            {
-                writer.write(&batch)?;
+                remove_live_order(orders, cloid_to_oid, fill.oid);
             }
         }
     }
@@ -2315,13 +2915,165 @@ fn process_block(
     Ok(())
 }
 
-fn finalize_output(writer: ArrowWriter<File>, rows: &mut RowBuffer, schema: &Arc<Schema>) -> Result<()> {
-    let mut writer = writer;
+fn build_output_tmp_path(output_dir: &Path, actual_start_block: u64) -> Result<PathBuf> {
+    create_dir_all(output_dir)
+        .with_context(|| format!("failed to create output directory: {}", output_dir.display()))?;
+    let pid = std::process::id();
+    let mut candidate = output_dir.join(format!(".tmp_btc_diff_start{actual_start_block}_pid{pid}.parquet"));
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+    for idx in 1..=9_999usize {
+        candidate = output_dir.join(format!(".tmp_btc_diff_start{actual_start_block}_pid{pid}_{idx}.parquet"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!("failed to allocate temp parquet file for start block {} under {}", actual_start_block, output_dir.display());
+}
+
+fn build_final_output_path(output_dir: &Path, actual_start_block: u64, actual_end_block: u64) -> Result<PathBuf> {
+    create_dir_all(output_dir)
+        .with_context(|| format!("failed to create output directory: {}", output_dir.display()))?;
+    let mut candidate = output_dir.join(format!("btc_diff_{actual_start_block}_{actual_end_block}.parquet"));
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+    for idx in 1..=9_999usize {
+        candidate = output_dir.join(format!("btc_diff_{actual_start_block}_{actual_end_block}_dup{idx}.parquet"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "failed to allocate final parquet file name for range {}..{} under {}",
+        actual_start_block,
+        actual_end_block,
+        output_dir.display()
+    );
+}
+
+fn open_output_writer(path: &Path, schema: &Arc<Schema>) -> Result<ArrowWriter<File>> {
+    let file = File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
+        .set_max_row_group_size(PARQUET_MAX_ROW_GROUP_ROWS)
+        .build();
+    ArrowWriter::try_new(file, Arc::clone(schema), Some(props)).context("creating parquet writer")
+}
+
+fn flush_rows_to_writer(writer: &mut ArrowWriter<File>, rows: &mut RowBuffer, schema: &Arc<Schema>) -> Result<()> {
     if let Some(batch) = rows.take_batch(schema)? {
         writer.write(&batch)?;
+        writer.flush()?;
     }
+    Ok(())
+}
+
+fn close_output_writer(mut writer: ArrowWriter<File>, rows: &mut RowBuffer, schema: &Arc<Schema>) -> Result<()> {
+    flush_rows_to_writer(&mut writer, rows, schema)?;
     writer.close()?;
     Ok(())
+}
+
+fn close_and_finalize_output_file(
+    output_dir: &Path,
+    writer: ArrowWriter<File>,
+    rows: &mut RowBuffer,
+    schema: &Arc<Schema>,
+    tmp_path: &Path,
+    actual_start_block: u64,
+    actual_end_block: u64,
+) -> Result<PathBuf> {
+    close_output_writer(writer, rows, schema)?;
+    let final_path = build_final_output_path(output_dir, actual_start_block, actual_end_block)?;
+    rename(tmp_path, &final_path).with_context(|| {
+        format!("failed to rename parquet temp file {} -> {}", tmp_path.display(), final_path.display())
+    })?;
+    Ok(final_path)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_output_ready_for_block(
+    output_dir: &Path,
+    schema: &Arc<Schema>,
+    block_number: u64,
+    emit_rows: bool,
+    writer: &mut Option<ArrowWriter<File>>,
+    current_tmp_output_path: &mut Option<PathBuf>,
+    current_file_window_start: &mut Option<u64>,
+    current_row_group_window_start: &mut Option<u64>,
+    current_file_actual_start_block: &mut Option<u64>,
+    last_emitted_block: Option<u64>,
+    generated_output_files: &mut Vec<PathBuf>,
+    rows: &mut RowBuffer,
+) -> Result<()> {
+    if !emit_rows {
+        return Ok(());
+    }
+
+    let next_file_window = file_window_start_block(block_number);
+    let next_row_group_window = row_group_window_start_block(block_number);
+
+    if writer.is_none() {
+        let tmp_path = build_output_tmp_path(output_dir, block_number)?;
+        *writer = Some(open_output_writer(&tmp_path, schema)?);
+        *current_tmp_output_path = Some(tmp_path.clone());
+        *current_file_window_start = Some(next_file_window);
+        *current_row_group_window_start = Some(next_row_group_window);
+        *current_file_actual_start_block = Some(block_number);
+        eprintln!("[file] open parquet_tmp={} start_block={}", tmp_path.display(), block_number);
+        return Ok(());
+    }
+
+    if *current_file_window_start != Some(next_file_window) {
+        if let Some(active_writer) = writer.as_mut() {
+            flush_rows_to_writer(active_writer, rows, schema)?;
+        }
+        if let Some(active_writer) = writer.take() {
+            let closed_start = current_file_actual_start_block.unwrap_or(block_number);
+            let closed_end = last_emitted_block.unwrap_or(block_number);
+            let tmp_path =
+                current_tmp_output_path.take().ok_or_else(|| anyhow!("missing current tmp parquet path on rotate"))?;
+            let final_path = close_and_finalize_output_file(
+                output_dir,
+                active_writer,
+                rows,
+                schema,
+                &tmp_path,
+                closed_start,
+                closed_end,
+            )?;
+            generated_output_files.push(final_path.clone());
+            eprintln!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
+        }
+
+        let tmp_path = build_output_tmp_path(output_dir, block_number)?;
+        *writer = Some(open_output_writer(&tmp_path, schema)?);
+        *current_tmp_output_path = Some(tmp_path.clone());
+        *current_file_window_start = Some(next_file_window);
+        *current_row_group_window_start = Some(next_row_group_window);
+        *current_file_actual_start_block = Some(block_number);
+        eprintln!("[file] open parquet_tmp={} start_block={}", tmp_path.display(), block_number);
+        return Ok(());
+    }
+
+    if *current_row_group_window_start != Some(next_row_group_window) {
+        if let Some(active_writer) = writer.as_mut() {
+            flush_rows_to_writer(active_writer, rows, schema)?;
+        }
+        *current_row_group_window_start = Some(next_row_group_window);
+    }
+
+    Ok(())
+}
+
+async fn fetch_next_pair(
+    replica_reader: &mut ReplicaCmdsReader,
+    fills_reader: &mut NodeFillsReader,
+) -> Result<(Option<ReplicaBatch>, Option<NodeFillsBatch>)> {
+    let (next_replica, next_fills) = tokio::try_join!(replica_reader.next_batch(), fills_reader.next_batch())?;
+    Ok((next_replica, next_fills))
 }
 
 #[tokio::main]
@@ -2332,7 +3084,7 @@ async fn main() -> Result<()> {
     if args.start_height.is_some() ^ args.height_span.is_some() {
         bail!("--start-height and --height-span must be provided together");
     }
-    let target_block_range = match (args.start_height, args.height_span) {
+    let output_block_range = match (args.start_height, args.height_span) {
         (Some(start_height), Some(height_span)) => {
             if height_span == 0 {
                 bail!("--height-span must be > 0");
@@ -2344,6 +3096,22 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
+    let read_block_range = output_block_range.map(|(start_height, end_height)| {
+        let warmup_start = start_height.saturating_sub(args.warmup).max(1);
+        (warmup_start, end_height)
+    });
+    let mut warmup_end_logged = false;
+    if let (Some((warmup_start, _)), Some((output_start, _))) = (read_block_range, output_block_range)
+        && warmup_start < output_start
+    {
+        eprintln!(
+            "[warmup] start warmup_blocks={} warmup_range={}..{} output_start={}",
+            output_start - warmup_start,
+            warmup_start,
+            output_start - 1,
+            output_start
+        );
+    }
 
     let replica_source = InputSource::parse(&args.replica_cmds).context("parsing --replica_cmds")?;
     let node_fills_source = InputSource::parse(&args.node_fills_by_block).context("parsing --node_fills_by_block")?;
@@ -2356,13 +3124,13 @@ async fn main() -> Result<()> {
 
     let replica_reader_source = match &replica_source {
         InputSource::LocalFile(path) => {
-            if target_block_range.is_some() {
+            if output_block_range.is_some() {
                 bail!("--start-height/--height-span currently require S3 replica_cmds prefix input");
             }
             ReaderSource::LocalFile(path.clone())
         }
         InputSource::S3Prefix { bucket, prefix } => {
-            let Some((start_height, end_height)) = target_block_range else {
+            let Some((start_height, end_height)) = read_block_range else {
                 bail!("S3 replica_cmds requires --start-height and --height-span");
             };
             let height_span = end_height - start_height + 1;
@@ -2393,7 +3161,7 @@ async fn main() -> Result<()> {
     };
 
     let mut fills_reader =
-        NodeFillsReader::new(fills_reader_source.clone(), s3_client.clone(), requester_pays, target_block_range)
+        NodeFillsReader::new(fills_reader_source.clone(), s3_client.clone(), requester_pays, read_block_range)
             .await
             .context("opening node_fills_by_block")?;
     let mut replica_reader = ReplicaCmdsReader::new(
@@ -2402,37 +3170,69 @@ async fn main() -> Result<()> {
         args.block_time_tolerance_ns,
         s3_client.clone(),
         requester_pays,
-        target_block_range,
+        read_block_range,
     )
     .await
     .context("opening replica_cmds")?;
 
+    if args.output_parquet.exists() && !args.output_parquet.is_dir() {
+        bail!(
+            "--output-parquet now expects a directory path, but got existing non-directory: {}",
+            args.output_parquet.display()
+        );
+    }
+    create_dir_all(&args.output_parquet)
+        .with_context(|| format!("failed to create output parquet directory: {}", args.output_parquet.display()))?;
+
     let schema = output_schema();
-    let file = File::create(&args.output_parquet)
-        .with_context(|| format!("failed to create {}", args.output_parquet.display()))?;
-    let props = WriterProperties::builder()
-        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3)?))
-        .set_max_row_group_size(ROW_GROUP_SIZE)
-        .build();
-    let mut writer = Some(ArrowWriter::try_new(file, Arc::clone(&schema), Some(props))?);
+    let mut writer: Option<ArrowWriter<File>> = None;
+    let mut current_tmp_output_path: Option<PathBuf> = None;
+    let mut current_file_window_start: Option<u64> = None;
+    let mut current_row_group_window_start: Option<u64> = None;
+    let mut current_file_actual_start_block: Option<u64> = None;
+    let mut last_emitted_block: Option<u64> = None;
+    let mut generated_output_files: Vec<PathBuf> = Vec::new();
 
     let mut rows = RowBuffer::default();
     let mut orders: HashMap<u64, OrderState> = HashMap::new();
-    let mut cloid_to_oid: HashMap<UserCloidKey, u64> = HashMap::new();
+    let mut cloid_to_oid: HashMap<String, HashMap<String, u64>> = HashMap::new();
     let mut trigger_refs = TriggerOrderRefs::default();
-    let mut known_non_trigger_oids: HashSet<u64> = HashSet::new();
+    let mut known_non_trigger_oids: HashMap<u64, KnownOidState> = HashMap::new();
+    let mut unknown_oid_logger = UnknownOidWindowLogger::new(&args.unknown_oid_log_sqlite)?;
     let started_at = Instant::now();
     let mut processed_blocks: u64 = 0;
     eprintln!("[phase] processing blocks ...");
-    let mut next_replica = replica_reader.next_batch().await?;
-    let mut next_fills = fills_reader.next_batch().await?;
+    let (mut next_replica, mut next_fills) = fetch_next_pair(&mut replica_reader, &mut fills_reader).await?;
 
     while next_replica.is_some() || next_fills.is_some() {
         match (&next_replica, &next_fills) {
             (Some(replica), Some(fills)) if replica.block_number == fills.block_number => {
                 let block_time_delta = (replica.block_time_ms - fills.block_time_ms).abs();
                 if block_time_delta > args.block_time_match_tolerance_ms {
-                    finalize_output(writer.take().unwrap(), &mut rows, &schema)?;
+                    unknown_oid_logger.finish()?;
+                    if let Some(active_writer) = writer.take() {
+                        let closed_start = current_file_actual_start_block.unwrap_or(replica.block_number);
+                        let closed_end = last_emitted_block.unwrap_or(replica.block_number);
+                        let tmp_path = current_tmp_output_path
+                            .take()
+                            .ok_or_else(|| anyhow!("missing current tmp parquet path at timestamp mismatch"))?;
+                        let final_path = close_and_finalize_output_file(
+                            &args.output_parquet,
+                            active_writer,
+                            &mut rows,
+                            &schema,
+                            &tmp_path,
+                            closed_start,
+                            closed_end,
+                        )?;
+                        generated_output_files.push(final_path.clone());
+                        eprintln!(
+                            "[file] close parquet={} actual_range={}..{}",
+                            final_path.display(),
+                            closed_start,
+                            closed_end
+                        );
+                    }
                     bail!(
                         "block {} timestamp mismatch: replica={}ms fills={}ms delta={}ms tolerance={}ms",
                         replica.block_number,
@@ -2446,21 +3246,49 @@ async fn main() -> Result<()> {
                 let replica = next_replica.take().unwrap();
                 let fills = next_fills.take().unwrap();
                 let emit_rows =
-                    target_block_range.map(|(start_height, _)| replica.block_number >= start_height).unwrap_or(true);
+                    output_block_range.map(|(start_height, _)| replica.block_number >= start_height).unwrap_or(true);
+                ensure_output_ready_for_block(
+                    &args.output_parquet,
+                    &schema,
+                    replica.block_number,
+                    emit_rows,
+                    &mut writer,
+                    &mut current_tmp_output_path,
+                    &mut current_file_window_start,
+                    &mut current_row_group_window_start,
+                    &mut current_file_actual_start_block,
+                    last_emitted_block,
+                    &mut generated_output_files,
+                    &mut rows,
+                )?;
                 process_block(
                     replica.block_number,
                     replica.block_time_ms,
                     Some(replica.events),
                     Some(fills.fills),
                     emit_rows,
+                    emit_rows,
                     &mut rows,
                     &mut orders,
                     &mut cloid_to_oid,
                     &mut trigger_refs,
                     &mut known_non_trigger_oids,
-                    writer.as_mut().unwrap(),
-                    &schema,
+                    &mut unknown_oid_logger,
                 )?;
+                if emit_rows {
+                    last_emitted_block = Some(replica.block_number);
+                    if !warmup_end_logged
+                        && let (Some((warmup_start, _)), Some((output_start, _))) =
+                            (read_block_range, output_block_range)
+                        && warmup_start < output_start
+                    {
+                        eprintln!(
+                            "[warmup] end at block={} (output starts from block {})",
+                            replica.block_number, output_start
+                        );
+                        warmup_end_logged = true;
+                    }
+                }
                 processed_blocks += 1;
                 if processed_blocks % 100 == 0 {
                     eprintln!(
@@ -2472,27 +3300,56 @@ async fn main() -> Result<()> {
                         started_at.elapsed().as_secs_f64()
                     );
                 }
-                next_replica = replica_reader.next_batch().await?;
-                next_fills = fills_reader.next_batch().await?;
+                let (fetched_replica, fetched_fills) = fetch_next_pair(&mut replica_reader, &mut fills_reader).await?;
+                next_replica = fetched_replica;
+                next_fills = fetched_fills;
             }
             (Some(replica), Some(fills)) if replica.block_number < fills.block_number => {
                 let replica = next_replica.take().unwrap();
                 let emit_rows =
-                    target_block_range.map(|(start_height, _)| replica.block_number >= start_height).unwrap_or(true);
+                    output_block_range.map(|(start_height, _)| replica.block_number >= start_height).unwrap_or(true);
+                ensure_output_ready_for_block(
+                    &args.output_parquet,
+                    &schema,
+                    replica.block_number,
+                    emit_rows,
+                    &mut writer,
+                    &mut current_tmp_output_path,
+                    &mut current_file_window_start,
+                    &mut current_row_group_window_start,
+                    &mut current_file_actual_start_block,
+                    last_emitted_block,
+                    &mut generated_output_files,
+                    &mut rows,
+                )?;
                 process_block(
                     replica.block_number,
                     replica.block_time_ms,
                     Some(replica.events),
                     None,
                     emit_rows,
+                    emit_rows,
                     &mut rows,
                     &mut orders,
                     &mut cloid_to_oid,
                     &mut trigger_refs,
                     &mut known_non_trigger_oids,
-                    writer.as_mut().unwrap(),
-                    &schema,
+                    &mut unknown_oid_logger,
                 )?;
+                if emit_rows {
+                    last_emitted_block = Some(replica.block_number);
+                    if !warmup_end_logged
+                        && let (Some((warmup_start, _)), Some((output_start, _))) =
+                            (read_block_range, output_block_range)
+                        && warmup_start < output_start
+                    {
+                        eprintln!(
+                            "[warmup] end at block={} (output starts from block {})",
+                            replica.block_number, output_start
+                        );
+                        warmup_end_logged = true;
+                    }
+                }
                 processed_blocks += 1;
                 if processed_blocks % 100 == 0 {
                     eprintln!(
@@ -2509,21 +3366,49 @@ async fn main() -> Result<()> {
             (Some(_), Some(_)) => {
                 let fills = next_fills.take().unwrap();
                 let emit_rows =
-                    target_block_range.map(|(start_height, _)| fills.block_number >= start_height).unwrap_or(true);
+                    output_block_range.map(|(start_height, _)| fills.block_number >= start_height).unwrap_or(true);
+                ensure_output_ready_for_block(
+                    &args.output_parquet,
+                    &schema,
+                    fills.block_number,
+                    emit_rows,
+                    &mut writer,
+                    &mut current_tmp_output_path,
+                    &mut current_file_window_start,
+                    &mut current_row_group_window_start,
+                    &mut current_file_actual_start_block,
+                    last_emitted_block,
+                    &mut generated_output_files,
+                    &mut rows,
+                )?;
                 process_block(
                     fills.block_number,
                     fills.block_time_ms,
                     None,
                     Some(fills.fills),
                     emit_rows,
+                    emit_rows,
                     &mut rows,
                     &mut orders,
                     &mut cloid_to_oid,
                     &mut trigger_refs,
                     &mut known_non_trigger_oids,
-                    writer.as_mut().unwrap(),
-                    &schema,
+                    &mut unknown_oid_logger,
                 )?;
+                if emit_rows {
+                    last_emitted_block = Some(fills.block_number);
+                    if !warmup_end_logged
+                        && let (Some((warmup_start, _)), Some((output_start, _))) =
+                            (read_block_range, output_block_range)
+                        && warmup_start < output_start
+                    {
+                        eprintln!(
+                            "[warmup] end at block={} (output starts from block {})",
+                            fills.block_number, output_start
+                        );
+                        warmup_end_logged = true;
+                    }
+                }
                 processed_blocks += 1;
                 if processed_blocks % 100 == 0 {
                     eprintln!(
@@ -2538,14 +3423,60 @@ async fn main() -> Result<()> {
                 next_fills = fills_reader.next_batch().await?;
             }
             (Some(replica), None) => {
-                finalize_output(writer.take().unwrap(), &mut rows, &schema)?;
+                unknown_oid_logger.finish()?;
+                if let Some(active_writer) = writer.take() {
+                    let closed_start = current_file_actual_start_block.unwrap_or(replica.block_number);
+                    let closed_end = last_emitted_block.unwrap_or(replica.block_number);
+                    let tmp_path = current_tmp_output_path
+                        .take()
+                        .ok_or_else(|| anyhow!("missing current tmp parquet path at replica eof"))?;
+                    let final_path = close_and_finalize_output_file(
+                        &args.output_parquet,
+                        active_writer,
+                        &mut rows,
+                        &schema,
+                        &tmp_path,
+                        closed_start,
+                        closed_end,
+                    )?;
+                    generated_output_files.push(final_path.clone());
+                    eprintln!(
+                        "[file] close parquet={} actual_range={}..{}",
+                        final_path.display(),
+                        closed_start,
+                        closed_end
+                    );
+                }
                 bail!(
                     "node_fills_by_block hit EOF before replica_cmds; unpaired replica block {} remains",
                     replica.block_number
                 );
             }
             (None, Some(fills)) => {
-                finalize_output(writer.take().unwrap(), &mut rows, &schema)?;
+                unknown_oid_logger.finish()?;
+                if let Some(active_writer) = writer.take() {
+                    let closed_start = current_file_actual_start_block.unwrap_or(fills.block_number);
+                    let closed_end = last_emitted_block.unwrap_or(fills.block_number);
+                    let tmp_path = current_tmp_output_path
+                        .take()
+                        .ok_or_else(|| anyhow!("missing current tmp parquet path at fills eof"))?;
+                    let final_path = close_and_finalize_output_file(
+                        &args.output_parquet,
+                        active_writer,
+                        &mut rows,
+                        &schema,
+                        &tmp_path,
+                        closed_start,
+                        closed_end,
+                    )?;
+                    generated_output_files.push(final_path.clone());
+                    eprintln!(
+                        "[file] close parquet={} actual_range={}..{}",
+                        final_path.display(),
+                        closed_start,
+                        closed_end
+                    );
+                }
                 bail!(
                     "replica_cmds hit EOF before node_fills_by_block; unpaired fills block {} remains",
                     fills.block_number
@@ -2555,14 +3486,36 @@ async fn main() -> Result<()> {
         }
     }
 
-    finalize_output(writer.take().unwrap(), &mut rows, &schema)?;
+    unknown_oid_logger.finish()?;
+    if let Some(active_writer) = writer.take() {
+        let closed_start = current_file_actual_start_block.unwrap_or(0);
+        let closed_end = last_emitted_block.unwrap_or(0);
+        let tmp_path =
+            current_tmp_output_path.take().ok_or_else(|| anyhow!("missing current tmp parquet path at final close"))?;
+        let final_path = close_and_finalize_output_file(
+            &args.output_parquet,
+            active_writer,
+            &mut rows,
+            &schema,
+            &tmp_path,
+            closed_start,
+            closed_end,
+        )?;
+        generated_output_files.push(final_path.clone());
+        eprintln!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
+    }
 
     println!(
-        "Wrote BTC diff parquet to {}. requester_pays={}. Remaining live orders in memory at EOF: {}",
+        "Wrote BTC diff parquet files={} output_dir={} unknown_oid_sqlite={} requester_pays={} remaining_live_orders={}",
+        generated_output_files.len(),
         args.output_parquet.display(),
+        args.unknown_oid_log_sqlite.display(),
         requester_pays,
         orders.len()
     );
+    for path in &generated_output_files {
+        println!("  - {}", path.display());
+    }
 
     Ok(())
 }

@@ -18,7 +18,7 @@ lexical-core = "0.8.5"
 memchr = "2.7.4"
 futures-util = "0.3.31"
 rayon = "1.10"
-alloy = "1.0.22"
+alloy = "=1.0.22"
 reqwest = "0.12.22"
 yawc = { version = "0.2.6", features = ["axum"] }
 tokio-cron-scheduler = "0.13.0"
