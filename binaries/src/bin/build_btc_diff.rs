@@ -9,6 +9,7 @@ use std::fs::{File, create_dir_all, rename};
 use std::pin::Pin;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
@@ -38,7 +39,7 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader as TokioBufReader};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use lz4_parallel_common::{ParallelLz4LineReader, ParallelLz4ReaderConfig};
 
@@ -47,13 +48,10 @@ use crate::build_btc_diff_replica_day_index::{
     REPLICA_INDEX_START_DATE_YYYYMMDD, REPLICA_SNAPSHOT_DIRS,
 };
 
-const BTC_ASSET_ID: u64 = 0;
 const ROW_GROUP_BLOCKS: u64 = 10_000;
 const FILE_ROTATION_BLOCKS: u64 = 1_000_000;
 const PARQUET_MAX_ROW_GROUP_ROWS: usize = 10_000_000;
 const DECIMAL_PRECISION: u8 = 18;
-const PX_SCALE: i8 = 1;
-const SZ_SCALE: i8 = 5;
 const HOUR_MS: i64 = 3_600_000;
 const LIVE_STATE_TTL_MS: i64 = 24 * HOUR_MS;
 const UNKNOWN_OID_WINDOW_BLOCKS: u64 = 10_000;
@@ -79,9 +77,77 @@ const WARMUP_STATE_FORMAT_VERSION: u32 = 3;
 const WARMUP_STATE_ZSTD_LEVEL: i32 = 3;
 const DEFAULT_OUTPUT_DIR: &str = "/home/aimee/hyperliquid";
 const DEFAULT_UNKNOWN_OID_SQLITE_FILE: &str = "/home/aimee/hyperliquid/build_btc_diff_unknown_oid.sqlite";
-const PRIMARY_ASSET_SYMBOL: &str = "BTC";
+const DEFAULT_COIN_SYMBOL: &str = "BTC";
 const UPLOAD_BUCKET: &str = "hyper0";
 const UPLOAD_ROOT_PREFIX: &str = "hyperliquid";
+const UPLOAD_MAX_CONCURRENCY: usize = 8;
+
+#[derive(Debug, Clone, Copy)]
+struct CoinConfig {
+    symbol: &'static str,
+    asset_id: u64,
+    px_scale: i8,
+    sz_scale: i8,
+}
+
+const SUPPORTED_COINS: [CoinConfig; 4] = [
+    CoinConfig {
+        symbol: "BTC",
+        asset_id: 0,
+        px_scale: 1,
+        sz_scale: 5,
+    },
+    CoinConfig {
+        symbol: "ETH",
+        asset_id: 1,
+        px_scale: 3,
+        sz_scale: 4,
+    },
+    CoinConfig {
+        symbol: "SOL",
+        asset_id: 5,
+        px_scale: 3,
+        sz_scale: 2,
+    },
+    CoinConfig {
+        symbol: "HYPE",
+        asset_id: 150,
+        px_scale: 4,
+        sz_scale: 2,
+    },
+];
+
+fn coin_config_by_symbol(raw: &str) -> Option<CoinConfig> {
+    let normalized = raw.trim().to_ascii_uppercase();
+    SUPPORTED_COINS
+        .iter()
+        .copied()
+        .find(|coin| coin.symbol == normalized)
+}
+
+fn parse_coin_configs(raw: &str) -> Result<Vec<CoinConfig>> {
+    let mut seen_symbols: HashSet<&'static str> = HashSet::new();
+    let mut selected = Vec::new();
+    for token in raw
+        .split(|ch: char| ch == ',' || ch == '+' || ch.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let coin = coin_config_by_symbol(token).ok_or_else(|| {
+            anyhow!(
+                "unsupported --coin '{}'; supported: BTC, ETH, SOL, HYPE",
+                token
+            )
+        })?;
+        if seen_symbols.insert(coin.symbol) {
+            selected.push(coin);
+        }
+    }
+    if selected.is_empty() {
+        bail!("--coin cannot be empty; supported: BTC, ETH, SOL, HYPE");
+    }
+    Ok(selected)
+}
 
 fn parse_height_span(raw: &str) -> std::result::Result<u64, String> {
     let trimmed = raw.trim();
@@ -140,6 +206,13 @@ struct Args {
 
     #[arg(long, default_value = DEFAULT_UNKNOWN_OID_SQLITE_FILE)]
     unknown_oid_log_sqlite: PathBuf,
+
+    #[arg(
+        long,
+        default_value = DEFAULT_COIN_SYMBOL,
+        help = "Target coin set (supported: BTC, ETH, SOL, HYPE). Accepts comma or plus separators, e.g. BTC,ETH or BTC+ETH"
+    )]
+    coin: String,
 
     #[arg(
         long,
@@ -544,6 +617,7 @@ struct FillEvent {
 
 #[derive(Debug, Clone)]
 struct FillRecord {
+    asset_id: u64,
     block_number: u64,
     block_time_ms: i64,
     user: String,
@@ -615,21 +689,34 @@ struct StalePruneRun {
 }
 
 #[derive(Debug)]
-struct UnknownOidWindowLogger {
-    conn: Connection,
-    enabled: bool,
-    current_window_start: Option<u64>,
+struct UnknownOidWindowPayload {
+    asset_symbol: String,
+    window_start_block: u64,
     stats: UnknownOidWindowStats,
     samples: Vec<UnknownOidSample>,
     stale_prune_runs: Vec<StalePruneRun>,
 }
 
-impl UnknownOidWindowLogger {
-    fn new(path: &PathBuf) -> Result<Self> {
-        let conn = Connection::open(path)
-            .with_context(|| format!("failed to open unknown oid sqlite for read/write: {}", path.display()))?;
-        conn.execute_batch(
-            r#"
+#[derive(Debug)]
+enum UnknownOidSqliteTask {
+    Flush(UnknownOidWindowPayload),
+    Shutdown,
+}
+
+#[derive(Clone, Debug)]
+struct UnknownOidSqliteSender {
+    tx: std_mpsc::Sender<UnknownOidSqliteTask>,
+}
+
+#[derive(Debug)]
+struct UnknownOidSqliteWorker {
+    tx: Option<std_mpsc::Sender<UnknownOidSqliteTask>>,
+    handle: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+fn init_unknown_oid_sqlite_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA busy_timeout=5000;
@@ -702,8 +789,8 @@ CREATE TABLE IF NOT EXISTS stale_prune_samples (
 CREATE INDEX IF NOT EXISTS idx_stale_prune_samples_oid ON stale_prune_samples(oid);
 CREATE INDEX IF NOT EXISTS idx_stale_prune_samples_created_block ON stale_prune_samples(created_block_number);
 "#,
-        )
-        .context("initializing unknown oid sqlite schema")?;
+    )
+    .context("initializing unknown oid sqlite schema")?;
     conn.execute_batch(
         r#"
 CREATE INDEX IF NOT EXISTS idx_unknown_oid_windows_asset_start ON unknown_oid_windows(asset_symbol, window_start_block);
@@ -713,15 +800,189 @@ CREATE INDEX IF NOT EXISTS idx_stale_prune_samples_asset_window_run_seq ON stale
 "#,
     )
     .context("initializing unknown oid sqlite asset indexes")?;
+    Ok(())
+}
 
-        Ok(Self {
-            conn,
+fn persist_unknown_oid_window_payload(conn: &mut Connection, payload: UnknownOidWindowPayload) -> Result<()> {
+    let window_start_block = payload.window_start_block;
+    let window_end_block = window_start_block + UNKNOWN_OID_WINDOW_BLOCKS - 1;
+
+    let tx = conn.transaction().context("begin unknown oid sqlite txn")?;
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO unknown_oid_windows (
+            asset_symbol, window_start_block, window_end_block, window_type,
+            unknown_cancel_total, unknown_modify_total,
+            unresolved_user_cloid_cancel, unresolved_user_cloid_modify,
+            sampled, sample_dropped, stale_prune_runs
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            payload.asset_symbol.as_str(),
+            i64::try_from(window_start_block)?,
+            i64::try_from(window_end_block)?,
+            "unknown_oid_window_v4_sqlite_asset",
+            i64::try_from(payload.stats.unknown_cancel_total)?,
+            i64::try_from(payload.stats.unknown_modify_total)?,
+            i64::try_from(payload.stats.unresolved_user_cloid_cancel)?,
+            i64::try_from(payload.stats.unresolved_user_cloid_modify)?,
+            i64::try_from(payload.stats.sampled)?,
+            i64::try_from(payload.stats.sample_dropped)?,
+            i64::try_from(payload.stale_prune_runs.len())?,
+        ],
+    )?;
+
+    if inserted == 0 {
+        warn!(
+            "[warn] unknown-oid sqlite conflict at window_start_block={} (already exists); skipping this window",
+            window_start_block
+        );
+        tx.commit()?;
+        return Ok(());
+    }
+
+    for (seq, sample) in payload.samples.iter().enumerate() {
+        tx.execute(
+            "INSERT OR IGNORE INTO unknown_oid_samples (
+                asset_symbol, window_start_block, seq, block_number, block_time_ms,
+                event, phase, reason, user_addr, ref_kind, ref_oid, ref_cloid, mapped_oid
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                payload.asset_symbol.as_str(),
+                i64::try_from(window_start_block)?,
+                i64::try_from(seq)?,
+                i64::try_from(sample.block_number)?,
+                sample.block_time_ms,
+                sample.event,
+                sample.phase,
+                sample.reason,
+                sample.user.as_deref(),
+                sample.ref_kind,
+                sample.ref_oid.map(i64::try_from).transpose()?,
+                sample.ref_cloid.as_deref(),
+                sample.mapped_oid.map(i64::try_from).transpose()?,
+            ],
+        )?;
+    }
+
+    for (run_seq, run) in payload.stale_prune_runs.iter().enumerate() {
+        tx.execute(
+            "INSERT OR IGNORE INTO stale_prune_runs (
+                asset_symbol, window_start_block, run_seq, trigger_block_number, trigger_block_time_ms,
+                cutoff_time_ms, pruned_total, sampled, sample_dropped
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                payload.asset_symbol.as_str(),
+                i64::try_from(window_start_block)?,
+                i64::try_from(run_seq)?,
+                i64::try_from(run.trigger_block_number)?,
+                run.trigger_block_time_ms,
+                run.cutoff_time_ms,
+                i64::try_from(run.pruned_total)?,
+                i64::try_from(run.sampled)?,
+                i64::try_from(run.sample_dropped)?,
+            ],
+        )?;
+
+        for (sample_seq, sample) in run.samples.iter().enumerate() {
+            tx.execute(
+                "INSERT OR IGNORE INTO stale_prune_samples (
+                    asset_symbol, window_start_block, run_seq, sample_seq, oid, user_addr, cloid,
+                    created_block_number, created_time_ms, pruned_at_block_number, pruned_at_time_ms, age_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    payload.asset_symbol.as_str(),
+                    i64::try_from(window_start_block)?,
+                    i64::try_from(run_seq)?,
+                    i64::try_from(sample_seq)?,
+                    i64::try_from(sample.oid)?,
+                    sample.user.as_str(),
+                    sample.cloid.as_deref(),
+                    i64::try_from(sample.created_block_number)?,
+                    sample.created_time_ms,
+                    i64::try_from(sample.pruned_at_block_number)?,
+                    sample.pruned_at_time_ms,
+                    sample.age_ms,
+                ],
+            )?;
+        }
+    }
+
+    tx.commit().context("commit unknown oid sqlite txn")?;
+    Ok(())
+}
+
+impl UnknownOidSqliteWorker {
+    fn start(path: &Path) -> Result<Self> {
+        let (tx, rx) = std_mpsc::channel::<UnknownOidSqliteTask>();
+        let sqlite_path = path.to_path_buf();
+        let handle = std::thread::spawn(move || -> Result<()> {
+            let mut conn = Connection::open(&sqlite_path)
+                .with_context(|| format!("failed to open unknown oid sqlite for read/write: {}", sqlite_path.display()))?;
+            init_unknown_oid_sqlite_schema(&conn)?;
+            while let Ok(task) = rx.recv() {
+                match task {
+                    UnknownOidSqliteTask::Flush(payload) => persist_unknown_oid_window_payload(&mut conn, payload)?,
+                    UnknownOidSqliteTask::Shutdown => break,
+                }
+            }
+            Ok(())
+        });
+        Ok(Self { tx: Some(tx), handle: Some(handle) })
+    }
+
+    fn sender(&self) -> UnknownOidSqliteSender {
+        UnknownOidSqliteSender {
+            tx: self
+                .tx
+                .as_ref()
+                .expect("sqlite worker sender should exist while worker is alive")
+                .clone(),
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(tx) = self.tx.take() {
+            drop(tx.send(UnknownOidSqliteTask::Shutdown));
+        }
+        if let Some(handle) = self.handle.take() {
+            match handle.join() {
+                Ok(result) => result?,
+                Err(_) => bail!("unknown oid sqlite worker thread panicked"),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for UnknownOidSqliteWorker {
+    fn drop(&mut self) {
+        if let Err(err) = self.finish() {
+            warn!("[warn] failed to finish unknown oid sqlite worker cleanly: {}", err);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UnknownOidWindowLogger {
+    sender: UnknownOidSqliteSender,
+    asset_symbol: String,
+    enabled: bool,
+    current_window_start: Option<u64>,
+    stats: UnknownOidWindowStats,
+    samples: Vec<UnknownOidSample>,
+    stale_prune_runs: Vec<StalePruneRun>,
+}
+
+impl UnknownOidWindowLogger {
+    fn new(asset_symbol: &str, sender: UnknownOidSqliteSender) -> Self {
+        Self {
+            sender,
+            asset_symbol: asset_symbol.to_owned(),
             enabled: true,
             current_window_start: None,
             stats: UnknownOidWindowStats::default(),
             samples: Vec::new(),
             stale_prune_runs: Vec::new(),
-        })
+        }
     }
 
     fn set_enabled(&mut self, enabled: bool) {
@@ -791,111 +1052,19 @@ CREATE INDEX IF NOT EXISTS idx_stale_prune_samples_asset_window_run_seq ON stale
         let Some(window_start_block) = self.current_window_start else {
             return Ok(());
         };
-        let window_end_block = window_start_block + UNKNOWN_OID_WINDOW_BLOCKS - 1;
         let stats = std::mem::take(&mut self.stats);
         let samples = std::mem::take(&mut self.samples);
         let stale_prune_runs = std::mem::take(&mut self.stale_prune_runs);
-
-        let tx = self.conn.transaction().context("begin unknown oid sqlite txn")?;
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO unknown_oid_windows (
-                asset_symbol, window_start_block, window_end_block, window_type,
-                unknown_cancel_total, unknown_modify_total,
-                unresolved_user_cloid_cancel, unresolved_user_cloid_modify,
-                sampled, sample_dropped, stale_prune_runs
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                PRIMARY_ASSET_SYMBOL,
-                i64::try_from(window_start_block)?,
-                i64::try_from(window_end_block)?,
-                "unknown_oid_window_v4_sqlite_asset",
-                i64::try_from(stats.unknown_cancel_total)?,
-                i64::try_from(stats.unknown_modify_total)?,
-                i64::try_from(stats.unresolved_user_cloid_cancel)?,
-                i64::try_from(stats.unresolved_user_cloid_modify)?,
-                i64::try_from(stats.sampled)?,
-                i64::try_from(stats.sample_dropped)?,
-                i64::try_from(stale_prune_runs.len())?,
-            ],
-        )?;
-
-        if inserted == 0 {
-            warn!(
-                "[warn] unknown-oid sqlite conflict at window_start_block={} (already exists); skipping this window",
-                window_start_block
-            );
-            tx.commit()?;
-            return Ok(());
-        }
-
-        for (seq, sample) in samples.iter().enumerate() {
-            tx.execute(
-                "INSERT OR IGNORE INTO unknown_oid_samples (
-                    asset_symbol, window_start_block, seq, block_number, block_time_ms,
-                    event, phase, reason, user_addr, ref_kind, ref_oid, ref_cloid, mapped_oid
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    PRIMARY_ASSET_SYMBOL,
-                    i64::try_from(window_start_block)?,
-                    i64::try_from(seq)?,
-                    i64::try_from(sample.block_number)?,
-                    sample.block_time_ms,
-                    sample.event,
-                    sample.phase,
-                    sample.reason,
-                    sample.user.as_deref(),
-                    sample.ref_kind,
-                    sample.ref_oid.map(i64::try_from).transpose()?,
-                    sample.ref_cloid.as_deref(),
-                    sample.mapped_oid.map(i64::try_from).transpose()?,
-                ],
-            )?;
-        }
-
-        for (run_seq, run) in stale_prune_runs.iter().enumerate() {
-            tx.execute(
-                "INSERT OR IGNORE INTO stale_prune_runs (
-                    asset_symbol, window_start_block, run_seq, trigger_block_number, trigger_block_time_ms,
-                    cutoff_time_ms, pruned_total, sampled, sample_dropped
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    PRIMARY_ASSET_SYMBOL,
-                    i64::try_from(window_start_block)?,
-                    i64::try_from(run_seq)?,
-                    i64::try_from(run.trigger_block_number)?,
-                    run.trigger_block_time_ms,
-                    run.cutoff_time_ms,
-                    i64::try_from(run.pruned_total)?,
-                    i64::try_from(run.sampled)?,
-                    i64::try_from(run.sample_dropped)?,
-                ],
-            )?;
-
-            for (sample_seq, sample) in run.samples.iter().enumerate() {
-                tx.execute(
-                    "INSERT OR IGNORE INTO stale_prune_samples (
-                        asset_symbol, window_start_block, run_seq, sample_seq, oid, user_addr, cloid,
-                        created_block_number, created_time_ms, pruned_at_block_number, pruned_at_time_ms, age_ms
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![
-                        PRIMARY_ASSET_SYMBOL,
-                        i64::try_from(window_start_block)?,
-                        i64::try_from(run_seq)?,
-                        i64::try_from(sample_seq)?,
-                        i64::try_from(sample.oid)?,
-                        sample.user.as_str(),
-                        sample.cloid.as_deref(),
-                        i64::try_from(sample.created_block_number)?,
-                        sample.created_time_ms,
-                        i64::try_from(sample.pruned_at_block_number)?,
-                        sample.pruned_at_time_ms,
-                        sample.age_ms,
-                    ],
-                )?;
-            }
-        }
-
-        tx.commit().context("commit unknown oid sqlite txn")?;
+        self.sender
+            .tx
+            .send(UnknownOidSqliteTask::Flush(UnknownOidWindowPayload {
+                asset_symbol: self.asset_symbol.clone(),
+                window_start_block,
+                stats,
+                samples,
+                stale_prune_runs,
+            }))
+            .map_err(|_| anyhow!("unknown oid sqlite worker stopped unexpectedly"))?;
         Ok(())
     }
 
@@ -935,6 +1104,7 @@ struct NodeFillsBatch {
 #[derive(Debug)]
 enum CmdEvent {
     Add {
+        asset_id: u64,
         user: String,
         oid: u64,
         cloid: Option<String>,
@@ -945,11 +1115,13 @@ enum CmdEvent {
         meta: OrderMeta,
     },
     Cancel {
+        asset_id: u64,
         user: Option<String>,
         order_ref: OrderRef,
         fallback_on_missing: bool,
     },
     Modify {
+        asset_id: u64,
         user: String,
         old_order_ref: OrderRef,
         new_oid: Option<u64>,
@@ -961,26 +1133,44 @@ enum CmdEvent {
         meta: OrderMeta,
     },
     TrackTriggerAdd {
+        asset_id: u64,
         user: String,
         oid: u64,
         cloid: Option<String>,
     },
     TrackTriggerPending {
+        asset_id: u64,
         user: String,
         cloid: Option<String>,
     },
     TrackTriggerModify {
+        asset_id: u64,
         user: String,
         old_order_ref: OrderRef,
         new_oid: Option<u64>,
         new_cloid: Option<String>,
     },
     Skipped {
+        asset_id: u64,
         user: Option<String>,
         oid: Option<u64>,
         event: String,
         status: String,
     },
+}
+
+impl CmdEvent {
+    fn asset_id(&self) -> u64 {
+        match self {
+            CmdEvent::Add { asset_id, .. }
+            | CmdEvent::Cancel { asset_id, .. }
+            | CmdEvent::Modify { asset_id, .. }
+            | CmdEvent::TrackTriggerAdd { asset_id, .. }
+            | CmdEvent::TrackTriggerPending { asset_id, .. }
+            | CmdEvent::TrackTriggerModify { asset_id, .. }
+            | CmdEvent::Skipped { asset_id, .. } => *asset_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1022,7 +1212,7 @@ struct WarmupAssetSnapshot {
     trigger_refs: TriggerOrderRefs,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WarmupStateSnapshot {
     format_version: u32,
     checkpoint_block_number: u64,
@@ -1071,7 +1261,7 @@ impl RowBuffer {
         self.rows.len()
     }
 
-    fn take_batch(&mut self, schema: &Arc<Schema>) -> Result<Option<RecordBatch>> {
+    fn take_batch(&mut self, schema: &Arc<Schema>, px_scale: i8, sz_scale: i8) -> Result<Option<RecordBatch>> {
         if self.rows.is_empty() {
             return Ok(None);
         }
@@ -1084,27 +1274,27 @@ impl RowBuffer {
         let mut oid = Int64Builder::with_capacity(self.rows.len());
         let mut side = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 4);
         let mut px = Decimal128Builder::with_capacity(self.rows.len())
-            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, PX_SCALE));
+            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, px_scale));
         let mut diff_type = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 16);
         let mut event = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 16);
         let mut sz = Decimal128Builder::with_capacity(self.rows.len())
-            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, SZ_SCALE));
+            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, sz_scale));
         let mut orig_sz = Decimal128Builder::with_capacity(self.rows.len())
-            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, SZ_SCALE));
+            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, sz_scale));
         let mut raw_sz = Decimal128Builder::with_capacity(self.rows.len())
-            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, SZ_SCALE));
+            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, sz_scale));
         let mut is_trigger = BooleanBuilder::with_capacity(self.rows.len());
         let mut tif = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 8);
         let mut reduce_only = BooleanBuilder::with_capacity(self.rows.len());
         let mut order_type = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 16);
         let mut trigger_condition = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 24);
         let mut trigger_px = Decimal128Builder::with_capacity(self.rows.len())
-            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, PX_SCALE));
+            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, px_scale));
         let mut is_position_tpsl = BooleanBuilder::with_capacity(self.rows.len());
         let mut tp_trigger_px = Decimal128Builder::with_capacity(self.rows.len())
-            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, PX_SCALE));
+            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, px_scale));
         let mut sl_trigger_px = Decimal128Builder::with_capacity(self.rows.len())
-            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, PX_SCALE));
+            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, px_scale));
         let mut status = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 24);
         let mut lifetime = Int32Builder::with_capacity(self.rows.len());
 
@@ -1122,21 +1312,21 @@ impl RowBuffer {
                 None => side.append_null(),
             }
             match row.px {
-                Some(value) => px.append_value(decimal_to_i128(value, PX_SCALE)),
+                Some(value) => px.append_value(decimal_to_i128(value, px_scale)),
                 None => px.append_null(),
             }
             diff_type.append_value(&row.diff_type);
             event.append_value(&row.event);
             match row.sz {
-                Some(value) => sz.append_value(decimal_to_i128(value, SZ_SCALE)),
+                Some(value) => sz.append_value(decimal_to_i128(value, sz_scale)),
                 None => sz.append_null(),
             }
             match row.orig_sz {
-                Some(value) => orig_sz.append_value(decimal_to_i128(value, SZ_SCALE)),
+                Some(value) => orig_sz.append_value(decimal_to_i128(value, sz_scale)),
                 None => orig_sz.append_null(),
             }
             match row.raw_sz {
-                Some(value) => raw_sz.append_value(decimal_to_i128(value, SZ_SCALE)),
+                Some(value) => raw_sz.append_value(decimal_to_i128(value, sz_scale)),
                 None => raw_sz.append_null(),
             }
             match row.is_trigger {
@@ -1160,7 +1350,7 @@ impl RowBuffer {
                 None => trigger_condition.append_null(),
             }
             match row.trigger_px {
-                Some(value) => trigger_px.append_value(decimal_to_i128(value, PX_SCALE)),
+                Some(value) => trigger_px.append_value(decimal_to_i128(value, px_scale)),
                 None => trigger_px.append_null(),
             }
             match row.is_position_tpsl {
@@ -1168,11 +1358,11 @@ impl RowBuffer {
                 None => is_position_tpsl.append_null(),
             }
             match row.tp_trigger_px {
-                Some(value) => tp_trigger_px.append_value(decimal_to_i128(value, PX_SCALE)),
+                Some(value) => tp_trigger_px.append_value(decimal_to_i128(value, px_scale)),
                 None => tp_trigger_px.append_null(),
             }
             match row.sl_trigger_px {
-                Some(value) => sl_trigger_px.append_value(decimal_to_i128(value, PX_SCALE)),
+                Some(value) => sl_trigger_px.append_value(decimal_to_i128(value, px_scale)),
                 None => sl_trigger_px.append_null(),
             }
             match row.status {
@@ -1984,6 +2174,7 @@ impl Lz4JsonLineReader {
 struct NodeFillsReader {
     reader: Lz4JsonLineReader,
     block_range: Option<(u64, u64)>,
+    target_asset_ids: HashSet<u64>,
 }
 
 impl NodeFillsReader {
@@ -1992,8 +2183,13 @@ impl NodeFillsReader {
         s3_client: Option<Arc<S3Client>>,
         requester_pays: bool,
         block_range: Option<(u64, u64)>,
+        target_asset_ids: HashSet<u64>,
     ) -> Result<Self> {
-        Ok(Self { reader: Lz4JsonLineReader::new(source, s3_client, requester_pays).await?, block_range })
+        Ok(Self {
+            reader: Lz4JsonLineReader::new(source, s3_client, requester_pays).await?,
+            block_range,
+            target_asset_ids,
+        })
     }
 
     async fn next_batch(&mut self) -> Result<Option<NodeFillsBatch>> {
@@ -2016,11 +2212,15 @@ impl NodeFillsReader {
         let (block_time_ns, block_time_ms) = parse_timestamp_ns_ms(&block.block_time)?;
         let mut fills = Vec::with_capacity(block.events.len());
         for (address, event) in block.events {
-            if event.coin != "BTC" {
+            let Some(coin) = coin_config_by_symbol(&event.coin) else {
+                continue;
+            };
+            if !self.target_asset_ids.contains(&coin.asset_id) {
                 continue;
             }
 
             fills.push(FillRecord {
+                asset_id: coin.asset_id,
                 block_number: block.block_number,
                 block_time_ms,
                 user: address,
@@ -2539,12 +2739,12 @@ impl ReplicaCmdsReader {
         }
     }
 
-    fn parse_raw_line(line: &mut Vec<u8>) -> Result<ReplicaBatch> {
+    fn parse_raw_line(line: &mut Vec<u8>, target_asset_ids: &HashSet<u64>) -> Result<ReplicaBatch> {
         let replica = parse_json_line::<ReplicaLine>(line)?;
-        Self::parse_replica_line(replica)
+        Self::parse_replica_line(replica, target_asset_ids)
     }
 
-    fn parse_replica_line(replica: ReplicaLine) -> Result<ReplicaBatch> {
+    fn parse_replica_line(replica: ReplicaLine, target_asset_ids: &HashSet<u64>) -> Result<ReplicaBatch> {
         let (block_time_ns, block_time_ms) = parse_timestamp_ns_ms(&replica.abci_block.time)?;
         let block_number = 0_u64;
 
@@ -2570,7 +2770,7 @@ impl ReplicaCmdsReader {
                             let Some((asset, side, px, sz, cloid, meta)) = parse_order_fields(order) else {
                                 continue;
                             };
-                            if asset != BTC_ASSET_ID {
+                            if !target_asset_ids.contains(&asset) {
                                 continue;
                             }
                             let Some(user) = response_item.user.clone() else {
@@ -2584,9 +2784,9 @@ impl ReplicaCmdsReader {
                             let oid = oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
                             if meta.is_trigger {
                                 if let Some(oid) = oid {
-                                    events.push(CmdEvent::TrackTriggerAdd { user, oid, cloid });
+                                    events.push(CmdEvent::TrackTriggerAdd { asset_id: asset, user, oid, cloid });
                                 } else if is_pending_trigger_status(status) {
-                                    events.push(CmdEvent::TrackTriggerPending { user, cloid });
+                                    events.push(CmdEvent::TrackTriggerPending { asset_id: asset, user, cloid });
                                 }
                                 continue;
                             }
@@ -2601,6 +2801,7 @@ impl ReplicaCmdsReader {
                             match parse_booked_and_raw_sz(sz, status) {
                                 BookedSzDecision::Booked { booked_sz, raw_sz } => {
                                     events.push(CmdEvent::Add {
+                                        asset_id: asset,
                                         user,
                                         oid,
                                         cloid,
@@ -2614,6 +2815,7 @@ impl ReplicaCmdsReader {
                                 BookedSzDecision::FullyFilled => continue,
                                 BookedSzDecision::InvalidFilledTotalSz => {
                                     events.push(CmdEvent::Skipped {
+                                        asset_id: asset,
                                         user: Some(user),
                                         oid: Some(oid),
                                         event: "add".to_owned(),
@@ -2642,7 +2844,7 @@ impl ReplicaCmdsReader {
                                 continue;
                             };
 
-                            if asset != BTC_ASSET_ID {
+                            if !target_asset_ids.contains(&asset) {
                                 continue;
                             }
                             let Some(order_ref) = order_ref else {
@@ -2653,6 +2855,7 @@ impl ReplicaCmdsReader {
                             }
 
                             events.push(CmdEvent::Cancel {
+                                asset_id: asset,
                                 user: response_item.user.clone(),
                                 order_ref,
                                 fallback_on_missing: true,
@@ -2666,7 +2869,7 @@ impl ReplicaCmdsReader {
                         let Some((asset, side, px, sz, new_cloid, meta)) = parse_order_fields(order) else {
                             continue;
                         };
-                        if asset != BTC_ASSET_ID {
+                        if !target_asset_ids.contains(&asset) {
                             continue;
                         }
                         let Some(user) = response_item.user.clone() else {
@@ -2702,6 +2905,7 @@ impl ReplicaCmdsReader {
                                     );
                                 }
                                 events.push(CmdEvent::Cancel {
+                                    asset_id: asset,
                                     user: Some(user.clone()),
                                     order_ref: old_order_ref,
                                     fallback_on_missing: true,
@@ -2714,7 +2918,13 @@ impl ReplicaCmdsReader {
                         let oid_from_filled = status.filled_oid();
                         if meta.is_trigger {
                             let new_oid = oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
-                            events.push(CmdEvent::TrackTriggerModify { user, old_order_ref, new_oid, new_cloid });
+                            events.push(CmdEvent::TrackTriggerModify {
+                                asset_id: asset,
+                                user,
+                                old_order_ref,
+                                new_oid,
+                                new_cloid,
+                            });
                             continue;
                         }
 
@@ -2728,6 +2938,7 @@ impl ReplicaCmdsReader {
                             new_oid = None;
                         }
                         events.push(CmdEvent::Modify {
+                            asset_id: asset,
                             user: user.clone(),
                             old_order_ref,
                             new_oid,
@@ -2741,6 +2952,7 @@ impl ReplicaCmdsReader {
 
                         if invalid_filled_total_sz {
                             events.push(CmdEvent::Skipped {
+                                asset_id: asset,
                                 user: Some(user),
                                 oid: oid_from_resting.or(oid_from_filled),
                                 event: "modify".to_owned(),
@@ -2759,7 +2971,7 @@ impl ReplicaCmdsReader {
                             let Some((asset, side, px, sz, new_cloid, meta)) = parse_order_fields(order) else {
                                 continue;
                             };
-                            if asset != BTC_ASSET_ID {
+                            if !target_asset_ids.contains(&asset) {
                                 continue;
                             }
                             let Some(user) = response_item.user.clone() else {
@@ -2794,6 +3006,7 @@ impl ReplicaCmdsReader {
                                     );
                                 }
                                 events.push(CmdEvent::Cancel {
+                                    asset_id: asset,
                                     user: Some(user),
                                     order_ref: old_order_ref,
                                     fallback_on_missing: true,
@@ -2809,7 +3022,13 @@ impl ReplicaCmdsReader {
                             let oid_from_filled = status.filled_oid();
                             if meta.is_trigger {
                                 let new_oid = oid_from_resting.or_else(|| if is_gtc { oid_from_filled } else { None });
-                                events.push(CmdEvent::TrackTriggerModify { user, old_order_ref, new_oid, new_cloid });
+                                events.push(CmdEvent::TrackTriggerModify {
+                                    asset_id: asset,
+                                    user,
+                                    old_order_ref,
+                                    new_oid,
+                                    new_cloid,
+                                });
                                 continue;
                             }
 
@@ -2823,6 +3042,7 @@ impl ReplicaCmdsReader {
                                 new_oid = None;
                             }
                             events.push(CmdEvent::Modify {
+                                asset_id: asset,
                                 user: user.clone(),
                                 old_order_ref,
                                 new_oid,
@@ -2836,6 +3056,7 @@ impl ReplicaCmdsReader {
 
                             if invalid_filled_total_sz {
                                 events.push(CmdEvent::Skipped {
+                                    asset_id: asset,
                                     user: Some(user),
                                     oid: oid_from_resting.or(oid_from_filled),
                                     event: "modify".to_owned(),
@@ -2886,6 +3107,7 @@ impl ReplicaPrefetchReader {
         source: ReaderSource,
         s3_client: Option<Arc<S3Client>>,
         requester_pays: bool,
+        target_asset_ids: HashSet<u64>,
         queue_depth: usize,
         requested_json_workers: usize,
         requested_lz4_workers: usize,
@@ -2955,6 +3177,7 @@ impl ReplicaPrefetchReader {
         .await?;
         let (tx, rx) = mpsc::channel(channel_capacity);
         let worker = tokio::spawn(async move {
+            let target_asset_ids = Arc::new(target_asset_ids);
             let parser_result_capacity = channel_capacity.max(effective_workers);
             let per_worker_capacity = (parser_result_capacity / effective_workers).max(1);
             let (result_tx, mut result_rx) = mpsc::channel::<ReplicaParseResult>(parser_result_capacity);
@@ -2964,10 +3187,12 @@ impl ReplicaPrefetchReader {
                 let (task_tx, mut task_rx) = mpsc::channel::<ReplicaParseTask>(per_worker_capacity);
                 task_txs.push(task_tx);
                 let worker_result_tx = result_tx.clone();
+                let worker_target_asset_ids = Arc::clone(&target_asset_ids);
                 tokio::spawn(async move {
                     while let Some(mut task) = task_rx.recv().await {
                         let parse_started_at = Instant::now();
-                        let parsed = ReplicaCmdsReader::parse_raw_line(&mut task.line);
+                        let parsed =
+                            ReplicaCmdsReader::parse_raw_line(&mut task.line, worker_target_asset_ids.as_ref());
                         let parse_ns = parse_started_at.elapsed().as_nanos();
                         task.line.clear();
                         if worker_result_tx
@@ -3093,7 +3318,7 @@ impl Drop for ReplicaPrefetchReader {
     }
 }
 
-fn output_schema() -> Arc<Schema> {
+fn output_schema(px_scale: i8, sz_scale: i8) -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("block_number", DataType::Int64, false),
         Field::new("block_time", DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())), false),
@@ -3101,21 +3326,21 @@ fn output_schema() -> Arc<Schema> {
         Field::new("user", DataType::Utf8, false),
         Field::new("oid", DataType::Int64, true),
         Field::new("side", DataType::Utf8, true),
-        Field::new("px", DataType::Decimal128(DECIMAL_PRECISION, PX_SCALE), true),
+        Field::new("px", DataType::Decimal128(DECIMAL_PRECISION, px_scale), true),
         Field::new("diff_type", DataType::Utf8, false),
         Field::new("event", DataType::Utf8, false),
-        Field::new("sz", DataType::Decimal128(DECIMAL_PRECISION, SZ_SCALE), true),
-        Field::new("orig_sz", DataType::Decimal128(DECIMAL_PRECISION, SZ_SCALE), true),
-        Field::new("raw_sz", DataType::Decimal128(DECIMAL_PRECISION, SZ_SCALE), true),
+        Field::new("sz", DataType::Decimal128(DECIMAL_PRECISION, sz_scale), true),
+        Field::new("orig_sz", DataType::Decimal128(DECIMAL_PRECISION, sz_scale), true),
+        Field::new("raw_sz", DataType::Decimal128(DECIMAL_PRECISION, sz_scale), true),
         Field::new("is_trigger", DataType::Boolean, true),
         Field::new("tif", DataType::Utf8, true),
         Field::new("reduce_only", DataType::Boolean, true),
         Field::new("order_type", DataType::Utf8, true),
         Field::new("trigger_condition", DataType::Utf8, true),
-        Field::new("trigger_px", DataType::Decimal128(DECIMAL_PRECISION, PX_SCALE), true),
+        Field::new("trigger_px", DataType::Decimal128(DECIMAL_PRECISION, px_scale), true),
         Field::new("is_position_tpsl", DataType::Boolean, true),
-        Field::new("tp_trigger_px", DataType::Decimal128(DECIMAL_PRECISION, PX_SCALE), true),
-        Field::new("sl_trigger_px", DataType::Decimal128(DECIMAL_PRECISION, PX_SCALE), true),
+        Field::new("tp_trigger_px", DataType::Decimal128(DECIMAL_PRECISION, px_scale), true),
+        Field::new("sl_trigger_px", DataType::Decimal128(DECIMAL_PRECISION, px_scale), true),
         Field::new("status", DataType::Utf8, true),
         Field::new("lifetime", DataType::Int32, true),
     ]))
@@ -3423,6 +3648,7 @@ fn rebuild_trigger_created_queue(trigger_refs: &mut TriggerOrderRefs) {
 
 fn push_add_row(
     rows: &mut RowBuffer,
+    coin_symbol: &str,
     block_number: u64,
     block_time_ms: i64,
     user: &str,
@@ -3436,7 +3662,7 @@ fn push_add_row(
     rows.push(OutputRow {
         block_number: i64::try_from(block_number)?,
         block_time_ms,
-        coin: "BTC".to_owned(),
+        coin: coin_symbol.to_owned(),
         user: user.to_owned(),
         oid: Some(i64::try_from(oid)?),
         side: Some(side.to_owned()),
@@ -3468,10 +3694,12 @@ struct BlockPruneStats {
 }
 
 fn process_block(
+    coin_symbol: &str,
+    target_asset_id: u64,
     block_number: u64,
     block_time_ms: i64,
-    cmd_events: Option<Vec<CmdEvent>>,
-    fills: Option<Vec<FillRecord>>,
+    cmd_events: Option<&[CmdEvent]>,
+    fills: Option<&[FillRecord]>,
     emit_rows: bool,
     emit_json_logs: bool,
     rows: &mut RowBuffer,
@@ -3504,9 +3732,12 @@ fn process_block(
         let cmd_started_at = Instant::now();
         let mut canceled_oids_in_block: HashSet<u64> = HashSet::new();
         let mut deferred_cancels: Vec<(Option<String>, OrderRef, bool)> = Vec::new();
-        for event in &events {
+        for event in events {
             match event {
-                CmdEvent::Add { user, oid, cloid, side, px, sz, raw_sz, meta } => {
+                CmdEvent::Add { asset_id, user, oid, cloid, side, px, sz, raw_sz, meta } => {
+                    if *asset_id != target_asset_id {
+                        continue;
+                    }
                     insert_live_order(
                         orders,
                         cloid_to_oid,
@@ -3522,10 +3753,30 @@ fn process_block(
                         meta,
                     );
                     if emit_rows {
-                        push_add_row(rows, block_number, block_time_ms, user, *oid, side, *px, *sz, *raw_sz, meta)?;
+                        push_add_row(
+                            rows,
+                            coin_symbol,
+                            block_number,
+                            block_time_ms,
+                            user,
+                            *oid,
+                            side,
+                            *px,
+                            *sz,
+                            *raw_sz,
+                            meta,
+                        )?;
                     }
                 }
-                CmdEvent::Cancel { user, order_ref, fallback_on_missing } => {
+                CmdEvent::Cancel {
+                    asset_id,
+                    user,
+                    order_ref,
+                    fallback_on_missing,
+                } => {
+                    if *asset_id != target_asset_id {
+                        continue;
+                    }
                     if let Some(trigger_oid) = resolve_trigger_ref(order_ref, user.as_deref(), trigger_refs) {
                         remove_trigger_ref(trigger_refs, trigger_oid);
                         continue;
@@ -3553,7 +3804,7 @@ fn process_block(
                                 rows.push(OutputRow {
                                     block_number: i64::try_from(block_number)?,
                                     block_time_ms,
-                                    coin: "BTC".to_owned(),
+                                    coin: coin_symbol.to_owned(),
                                     user: state.user,
                                     oid: Some(i64::try_from(oid)?),
                                     side: Some(state.side),
@@ -3627,7 +3878,21 @@ fn process_block(
                         }
                     }
                 }
-                CmdEvent::Modify { user, old_order_ref, new_oid, new_cloid, side, px, sz, raw_sz, meta } => {
+                CmdEvent::Modify {
+                    asset_id,
+                    user,
+                    old_order_ref,
+                    new_oid,
+                    new_cloid,
+                    side,
+                    px,
+                    sz,
+                    raw_sz,
+                    meta,
+                } => {
+                    if *asset_id != target_asset_id {
+                        continue;
+                    }
                     let resolved_old_oid = resolve_order_ref(old_order_ref, Some(user.as_str()), cloid_to_oid);
                     if let Some(old_oid) = resolved_old_oid {
                         if let Some(old_state) = remove_live_order(orders, cloid_to_oid, order_expiry_index, old_oid) {
@@ -3635,7 +3900,7 @@ fn process_block(
                                 rows.push(OutputRow {
                                     block_number: i64::try_from(block_number)?,
                                     block_time_ms,
-                                    coin: "BTC".to_owned(),
+                                    coin: coin_symbol.to_owned(),
                                     user: old_state.user,
                                     oid: Some(i64::try_from(old_oid)?),
                                     side: Some(old_state.side),
@@ -3715,6 +3980,7 @@ fn process_block(
                             if emit_rows {
                                 push_add_row(
                                     rows,
+                                    coin_symbol,
                                     block_number,
                                     block_time_ms,
                                     user,
@@ -3729,13 +3995,28 @@ fn process_block(
                         }
                     }
                 }
-                CmdEvent::TrackTriggerAdd { user, oid, cloid } => {
+                CmdEvent::TrackTriggerAdd { asset_id, user, oid, cloid } => {
+                    if *asset_id != target_asset_id {
+                        continue;
+                    }
                     insert_trigger_ref(trigger_refs, user, *oid, cloid.as_deref(), block_time_ms);
                 }
-                CmdEvent::TrackTriggerPending { user, cloid } => {
+                CmdEvent::TrackTriggerPending { asset_id, user, cloid } => {
+                    if *asset_id != target_asset_id {
+                        continue;
+                    }
                     insert_pending_trigger_ref(trigger_refs, user, cloid.as_deref());
                 }
-                CmdEvent::TrackTriggerModify { user, old_order_ref, new_oid, new_cloid } => {
+                CmdEvent::TrackTriggerModify {
+                    asset_id,
+                    user,
+                    old_order_ref,
+                    new_oid,
+                    new_cloid,
+                } => {
+                    if *asset_id != target_asset_id {
+                        continue;
+                    }
                     if let Some(old_oid) = resolve_trigger_ref(old_order_ref, Some(user.as_str()), trigger_refs) {
                         remove_trigger_ref(trigger_refs, old_oid);
                     } else if let OrderRef::Cloid(cloid) = old_order_ref {
@@ -3747,13 +4028,16 @@ fn process_block(
                         insert_pending_trigger_ref(trigger_refs, user, new_cloid.as_deref());
                     }
                 }
-                CmdEvent::Skipped { user, oid, event, status } => {
+                CmdEvent::Skipped { asset_id, user, oid, event, status } => {
+                    if *asset_id != target_asset_id {
+                        continue;
+                    }
                     if emit_rows {
                         let oid = oid.map(i64::try_from).transpose()?;
                         rows.push(OutputRow {
                             block_number: i64::try_from(block_number)?,
                             block_time_ms,
-                            coin: "BTC".to_owned(),
+                            coin: coin_symbol.to_owned(),
                             user: user.clone().unwrap_or_default(),
                             oid,
                             side: None,
@@ -3804,7 +4088,7 @@ fn process_block(
                         rows.push(OutputRow {
                             block_number: i64::try_from(block_number)?,
                             block_time_ms,
-                            coin: "BTC".to_owned(),
+                            coin: coin_symbol.to_owned(),
                             user: state.user,
                             oid: Some(i64::try_from(oid)?),
                             side: Some(state.side),
@@ -3884,12 +4168,22 @@ fn process_block(
     if let Some(fills) = fills {
         let fills_started_at = Instant::now();
         let taker_tids = if emit_rows {
-            Some(fills.iter().filter(|fill| fill.crossed).filter_map(|fill| fill.tid).collect::<HashSet<u64>>())
+            Some(
+                fills
+                    .iter()
+                    .filter(|fill| fill.asset_id == target_asset_id)
+                    .filter(|fill| fill.crossed)
+                    .filter_map(|fill| fill.tid)
+                    .collect::<HashSet<u64>>(),
+            )
         } else {
             None
         };
 
         for fill in fills {
+            if fill.asset_id != target_asset_id {
+                continue;
+            }
             let fill_time_ms = fill.block_time_ms;
 
             // Filled/crossed trigger orders should not remain in live trigger refs.
@@ -3907,7 +4201,7 @@ fn process_block(
                 rows.push(OutputRow {
                     block_number: i64::try_from(fill.block_number)?,
                     block_time_ms: fill_time_ms,
-                    coin: "BTC".to_owned(),
+                    coin: coin_symbol.to_owned(),
                     user: fill.user.clone(),
                     oid: Some(i64::try_from(fill.oid)?),
                     side: fill.side.clone(),
@@ -3982,16 +4276,18 @@ fn cleanup_stale_parquet_tmp_files(output_dir: &Path) -> Result<usize> {
     Ok(removed)
 }
 
-fn build_output_tmp_path(output_dir: &Path, actual_start_block: u64) -> Result<PathBuf> {
+fn build_output_tmp_path(output_dir: &Path, coin_lower: &str, actual_start_block: u64) -> Result<PathBuf> {
     create_dir_all(output_dir)
         .with_context(|| format!("failed to create output directory: {}", output_dir.display()))?;
     let pid = std::process::id();
-    let mut candidate = output_dir.join(format!(".tmp_btc_diff_start{actual_start_block}_pid{pid}.parquet.tmp"));
+    let mut candidate =
+        output_dir.join(format!(".tmp_{coin_lower}_diff_start{actual_start_block}_pid{pid}.parquet.tmp"));
     if !candidate.exists() {
         return Ok(candidate);
     }
     for idx in 1..=9_999usize {
-        candidate = output_dir.join(format!(".tmp_btc_diff_start{actual_start_block}_pid{pid}_{idx}.parquet.tmp"));
+        candidate = output_dir
+            .join(format!(".tmp_{coin_lower}_diff_start{actual_start_block}_pid{pid}_{idx}.parquet.tmp"));
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -3999,15 +4295,21 @@ fn build_output_tmp_path(output_dir: &Path, actual_start_block: u64) -> Result<P
     bail!("failed to allocate temp parquet file for start block {} under {}", actual_start_block, output_dir.display());
 }
 
-fn build_final_output_path(output_dir: &Path, actual_start_block: u64, actual_end_block: u64) -> Result<PathBuf> {
+fn build_final_output_path(
+    output_dir: &Path,
+    coin_lower: &str,
+    actual_start_block: u64,
+    actual_end_block: u64,
+) -> Result<PathBuf> {
     create_dir_all(output_dir)
         .with_context(|| format!("failed to create output directory: {}", output_dir.display()))?;
-    let mut candidate = output_dir.join(format!("btc_diff_{actual_start_block}_{actual_end_block}.parquet"));
+    let mut candidate = output_dir.join(format!("{coin_lower}_diff_{actual_start_block}_{actual_end_block}.parquet"));
     if !candidate.exists() {
         return Ok(candidate);
     }
     for idx in 1..=9_999usize {
-        candidate = output_dir.join(format!("btc_diff_{actual_start_block}_{actual_end_block}_dup{idx}.parquet"));
+        candidate =
+            output_dir.join(format!("{coin_lower}_diff_{actual_start_block}_{actual_end_block}_dup{idx}.parquet"));
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -4032,7 +4334,7 @@ fn build_upload_key(path: &Path, coin_lower: &str) -> Option<String> {
         return Some(format!("{UPLOAD_ROOT_PREFIX}/{coin_lower}_diff/{file_name}"));
     }
     if file_name.ends_with(".msgpack.zst") {
-        return Some(format!("{UPLOAD_ROOT_PREFIX}/{coin_lower}_snapshot/{file_name}"));
+        return Some(format!("{UPLOAD_ROOT_PREFIX}/snapshot/{file_name}"));
     }
     None
 }
@@ -4045,6 +4347,67 @@ fn snapshot_checkpoint_from_path(path: &Path) -> Option<u64> {
     checkpoint.parse::<u64>().ok()
 }
 
+fn latest_snapshot_path(snapshot_files: &[PathBuf]) -> Option<PathBuf> {
+    snapshot_files
+        .iter()
+        .filter_map(|path| snapshot_checkpoint_from_path(path).map(|checkpoint| (checkpoint, path.clone())))
+        .max_by_key(|(checkpoint, _)| *checkpoint)
+        .map(|(_, path)| path)
+        .or_else(|| snapshot_files.last().cloned())
+}
+
+fn spawn_upload_job(
+    uploads: &mut JoinSet<Result<(PathBuf, String, bool)>>,
+    s3_client: &S3Client,
+    local_path: PathBuf,
+    remote_key: String,
+    keep_local: bool,
+) {
+    let client = s3_client.clone();
+    uploads.spawn(async move {
+        let body = ByteStream::from_path(&local_path)
+            .await
+            .with_context(|| format!("failed to open upload source file {}", local_path.display()))?;
+        client
+            .put_object()
+            .bucket(UPLOAD_BUCKET)
+            .key(&remote_key)
+            .body(body)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to upload {} to s3://{}/{}",
+                    local_path.display(),
+                    UPLOAD_BUCKET,
+                    remote_key
+                )
+            })?;
+        Ok((local_path, remote_key, keep_local))
+    });
+}
+
+fn fill_upload_workers(
+    uploads: &mut JoinSet<Result<(PathBuf, String, bool)>>,
+    upload_jobs: &mut VecDeque<(PathBuf, String, bool)>,
+    s3_client: &S3Client,
+) {
+    let target_in_flight = UPLOAD_MAX_CONCURRENCY.max(1);
+    while uploads.len() < target_in_flight {
+        let Some((local_path, remote_key, keep_local)) = upload_jobs.pop_front() else {
+            break;
+        };
+        spawn_upload_job(uploads, s3_client, local_path, remote_key, keep_local);
+    }
+}
+
+fn missing_snapshot_assets(snapshot: &WarmupStateSnapshot, selected_coins: &[CoinConfig]) -> Vec<&'static str> {
+    selected_coins
+        .iter()
+        .filter_map(|coin| (!snapshot.assets.contains_key(coin.symbol)).then_some(coin.symbol))
+        .collect()
+}
+
 async fn upload_and_cleanup_generated_files(
     s3_client: &S3Client,
     coin_symbol: &str,
@@ -4052,89 +4415,40 @@ async fn upload_and_cleanup_generated_files(
     snapshot_files: &[PathBuf],
 ) -> Result<()> {
     let coin_lower = coin_symbol.to_ascii_lowercase();
-    info!(
-        "[upload] start bucket={} coin={} parquet_files={} snapshot_files={}",
-        UPLOAD_BUCKET,
-        coin_lower,
-        parquet_files.len(),
-        snapshot_files.len()
-    );
 
-    let retained_snapshot = snapshot_files
-        .iter()
-        .filter_map(|path| snapshot_checkpoint_from_path(path).map(|checkpoint| (checkpoint, path.clone())))
-        .max_by_key(|(checkpoint, _)| *checkpoint)
-        .map(|(_, path)| path)
-        .or_else(|| snapshot_files.last().cloned());
-    if let Some(path) = retained_snapshot.as_ref() {
-        info!("[upload] retain_latest_snapshot local={}", path.display());
-    }
+    let retained_snapshot = latest_snapshot_path(snapshot_files);
 
-    let mut uploaded_files = 0usize;
-    let mut removed_files = 0usize;
+    let mut upload_jobs: VecDeque<(PathBuf, String, bool)> = VecDeque::new();
 
     for path in parquet_files {
         let Some(key) = build_upload_key(path, &coin_lower) else {
             continue;
         };
-        let body = ByteStream::from_path(path)
-            .await
-            .with_context(|| format!("failed to open upload source file {}", path.display()))?;
-        s3_client
-            .put_object()
-            .bucket(UPLOAD_BUCKET)
-            .key(&key)
-            .body(body)
-            .send()
-            .await
-            .with_context(|| format!("failed to upload {} to s3://{}/{}", path.display(), UPLOAD_BUCKET, key))?;
-        info!("[upload] uploaded local={} remote=s3://{}/{}", path.display(), UPLOAD_BUCKET, key);
-
-        std::fs::remove_file(path)
-            .with_context(|| format!("failed to remove uploaded local file {}", path.display()))?;
-        info!("[upload] removed_local path={}", path.display());
-        uploaded_files += 1;
-        removed_files += 1;
+        upload_jobs.push_back((path.clone(), key, false));
     }
 
     for path in snapshot_files {
         let Some(key) = build_upload_key(path, &coin_lower) else {
             continue;
         };
-        let body = ByteStream::from_path(path)
-            .await
-            .with_context(|| format!("failed to open upload source file {}", path.display()))?;
-        s3_client
-            .put_object()
-            .bucket(UPLOAD_BUCKET)
-            .key(&key)
-            .body(body)
-            .send()
-            .await
-            .with_context(|| format!("failed to upload {} to s3://{}/{}", path.display(), UPLOAD_BUCKET, key))?;
-        info!("[upload] uploaded local={} remote=s3://{}/{}", path.display(), UPLOAD_BUCKET, key);
-
-        if retained_snapshot.as_ref().is_some_and(|retained| retained == path) {
-            info!("[upload] kept_local_snapshot path={} reason=warmup_resume_cache", path.display());
-            uploaded_files += 1;
-            continue;
-        }
-
-        std::fs::remove_file(path)
-            .with_context(|| format!("failed to remove uploaded local file {}", path.display()))?;
-        info!("[upload] removed_local path={}", path.display());
-        uploaded_files += 1;
-        removed_files += 1;
+        let keep_local = retained_snapshot.as_ref().is_some_and(|retained| retained == path);
+        upload_jobs.push_back((path.clone(), key, keep_local));
     }
 
-    info!(
-        "[upload] complete bucket={} uploaded_files={} removed_local_files={} parquet_files={} snapshot_files={}",
-        UPLOAD_BUCKET,
-        uploaded_files,
-        removed_files,
-        parquet_files.len(),
-        snapshot_files.len()
-    );
+    let mut uploads = JoinSet::new();
+    fill_upload_workers(&mut uploads, &mut upload_jobs, s3_client);
+
+    while let Some(joined) = uploads.join_next().await {
+        let (path, _remote_key, keep_local) = joined.context("upload worker join failure")??;
+        let file_name = path.file_name().and_then(|value| value.to_str()).unwrap_or("unknown_file");
+        info!("[upload] success {}", file_name);
+        if !keep_local {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove uploaded local file {}", path.display()))?;
+        }
+        fill_upload_workers(&mut uploads, &mut upload_jobs, s3_client);
+    }
+
     Ok(())
 }
 
@@ -4157,25 +4471,20 @@ async fn upload_newly_generated_files(
     }
 
     let snapshot_files = std::mem::take(generated_snapshot_files);
-    for path in snapshot_files {
-        upload_and_cleanup_generated_files(s3_client, coin_symbol, &[], std::slice::from_ref(&path)).await?;
+    let retained_snapshot = latest_snapshot_path(&snapshot_files);
+    upload_and_cleanup_generated_files(s3_client, coin_symbol, &[], &snapshot_files).await?;
 
-        if let Some(previous) = latest_local_snapshot.replace(path.clone())
-            && previous != path
-            && previous.is_file()
-        {
-            std::fs::remove_file(&previous).with_context(|| {
-                format!(
-                    "failed to remove superseded local warmup snapshot {}",
-                    previous.display()
-                )
-            })?;
-            info!(
-                "[upload] removed_superseded_snapshot path={} kept={}",
-                previous.display(),
-                path.display()
-            );
-        }
+    if let Some(path) = retained_snapshot
+        && let Some(previous) = latest_local_snapshot.replace(path.clone())
+        && previous != path
+        && previous.is_file()
+    {
+        std::fs::remove_file(&previous).with_context(|| {
+            format!(
+                "failed to remove superseded local warmup snapshot {}",
+                previous.display()
+            )
+        })?;
     }
 
     Ok(())
@@ -4204,19 +4513,8 @@ fn write_warmup_state_snapshot(
     output_dir: &Path,
     checkpoint_block_number: u64,
     checkpoint_block_time_ms: i64,
-    orders: &HashMap<u64, OrderState>,
-    cloid_to_oid: &HashMap<String, HashMap<String, u64>>,
-    trigger_refs: &TriggerOrderRefs,
+    assets: HashMap<String, WarmupAssetSnapshot>,
 ) -> Result<PathBuf> {
-    let mut assets = HashMap::new();
-    assets.insert(
-        PRIMARY_ASSET_SYMBOL.to_owned(),
-        WarmupAssetSnapshot {
-            live_orders: orders.clone(),
-            live_oid_by_user_cloid: cloid_to_oid.clone(),
-            trigger_refs: trigger_refs.clone(),
-        },
-    );
     let snapshot = WarmupStateSnapshot {
         format_version: WARMUP_STATE_FORMAT_VERSION,
         checkpoint_block_number,
@@ -4260,16 +4558,14 @@ fn read_warmup_state_snapshot(path: &Path) -> Result<WarmupStateSnapshot> {
     Ok(snapshot)
 }
 
-fn maybe_write_warmup_state_snapshot(
+async fn maybe_write_warmup_state_snapshot(
     output_dir: Option<&Path>,
     block_number: u64,
     block_time_ms: i64,
     in_warmup: bool,
     warmup_just_ended: bool,
     block_prune_stats: BlockPruneStats,
-    orders: &HashMap<u64, OrderState>,
-    cloid_to_oid: &HashMap<String, HashMap<String, u64>>,
-    trigger_refs: &TriggerOrderRefs,
+    states: &[CoinRuntimeState],
     generated_snapshot_files: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let Some(output_dir) = output_dir else {
@@ -4283,14 +4579,20 @@ fn maybe_write_warmup_state_snapshot(
         return Ok(());
     }
     let reason = if warmup_just_ended { "warmup_end" } else { "file_boundary_1m" };
-    let final_path = write_warmup_state_snapshot(
-        output_dir,
-        block_number,
-        block_time_ms,
-        orders,
-        cloid_to_oid,
-        trigger_refs,
-    )?;
+    let (live_orders, user_cloid_oid_map_entries, trigger_oids, _buffered_rows) =
+        aggregate_coin_state_metrics(states);
+    let output_dir = output_dir.to_path_buf();
+    let snapshot_assets = build_multi_asset_warmup_snapshot(states);
+    let final_path = tokio::task::spawn_blocking(move || {
+        write_warmup_state_snapshot(
+            output_dir.as_path(),
+            block_number,
+            block_time_ms,
+            snapshot_assets,
+        )
+    })
+    .await
+    .context("join warmup snapshot export task")??;
     info!(
         "[warmup.state] reason={} checkpoint_block={} checkpoint_time_ms={} purged_live={} purged_trigger={} path={} live_orders={} user_cloid_oid_map_entries={} trigger_oids={}",
         reason,
@@ -4299,9 +4601,9 @@ fn maybe_write_warmup_state_snapshot(
         block_prune_stats.live_pruned_orders,
         block_prune_stats.trigger_pruned_oids,
         final_path.display(),
-        orders.len(),
-        cloid_mapping_entry_count(cloid_to_oid),
-        trigger_refs.oid_to_cloid.len(),
+        live_orders,
+        user_cloid_oid_map_entries,
+        trigger_oids,
     );
     generated_snapshot_files.push(final_path);
     Ok(())
@@ -4324,19 +4626,21 @@ fn warmup_just_finished(
 
 #[allow(clippy::too_many_arguments)]
 fn restore_warmup_state_snapshot(
-    snapshot: WarmupStateSnapshot,
+    snapshot: &WarmupStateSnapshot,
+    asset_symbol: &str,
     orders: &mut HashMap<u64, OrderState>,
     cloid_to_oid: &mut HashMap<String, HashMap<String, u64>>,
     order_expiry_index: &mut BTreeSet<(i64, u64)>,
     trigger_refs: &mut TriggerOrderRefs,
 ) -> Result<()> {
     let checkpoint_time_ms = snapshot.checkpoint_block_time_ms;
-    let primary_asset = snapshot.assets.get(PRIMARY_ASSET_SYMBOL).ok_or_else(|| {
-        anyhow!(
-            "warmup snapshot missing primary asset bucket: {}",
-            PRIMARY_ASSET_SYMBOL
-        )
-    })?;
+    let Some(primary_asset) = snapshot.assets.get(asset_symbol) else {
+        orders.clear();
+        cloid_to_oid.clear();
+        order_expiry_index.clear();
+        *trigger_refs = TriggerOrderRefs::default();
+        return Ok(());
+    };
 
     *orders = primary_asset.live_orders.clone();
     *cloid_to_oid = primary_asset.live_oid_by_user_cloid.clone();
@@ -4378,107 +4682,209 @@ fn open_output_writer(path: &Path, schema: &Arc<Schema>) -> Result<ArrowWriter<F
     ArrowWriter::try_new(file, Arc::clone(schema), Some(props)).context("creating parquet writer")
 }
 
-fn flush_rows_to_writer(writer: &mut ArrowWriter<File>, rows: &mut RowBuffer, schema: &Arc<Schema>) -> Result<()> {
-    if let Some(batch) = rows.take_batch(schema)? {
-        writer.write(&batch)?;
-        writer.flush()?;
+async fn finish_pending_output_flush(state: &mut CoinRuntimeState) -> Result<()> {
+    if let Some(task) = state.pending_flush_writer.take() {
+        let writer = task.await.context("join output flush task")??;
+        state.writer = Some(writer);
     }
     Ok(())
 }
 
-fn close_output_writer(mut writer: ArrowWriter<File>, rows: &mut RowBuffer, schema: &Arc<Schema>) -> Result<()> {
-    flush_rows_to_writer(&mut writer, rows, schema)?;
-    writer.close()?;
+async fn collect_finished_output_flush_if_ready(state: &mut CoinRuntimeState) -> Result<()> {
+    let should_collect = state
+        .pending_flush_writer
+        .as_ref()
+        .is_some_and(JoinHandle::is_finished);
+    if should_collect {
+        finish_pending_output_flush(state).await?;
+    }
     Ok(())
 }
 
-fn close_and_finalize_output_file(
-    output_dir: &Path,
-    writer: ArrowWriter<File>,
-    rows: &mut RowBuffer,
-    schema: &Arc<Schema>,
-    tmp_path: &Path,
-    actual_start_block: u64,
-    actual_end_block: u64,
-) -> Result<PathBuf> {
-    close_output_writer(writer, rows, schema)?;
-    let final_path = build_final_output_path(output_dir, actual_start_block, actual_end_block)?;
-    rename(tmp_path, &final_path).with_context(|| {
-        format!("failed to rename parquet temp file {} -> {}", tmp_path.display(), final_path.display())
-    })?;
-    Ok(final_path)
+async fn dispatch_output_flush_if_needed(state: &mut CoinRuntimeState) -> Result<()> {
+    if state.rows.len() == 0 {
+        return Ok(());
+    }
+
+    finish_pending_output_flush(state).await?;
+
+    let Some(batch) = state
+        .rows
+        .take_batch(&state.schema, state.config.px_scale, state.config.sz_scale)?
+    else {
+        return Ok(());
+    };
+
+    let writer = state
+        .writer
+        .take()
+        .ok_or_else(|| anyhow!("missing parquet writer while dispatching row-group flush"))?;
+    let coin = state.config.symbol.to_owned();
+
+    state.pending_flush_writer = Some(tokio::task::spawn_blocking(move || -> Result<ArrowWriter<File>> {
+        let mut writer = writer;
+        writer
+            .write(&batch)
+            .with_context(|| format!("writing parquet batch for {}", coin))?;
+        writer
+            .flush()
+            .with_context(|| format!("flushing parquet writer for {}", coin))?;
+        Ok(writer)
+    }));
+    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ensure_output_ready_for_block(
+async fn close_current_output_file(
     output_dir: &Path,
-    schema: &Arc<Schema>,
+    state: &mut CoinRuntimeState,
+    fallback_block: u64,
+) -> Result<Option<(PathBuf, u64, u64)>> {
+    dispatch_output_flush_if_needed(state).await?;
+    finish_pending_output_flush(state).await?;
+
+    let Some(active_writer) = state.writer.take() else {
+        return Ok(None);
+    };
+
+    let closed_start = state.current_file_actual_start_block.unwrap_or(fallback_block);
+    let closed_end = state.last_emitted_block.unwrap_or(fallback_block);
+    let tmp_path = state
+        .current_tmp_output_path
+        .take()
+        .ok_or_else(|| anyhow!("missing current tmp parquet path while closing output"))?;
+    let output_dir = output_dir.to_path_buf();
+    let coin_lower = state.coin_lower.clone();
+
+    let final_path = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        let writer = active_writer;
+        writer.close().context("closing parquet writer")?;
+        let final_path = build_final_output_path(&output_dir, &coin_lower, closed_start, closed_end)?;
+        rename(&tmp_path, &final_path).with_context(|| {
+            format!(
+                "failed to rename parquet temp file {} -> {}",
+                tmp_path.display(),
+                final_path.display()
+            )
+        })?;
+        Ok(final_path)
+    })
+    .await
+    .context("join output close task")??;
+
+    Ok(Some((final_path, closed_start, closed_end)))
+}
+
+async fn ensure_output_ready_for_block(
+    output_dir: &Path,
     block_number: u64,
     emit_rows: bool,
-    writer: &mut Option<ArrowWriter<File>>,
-    current_tmp_output_path: &mut Option<PathBuf>,
-    current_file_window_start: &mut Option<u64>,
-    current_row_group_window_start: &mut Option<u64>,
-    current_file_actual_start_block: &mut Option<u64>,
-    last_emitted_block: Option<u64>,
-    generated_output_files: &mut Vec<PathBuf>,
-    rows: &mut RowBuffer,
+    state: &mut CoinRuntimeState,
 ) -> Result<()> {
     if !emit_rows {
         return Ok(());
     }
 
+    collect_finished_output_flush_if_ready(state).await?;
+
     let next_file_window = file_window_start_block(block_number);
     let next_row_group_window = row_group_window_start_block(block_number);
 
-    if writer.is_none() {
-        let tmp_path = build_output_tmp_path(output_dir, block_number)?;
-        *writer = Some(open_output_writer(&tmp_path, schema)?);
-        *current_tmp_output_path = Some(tmp_path.clone());
-        *current_file_window_start = Some(next_file_window);
-        *current_row_group_window_start = Some(next_row_group_window);
-        *current_file_actual_start_block = Some(block_number);
+    if state.writer.is_none() && state.pending_flush_writer.is_none() {
+        let tmp_path = build_output_tmp_path(output_dir, state.coin_lower.as_str(), block_number)?;
+        state.writer = Some(open_output_writer(&tmp_path, &state.schema)?);
+        state.current_tmp_output_path = Some(tmp_path.clone());
+        state.current_file_window_start = Some(next_file_window);
+        state.current_row_group_window_start = Some(next_row_group_window);
+        state.current_file_actual_start_block = Some(block_number);
         info!("[file] open parquet_tmp={} start_block={}", tmp_path.display(), block_number);
         return Ok(());
     }
 
-    if *current_file_window_start != Some(next_file_window) {
-        if let Some(active_writer) = writer.as_mut() {
-            flush_rows_to_writer(active_writer, rows, schema)?;
-        }
-        if let Some(active_writer) = writer.take() {
-            let closed_start = current_file_actual_start_block.unwrap_or(block_number);
-            let closed_end = last_emitted_block.unwrap_or(block_number);
-            let tmp_path =
-                current_tmp_output_path.take().ok_or_else(|| anyhow!("missing current tmp parquet path on rotate"))?;
-            let final_path = close_and_finalize_output_file(
-                output_dir,
-                active_writer,
-                rows,
-                schema,
-                &tmp_path,
+    if state.current_file_window_start != Some(next_file_window) {
+        if let Some((final_path, closed_start, closed_end)) =
+            close_current_output_file(output_dir, state, block_number).await?
+        {
+            state.generated_output_files.push(final_path.clone());
+            info!(
+                "[file] close parquet={} actual_range={}..{}",
+                final_path.display(),
                 closed_start,
-                closed_end,
-            )?;
-            generated_output_files.push(final_path.clone());
-            info!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
+                closed_end
+            );
         }
 
-        let tmp_path = build_output_tmp_path(output_dir, block_number)?;
-        *writer = Some(open_output_writer(&tmp_path, schema)?);
-        *current_tmp_output_path = Some(tmp_path.clone());
-        *current_file_window_start = Some(next_file_window);
-        *current_row_group_window_start = Some(next_row_group_window);
-        *current_file_actual_start_block = Some(block_number);
+        let tmp_path = build_output_tmp_path(output_dir, state.coin_lower.as_str(), block_number)?;
+        state.writer = Some(open_output_writer(&tmp_path, &state.schema)?);
+        state.current_tmp_output_path = Some(tmp_path.clone());
+        state.current_file_window_start = Some(next_file_window);
+        state.current_row_group_window_start = Some(next_row_group_window);
+        state.current_file_actual_start_block = Some(block_number);
         info!("[file] open parquet_tmp={} start_block={}", tmp_path.display(), block_number);
         return Ok(());
     }
 
-    if *current_row_group_window_start != Some(next_row_group_window) {
-        if let Some(active_writer) = writer.as_mut() {
-            flush_rows_to_writer(active_writer, rows, schema)?;
+    if state.current_row_group_window_start != Some(next_row_group_window) {
+        dispatch_output_flush_if_needed(state).await?;
+        state.current_row_group_window_start = Some(next_row_group_window);
+    }
+
+    Ok(())
+}
+
+async fn close_open_output_for_coin_state(
+    output_dir: &Path,
+    state: &mut CoinRuntimeState,
+    fallback_block: u64,
+) -> Result<()> {
+    if let Some((final_path, closed_start, closed_end)) = close_current_output_file(output_dir, state, fallback_block).await? {
+        state.generated_output_files.push(final_path.clone());
+        info!(
+            "[file] close parquet={} actual_range={}..{}",
+            final_path.display(),
+            closed_start,
+            closed_end
+        );
+    }
+    Ok(())
+}
+
+async fn upload_pending_files_for_states(
+    upload_client: Option<&Arc<S3Client>>,
+    coin_states: &mut [CoinRuntimeState],
+    generated_snapshot_files: &mut Vec<PathBuf>,
+    latest_local_uploaded_snapshot: &mut Option<PathBuf>,
+) -> Result<()> {
+    let Some(client) = upload_client else {
+        return Ok(());
+    };
+
+    if generated_snapshot_files.is_empty() && coin_states.iter().all(|state| state.generated_output_files.is_empty()) {
+        return Ok(());
+    }
+
+    for (idx, state) in coin_states.iter_mut().enumerate() {
+        if idx == 0 {
+            upload_newly_generated_files(
+                client.as_ref(),
+                state.config.symbol,
+                &mut state.generated_output_files,
+                generated_snapshot_files,
+                latest_local_uploaded_snapshot,
+                &mut state.uploaded_parquet_files,
+            )
+            .await?;
+        } else {
+            let mut no_snapshot_files = Vec::new();
+            upload_newly_generated_files(
+                client.as_ref(),
+                state.config.symbol,
+                &mut state.generated_output_files,
+                &mut no_snapshot_files,
+                latest_local_uploaded_snapshot,
+                &mut state.uploaded_parquet_files,
+            )
+            .await?;
         }
-        *current_row_group_window_start = Some(next_row_group_window);
     }
 
     Ok(())
@@ -4646,11 +5052,89 @@ fn log_processing_progress(
     );
 }
 
+struct CoinRuntimeState {
+    config: CoinConfig,
+    coin_lower: String,
+    schema: Arc<Schema>,
+    writer: Option<ArrowWriter<File>>,
+    pending_flush_writer: Option<JoinHandle<Result<ArrowWriter<File>>>>,
+    current_tmp_output_path: Option<PathBuf>,
+    current_file_window_start: Option<u64>,
+    current_row_group_window_start: Option<u64>,
+    current_file_actual_start_block: Option<u64>,
+    last_emitted_block: Option<u64>,
+    generated_output_files: Vec<PathBuf>,
+    rows: RowBuffer,
+    orders: HashMap<u64, OrderState>,
+    cloid_to_oid: HashMap<String, HashMap<String, u64>>,
+    order_expiry_index: BTreeSet<(i64, u64)>,
+    trigger_refs: TriggerOrderRefs,
+    unknown_oid_logger: UnknownOidWindowLogger,
+    uploaded_parquet_files: usize,
+}
+
+fn aggregate_coin_state_metrics(states: &[CoinRuntimeState]) -> (usize, usize, usize, usize) {
+    let live_orders = states.iter().map(|state| state.orders.len()).sum();
+    let cloid_entries = states
+        .iter()
+        .map(|state| cloid_mapping_entry_count(&state.cloid_to_oid))
+        .sum();
+    let trigger_oids = states.iter().map(|state| state.trigger_refs.oid_to_cloid.len()).sum();
+    let buffered_rows = states.iter().map(|state| state.rows.len()).sum();
+    (live_orders, cloid_entries, trigger_oids, buffered_rows)
+}
+
+fn build_multi_asset_warmup_snapshot(states: &[CoinRuntimeState]) -> HashMap<String, WarmupAssetSnapshot> {
+    let mut assets = HashMap::new();
+    for state in states {
+        assets.insert(
+            state.config.symbol.to_owned(),
+            WarmupAssetSnapshot {
+                live_orders: state.orders.clone(),
+                live_oid_by_user_cloid: state.cloid_to_oid.clone(),
+                trigger_refs: state.trigger_refs.clone(),
+            },
+        );
+    }
+    assets
+}
+
+fn split_cmd_events_by_coin_state(
+    events: Vec<CmdEvent>,
+    coin_state_idx_by_asset: &HashMap<u64, usize>,
+    coin_state_count: usize,
+) -> Vec<Vec<CmdEvent>> {
+    let mut events_by_coin_state = (0..coin_state_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for event in events {
+        if let Some(state_idx) = coin_state_idx_by_asset.get(&event.asset_id()).copied() {
+            events_by_coin_state[state_idx].push(event);
+        }
+    }
+    events_by_coin_state
+}
+
+fn split_fills_by_coin_state(
+    fills: Vec<FillRecord>,
+    coin_state_idx_by_asset: &HashMap<u64, usize>,
+    coin_state_count: usize,
+) -> Vec<Vec<FillRecord>> {
+    let mut fills_by_coin_state = (0..coin_state_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for fill in fills {
+        if let Some(state_idx) = coin_state_idx_by_asset.get(&fill.asset_id).copied() {
+            fills_by_coin_state[state_idx].push(fill);
+        }
+    }
+    fills_by_coin_state
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     Builder::from_env(Env::default().default_filter_or("info")).format_timestamp_micros().init();
 
     let args = Args::parse();
+    let selected_coins = parse_coin_configs(&args.coin)?;
+    let selected_coin_text = selected_coins.iter().map(|coin| coin.symbol).collect::<Vec<_>>().join(",");
+    let selected_asset_ids: HashSet<u64> = selected_coins.iter().map(|coin| coin.asset_id).collect();
     let requested_json_workers = args.replica_json_workers;
     if requested_json_workers == 0 {
         bail!("--json must be >= 1");
@@ -4684,6 +5168,20 @@ async fn main() -> Result<()> {
         replica_prefetch_buffer_mb
     );
     info!(
+        "[config.coin] selected={} count={}",
+        selected_coin_text,
+        selected_coins.len()
+    );
+    for coin in &selected_coins {
+        info!(
+            "[config.coin.detail] symbol={} asset_id={} px_scale={} sz_scale={}",
+            coin.symbol,
+            coin.asset_id,
+            coin.px_scale,
+            coin.sz_scale
+        );
+    }
+    info!(
         "[config.upload] enabled={} mode=incremental_parquet_and_snapshot",
         args.upload
     );
@@ -4714,7 +5212,7 @@ async fn main() -> Result<()> {
         auto_matched_warmup_state = selected_warmup_state_path.is_some();
     }
 
-    let warmup_state_snapshot = if let Some(path) = selected_warmup_state_path.as_deref() {
+    let mut warmup_state_snapshot = if let Some(path) = selected_warmup_state_path.as_deref() {
         let source_flag = if auto_matched_warmup_state {
             "auto-matched local warmup state"
         } else {
@@ -4726,6 +5224,25 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    if let Some(snapshot) = warmup_state_snapshot.as_ref() {
+        let missing_assets = missing_snapshot_assets(snapshot, &selected_coins);
+        if !missing_assets.is_empty() {
+            if let Some(path) = selected_warmup_state_path.as_deref() {
+                warn!(
+                    "[warmup.state] ignore_snapshot_missing_assets file={} missing_assets={} selected={} checkpoint_block={}",
+                    path.display(),
+                    missing_assets.join(","),
+                    selected_coin_text,
+                    snapshot.checkpoint_block_number
+                );
+            }
+            warmup_state_snapshot = None;
+            selected_warmup_state_path = None;
+            auto_matched_warmup_state = false;
+        }
+    }
+
     let mut read_block_range = output_block_range.map(|(start_height, end_height)| {
         let warmup_start = start_height.saturating_sub(warmup_blocks).max(1);
         (warmup_start, end_height)
@@ -4851,13 +5368,20 @@ async fn main() -> Result<()> {
     };
 
     let mut fills_reader =
-        NodeFillsReader::new(fills_reader_source.clone(), s3_client.clone(), requester_pays, read_block_range)
+        NodeFillsReader::new(
+            fills_reader_source.clone(),
+            s3_client.clone(),
+            requester_pays,
+            read_block_range,
+            selected_asset_ids.clone(),
+        )
             .await
             .context("opening node_fills_by_block")?;
     let mut replica_reader = ReplicaPrefetchReader::new(
         replica_reader_source,
         s3_client.clone(),
         requester_pays,
+        selected_asset_ids,
         replica_queue_depth,
         replica_json_workers,
         replica_lz4_workers,
@@ -4901,44 +5425,63 @@ async fn main() -> Result<()> {
             )
         })?;
     }
-
-    let schema = output_schema();
-    let mut writer: Option<ArrowWriter<File>> = None;
-    let mut current_tmp_output_path: Option<PathBuf> = None;
-    let mut current_file_window_start: Option<u64> = None;
-    let mut current_row_group_window_start: Option<u64> = None;
-    let mut current_file_actual_start_block: Option<u64> = None;
-    let mut last_emitted_block: Option<u64> = None;
-    let mut generated_output_files: Vec<PathBuf> = Vec::new();
+    let mut unknown_oid_sqlite_worker = UnknownOidSqliteWorker::start(&args.unknown_oid_log_sqlite)?;
+    let unknown_oid_sqlite_sender = unknown_oid_sqlite_worker.sender();
     let mut generated_snapshot_files: Vec<PathBuf> = Vec::new();
     let mut latest_local_uploaded_snapshot = selected_warmup_state_path.clone();
-    let mut uploaded_parquet_files: usize = 0;
 
-    let mut rows = RowBuffer::default();
-    let mut orders: HashMap<u64, OrderState> = HashMap::new();
-    let mut cloid_to_oid: HashMap<String, HashMap<String, u64>> = HashMap::new();
-    let mut order_expiry_index: BTreeSet<(i64, u64)> = BTreeSet::new();
-    let mut trigger_refs = TriggerOrderRefs::default();
+    let mut coin_states = Vec::with_capacity(selected_coins.len());
+    for coin in selected_coins {
+        let mut state = CoinRuntimeState {
+            config: coin,
+            coin_lower: coin.symbol.to_ascii_lowercase(),
+            schema: output_schema(coin.px_scale, coin.sz_scale),
+            writer: None,
+            pending_flush_writer: None,
+            current_tmp_output_path: None,
+            current_file_window_start: None,
+            current_row_group_window_start: None,
+            current_file_actual_start_block: None,
+            last_emitted_block: None,
+            generated_output_files: Vec::new(),
+            rows: RowBuffer::default(),
+            orders: HashMap::new(),
+            cloid_to_oid: HashMap::new(),
+            order_expiry_index: BTreeSet::new(),
+            trigger_refs: TriggerOrderRefs::default(),
+            unknown_oid_logger: UnknownOidWindowLogger::new(coin.symbol, unknown_oid_sqlite_sender.clone()),
+            uploaded_parquet_files: 0,
+        };
 
-    if let Some(snapshot) = warmup_state_snapshot {
-        let checkpoint_block_number = snapshot.checkpoint_block_number;
-        restore_warmup_state_snapshot(
-            snapshot,
-            &mut orders,
-            &mut cloid_to_oid,
-            &mut order_expiry_index,
-            &mut trigger_refs,
-        )?;
-        info!(
-            "[warmup.state] restored checkpoint_block={} live_orders={} cloid={} trigger={}",
-            checkpoint_block_number,
-            orders.len(),
-            cloid_mapping_entry_count(&cloid_to_oid),
-            trigger_refs.oid_to_cloid.len()
-        );
+        if let Some(snapshot) = warmup_state_snapshot.as_ref() {
+            let checkpoint_block_number = snapshot.checkpoint_block_number;
+            restore_warmup_state_snapshot(
+                snapshot,
+                coin.symbol,
+                &mut state.orders,
+                &mut state.cloid_to_oid,
+                &mut state.order_expiry_index,
+                &mut state.trigger_refs,
+            )?;
+            info!(
+                "[warmup.state] restored coin={} checkpoint_block={} live_orders={} cloid={} trigger={}",
+                coin.symbol,
+                checkpoint_block_number,
+                state.orders.len(),
+                cloid_mapping_entry_count(&state.cloid_to_oid),
+                state.trigger_refs.oid_to_cloid.len()
+            );
+        }
+
+        coin_states.push(state);
     }
 
-    let mut unknown_oid_logger = UnknownOidWindowLogger::new(&args.unknown_oid_log_sqlite)?;
+    let coin_state_idx_by_asset: HashMap<u64, usize> = coin_states
+        .iter()
+        .enumerate()
+        .map(|(idx, state)| (state.config.asset_id, idx))
+        .collect();
+
     let started_at = Instant::now();
     let mut processed_blocks_total: u64 = 0;
     let mut warmup_processed_blocks: u64 = 0;
@@ -4992,41 +5535,17 @@ async fn main() -> Result<()> {
                 if delta_ns <= BLOCK_TIME_TOLERANCE_NS {
                     let block_time_delta = (replica.block_time_ms - fills.block_time_ms).abs();
                     if block_time_delta > BLOCK_TIME_MATCH_TOLERANCE_MS {
-                        unknown_oid_logger.finish()?;
-                        if let Some(active_writer) = writer.take() {
-                            let closed_start = current_file_actual_start_block.unwrap_or(fills.block_number);
-                            let closed_end = last_emitted_block.unwrap_or(fills.block_number);
-                            let tmp_path = current_tmp_output_path
-                                .take()
-                                .ok_or_else(|| anyhow!("missing current tmp parquet path at timestamp mismatch"))?;
-                            let final_path = close_and_finalize_output_file(
-                                &args.output_parquet,
-                                active_writer,
-                                &mut rows,
-                                &schema,
-                                &tmp_path,
-                                closed_start,
-                                closed_end,
-                            )?;
-                            generated_output_files.push(final_path.clone());
-                            info!(
-                                "[file] close parquet={} actual_range={}..{}",
-                                final_path.display(),
-                                closed_start,
-                                closed_end
-                            );
+                        for state in &mut coin_states {
+                            state.unknown_oid_logger.finish()?;
+                            close_open_output_for_coin_state(&args.output_parquet, state, fills.block_number).await?;
                         }
-                        if let Some(client) = upload_client.as_ref() {
-                            upload_newly_generated_files(
-                                client.as_ref(),
-                                PRIMARY_ASSET_SYMBOL,
-                                &mut generated_output_files,
-                                &mut generated_snapshot_files,
-                                &mut latest_local_uploaded_snapshot,
-                                &mut uploaded_parquet_files,
-                            )
-                            .await?;
-                        }
+                        upload_pending_files_for_states(
+                            upload_client.as_ref(),
+                            &mut coin_states,
+                            &mut generated_snapshot_files,
+                            &mut latest_local_uploaded_snapshot,
+                        )
+                        .await?;
                         bail!(
                             "block {} timestamp mismatch: replica={}ms fills={}ms delta={}ms tolerance={}ms",
                             fills.block_number,
@@ -5039,41 +5558,72 @@ async fn main() -> Result<()> {
 
                     let replica = next_replica.take().unwrap();
                     let fills = next_fills.take().unwrap();
-                    let block_number = fills.block_number;
-                    last_seen_fills_ts_ns = Some(fills.block_time_ns);
+                    let ReplicaBatch { events, .. } = replica;
+                    let NodeFillsBatch {
+                        block_number,
+                        block_time_ns: fills_block_time_ns,
+                        block_time_ms: fills_block_time_ms,
+                        fills,
+                    } = fills;
+                    let cmd_events_by_coin_state =
+                        split_cmd_events_by_coin_state(events, &coin_state_idx_by_asset, coin_states.len());
+                    let fills_by_coin_state =
+                        split_fills_by_coin_state(fills, &coin_state_idx_by_asset, coin_states.len());
+                    last_seen_fills_ts_ns = Some(fills_block_time_ns);
                     let emit_rows =
                         output_block_range.map(|(start_height, _)| block_number >= start_height).unwrap_or(true);
-                    let ensure_output_started_at = Instant::now();
-                    ensure_output_ready_for_block(
-                        &args.output_parquet,
-                        &schema,
-                        block_number,
-                        emit_rows,
-                        &mut writer,
-                        &mut current_tmp_output_path,
-                        &mut current_file_window_start,
-                        &mut current_row_group_window_start,
-                        &mut current_file_actual_start_block,
-                        last_emitted_block,
-                        &mut generated_output_files,
-                        &mut rows,
-                    )?;
-                    perf_stats.ensure_output_ns += ensure_output_started_at.elapsed().as_nanos();
-                    let block_prune_stats = process_block(
-                        block_number,
-                        fills.block_time_ms,
-                        Some(replica.events),
-                        Some(fills.fills),
-                        emit_rows,
-                        emit_rows,
-                        &mut rows,
-                        &mut orders,
-                        &mut cloid_to_oid,
-                        &mut order_expiry_index,
-                        &mut trigger_refs,
-                        &mut unknown_oid_logger,
-                        &mut perf_stats,
-                    )?;
+
+                    let mut block_prune_stats = BlockPruneStats::default();
+                    let needs_maintenance = block_number == row_group_window_start_block(block_number);
+                    for (state_idx, state) in coin_states.iter_mut().enumerate() {
+                        let ensure_output_started_at = Instant::now();
+                        ensure_output_ready_for_block(&args.output_parquet, block_number, emit_rows, state).await?;
+                        perf_stats.ensure_output_ns += ensure_output_started_at.elapsed().as_nanos();
+
+                        let cmd_events_slice = {
+                            let entries = &cmd_events_by_coin_state[state_idx];
+                            (!entries.is_empty()).then_some(entries.as_slice())
+                        };
+                        let fills_slice = {
+                            let entries = &fills_by_coin_state[state_idx];
+                            (!entries.is_empty()).then_some(entries.as_slice())
+                        };
+
+                        if cmd_events_slice.is_none() && fills_slice.is_none() && !needs_maintenance {
+                            if emit_rows {
+                                state.last_emitted_block = Some(block_number);
+                            }
+                            continue;
+                        }
+
+                        let coin_prune_stats = process_block(
+                            state.config.symbol,
+                            state.config.asset_id,
+                            block_number,
+                            fills_block_time_ms,
+                            cmd_events_slice,
+                            fills_slice,
+                            emit_rows,
+                            emit_rows,
+                            &mut state.rows,
+                            &mut state.orders,
+                            &mut state.cloid_to_oid,
+                            &mut state.order_expiry_index,
+                            &mut state.trigger_refs,
+                            &mut state.unknown_oid_logger,
+                            &mut perf_stats,
+                        )?;
+                        block_prune_stats.live_pruned_orders =
+                            block_prune_stats.live_pruned_orders.saturating_add(coin_prune_stats.live_pruned_orders);
+                        block_prune_stats.trigger_pruned_oids = block_prune_stats
+                            .trigger_pruned_oids
+                            .saturating_add(coin_prune_stats.trigger_pruned_oids);
+
+                        if emit_rows {
+                            state.last_emitted_block = Some(block_number);
+                        }
+                    }
+
                     let warmup_just_ended =
                         warmup_just_finished(warmup_end_logged, read_block_range, output_block_range, block_number);
                     if warmup_just_ended {
@@ -5088,9 +5638,7 @@ async fn main() -> Result<()> {
                         progress_pruned_trigger_oids_interval = 0;
                         warmup_end_logged = true;
                     }
-                    if emit_rows {
-                        last_emitted_block = Some(block_number);
-                    }
+
                     processed_blocks_total += 1;
                     if !emit_rows {
                         warmup_processed_blocks += 1;
@@ -5103,18 +5651,18 @@ async fn main() -> Result<()> {
                     }
 
                     if !emit_rows && warmup_processed_blocks % PROGRESS_LOG_INTERVAL_BLOCKS == 0 {
-                        let cloid_map_entries = cloid_mapping_entry_count(&cloid_to_oid);
-                        let trigger_oids = trigger_refs.oid_to_cloid.len();
+                        let (live_orders, cloid_map_entries, trigger_oids, buffered_rows) =
+                            aggregate_coin_state_metrics(&coin_states);
                         let elapsed_secs = warmup_interval_started_at.elapsed().as_secs_f64();
                         let total_secs = warmup_phase_started_at.elapsed().as_secs_f64();
                         log_processing_progress(
                             warmup_processed_blocks,
                             block_number,
-                            fills.block_time_ms,
-                            orders.len(),
+                            fills_block_time_ms,
+                            live_orders,
                             cloid_map_entries,
                             trigger_oids,
-                            rows.len(),
+                            buffered_rows,
                             warmup_pruned_live_orders_interval,
                             warmup_pruned_trigger_oids_interval,
                             elapsed_secs,
@@ -5127,18 +5675,18 @@ async fn main() -> Result<()> {
                     }
 
                     if emit_rows && progress_processed_blocks % PROGRESS_LOG_INTERVAL_BLOCKS == 0 {
-                        let cloid_map_entries = cloid_mapping_entry_count(&cloid_to_oid);
-                        let trigger_oids = trigger_refs.oid_to_cloid.len();
+                        let (live_orders, cloid_map_entries, trigger_oids, buffered_rows) =
+                            aggregate_coin_state_metrics(&coin_states);
                         let elapsed_secs = progress_interval_started_at.elapsed().as_secs_f64();
                         let total_secs = progress_phase_started_at.elapsed().as_secs_f64();
                         log_processing_progress(
                             progress_processed_blocks,
                             block_number,
-                            fills.block_time_ms,
-                            orders.len(),
+                            fills_block_time_ms,
+                            live_orders,
                             cloid_map_entries,
                             trigger_oids,
-                            rows.len(),
+                            buffered_rows,
                             progress_pruned_live_orders_interval,
                             progress_pruned_trigger_oids_interval,
                             elapsed_secs,
@@ -5149,38 +5697,32 @@ async fn main() -> Result<()> {
                         progress_pruned_live_orders_interval = 0;
                         progress_pruned_trigger_oids_interval = 0;
                     }
+
                     maybe_write_warmup_state_snapshot(
                         args.warmup_state_output_dir.as_deref(),
                         block_number,
-                        fills.block_time_ms,
+                        fills_block_time_ms,
                         !emit_rows,
                         warmup_just_ended,
                         block_prune_stats,
-                        &orders,
-                        &cloid_to_oid,
-                        &trigger_refs,
+                        &coin_states,
                         &mut generated_snapshot_files,
-                    )?;
-                    if let Some(client) = upload_client.as_ref() {
-                        upload_newly_generated_files(
-                            client.as_ref(),
-                            PRIMARY_ASSET_SYMBOL,
-                            &mut generated_output_files,
-                            &mut generated_snapshot_files,
-                            &mut latest_local_uploaded_snapshot,
-                            &mut uploaded_parquet_files,
-                        )
-                        .await?;
-                    }
-                    let (fetched_replica, fetched_fills) =
-                        {
-                            let fetch_pair_started_at = Instant::now();
-                            let pair = fetch_next_pair(&mut replica_reader, &mut fills_reader).await?;
-                            perf_stats.fetch_pair_ns += fetch_pair_started_at.elapsed().as_nanos();
-                            pair
-                        };
-                    next_replica = fetched_replica;
-                    next_fills = fetched_fills;
+                    )
+                    .await?;
+
+                    upload_pending_files_for_states(
+                        upload_client.as_ref(),
+                        &mut coin_states,
+                        &mut generated_snapshot_files,
+                        &mut latest_local_uploaded_snapshot,
+                    )
+                    .await?;
+
+                    let fetch_pair_started_at = Instant::now();
+                    let pair = fetch_next_pair(&mut replica_reader, &mut fills_reader).await?;
+                    perf_stats.fetch_pair_ns += fetch_pair_started_at.elapsed().as_nanos();
+                    next_replica = pair.0;
+                    next_fills = pair.1;
                     continue;
                 }
 
@@ -5192,41 +5734,64 @@ async fn main() -> Result<()> {
                 }
 
                 let fills = next_fills.take().unwrap();
-                let block_number = fills.block_number;
-                last_seen_fills_ts_ns = Some(fills.block_time_ns);
-                let emit_rows =
-                    output_block_range.map(|(start_height, _)| block_number >= start_height).unwrap_or(true);
-                let ensure_output_started_at = Instant::now();
-                ensure_output_ready_for_block(
-                    &args.output_parquet,
-                    &schema,
+                let NodeFillsBatch {
                     block_number,
-                    emit_rows,
-                    &mut writer,
-                    &mut current_tmp_output_path,
-                    &mut current_file_window_start,
-                    &mut current_row_group_window_start,
-                    &mut current_file_actual_start_block,
-                    last_emitted_block,
-                    &mut generated_output_files,
-                    &mut rows,
-                )?;
-                perf_stats.ensure_output_ns += ensure_output_started_at.elapsed().as_nanos();
-                let block_prune_stats = process_block(
-                    block_number,
-                    fills.block_time_ms,
-                    None,
-                    Some(fills.fills),
-                    emit_rows,
-                    emit_rows,
-                    &mut rows,
-                    &mut orders,
-                    &mut cloid_to_oid,
-                    &mut order_expiry_index,
-                    &mut trigger_refs,
-                    &mut unknown_oid_logger,
-                    &mut perf_stats,
-                )?;
+                    block_time_ns: fills_block_time_ns,
+                    block_time_ms: fills_block_time_ms,
+                    fills,
+                } = fills;
+                let fills_by_coin_state =
+                    split_fills_by_coin_state(fills, &coin_state_idx_by_asset, coin_states.len());
+                last_seen_fills_ts_ns = Some(fills_block_time_ns);
+                let emit_rows = output_block_range.map(|(start_height, _)| block_number >= start_height).unwrap_or(true);
+
+                let mut block_prune_stats = BlockPruneStats::default();
+                let needs_maintenance = block_number == row_group_window_start_block(block_number);
+                for (state_idx, state) in coin_states.iter_mut().enumerate() {
+                    let ensure_output_started_at = Instant::now();
+                    ensure_output_ready_for_block(&args.output_parquet, block_number, emit_rows, state).await?;
+                    perf_stats.ensure_output_ns += ensure_output_started_at.elapsed().as_nanos();
+
+                    let fills_slice = {
+                        let entries = &fills_by_coin_state[state_idx];
+                        (!entries.is_empty()).then_some(entries.as_slice())
+                    };
+
+                    if fills_slice.is_none() && !needs_maintenance {
+                        if emit_rows {
+                            state.last_emitted_block = Some(block_number);
+                        }
+                        continue;
+                    }
+
+                    let coin_prune_stats = process_block(
+                        state.config.symbol,
+                        state.config.asset_id,
+                        block_number,
+                        fills_block_time_ms,
+                        None,
+                        fills_slice,
+                        emit_rows,
+                        emit_rows,
+                        &mut state.rows,
+                        &mut state.orders,
+                        &mut state.cloid_to_oid,
+                        &mut state.order_expiry_index,
+                        &mut state.trigger_refs,
+                        &mut state.unknown_oid_logger,
+                        &mut perf_stats,
+                    )?;
+                    block_prune_stats.live_pruned_orders =
+                        block_prune_stats.live_pruned_orders.saturating_add(coin_prune_stats.live_pruned_orders);
+                    block_prune_stats.trigger_pruned_oids = block_prune_stats
+                        .trigger_pruned_oids
+                        .saturating_add(coin_prune_stats.trigger_pruned_oids);
+
+                    if emit_rows {
+                        state.last_emitted_block = Some(block_number);
+                    }
+                }
+
                 let warmup_just_ended =
                     warmup_just_finished(warmup_end_logged, read_block_range, output_block_range, block_number);
                 if warmup_just_ended {
@@ -5241,9 +5806,7 @@ async fn main() -> Result<()> {
                     progress_pruned_trigger_oids_interval = 0;
                     warmup_end_logged = true;
                 }
-                if emit_rows {
-                    last_emitted_block = Some(block_number);
-                }
+
                 processed_blocks_total += 1;
                 if !emit_rows {
                     warmup_processed_blocks += 1;
@@ -5256,18 +5819,18 @@ async fn main() -> Result<()> {
                 }
 
                 if !emit_rows && warmup_processed_blocks % PROGRESS_LOG_INTERVAL_BLOCKS == 0 {
-                    let cloid_map_entries = cloid_mapping_entry_count(&cloid_to_oid);
-                    let trigger_oids = trigger_refs.oid_to_cloid.len();
+                    let (live_orders, cloid_map_entries, trigger_oids, buffered_rows) =
+                        aggregate_coin_state_metrics(&coin_states);
                     let elapsed_secs = warmup_interval_started_at.elapsed().as_secs_f64();
                     let total_secs = warmup_phase_started_at.elapsed().as_secs_f64();
                     log_processing_progress(
                         warmup_processed_blocks,
                         block_number,
-                        fills.block_time_ms,
-                        orders.len(),
+                        fills_block_time_ms,
+                        live_orders,
                         cloid_map_entries,
                         trigger_oids,
-                        rows.len(),
+                        buffered_rows,
                         warmup_pruned_live_orders_interval,
                         warmup_pruned_trigger_oids_interval,
                         elapsed_secs,
@@ -5280,18 +5843,18 @@ async fn main() -> Result<()> {
                 }
 
                 if emit_rows && progress_processed_blocks % PROGRESS_LOG_INTERVAL_BLOCKS == 0 {
-                    let cloid_map_entries = cloid_mapping_entry_count(&cloid_to_oid);
-                    let trigger_oids = trigger_refs.oid_to_cloid.len();
+                    let (live_orders, cloid_map_entries, trigger_oids, buffered_rows) =
+                        aggregate_coin_state_metrics(&coin_states);
                     let elapsed_secs = progress_interval_started_at.elapsed().as_secs_f64();
                     let total_secs = progress_phase_started_at.elapsed().as_secs_f64();
                     log_processing_progress(
                         progress_processed_blocks,
                         block_number,
-                        fills.block_time_ms,
-                        orders.len(),
+                        fills_block_time_ms,
+                        live_orders,
                         cloid_map_entries,
                         trigger_oids,
-                        rows.len(),
+                        buffered_rows,
                         progress_pruned_live_orders_interval,
                         progress_pruned_trigger_oids_interval,
                         elapsed_secs,
@@ -5302,29 +5865,27 @@ async fn main() -> Result<()> {
                     progress_pruned_live_orders_interval = 0;
                     progress_pruned_trigger_oids_interval = 0;
                 }
+
                 maybe_write_warmup_state_snapshot(
                     args.warmup_state_output_dir.as_deref(),
                     block_number,
-                    fills.block_time_ms,
+                    fills_block_time_ms,
                     !emit_rows,
                     warmup_just_ended,
                     block_prune_stats,
-                    &orders,
-                    &cloid_to_oid,
-                    &trigger_refs,
+                    &coin_states,
                     &mut generated_snapshot_files,
-                )?;
-                if let Some(client) = upload_client.as_ref() {
-                    upload_newly_generated_files(
-                        client.as_ref(),
-                        PRIMARY_ASSET_SYMBOL,
-                        &mut generated_output_files,
-                        &mut generated_snapshot_files,
-                        &mut latest_local_uploaded_snapshot,
-                        &mut uploaded_parquet_files,
-                    )
-                    .await?;
-                }
+                )
+                .await?;
+
+                upload_pending_files_for_states(
+                    upload_client.as_ref(),
+                    &mut coin_states,
+                    &mut generated_snapshot_files,
+                    &mut latest_local_uploaded_snapshot,
+                )
+                .await?;
+
                 let fetch_fills_started_at = Instant::now();
                 next_fills = fills_reader.next_batch().await?;
                 perf_stats.fetch_fills_only_ns += fetch_fills_started_at.elapsed().as_nanos();
@@ -5337,82 +5898,36 @@ async fn main() -> Result<()> {
                 {
                     break;
                 }
-                unknown_oid_logger.finish()?;
-                if let Some(active_writer) = writer.take() {
-                    let closed_start = current_file_actual_start_block.unwrap_or(last_emitted_block.unwrap_or(0));
-                    let closed_end = last_emitted_block.unwrap_or(0);
-                    let tmp_path = current_tmp_output_path
-                        .take()
-                        .ok_or_else(|| anyhow!("missing current tmp parquet path at replica eof"))?;
-                    let final_path = close_and_finalize_output_file(
-                        &args.output_parquet,
-                        active_writer,
-                        &mut rows,
-                        &schema,
-                        &tmp_path,
-                        closed_start,
-                        closed_end,
-                    )?;
-                    generated_output_files.push(final_path.clone());
-                    info!(
-                        "[file] close parquet={} actual_range={}..{}",
-                        final_path.display(),
-                        closed_start,
-                        closed_end
-                    );
+
+                for state in &mut coin_states {
+                    state.unknown_oid_logger.finish()?;
+                    let fallback_block = state.last_emitted_block.unwrap_or(0);
+                    close_open_output_for_coin_state(&args.output_parquet, state, fallback_block).await?;
                 }
-                if let Some(client) = upload_client.as_ref() {
-                    upload_newly_generated_files(
-                        client.as_ref(),
-                        PRIMARY_ASSET_SYMBOL,
-                        &mut generated_output_files,
-                        &mut generated_snapshot_files,
-                        &mut latest_local_uploaded_snapshot,
-                        &mut uploaded_parquet_files,
-                    )
-                    .await?;
-                }
+                upload_pending_files_for_states(
+                    upload_client.as_ref(),
+                    &mut coin_states,
+                    &mut generated_snapshot_files,
+                    &mut latest_local_uploaded_snapshot,
+                )
+                .await?;
                 bail!(
                     "node_fills_by_block hit EOF before replica_cmds; unpaired replica timestamp remains: {}ms",
                     replica.block_time_ms
                 );
             }
             (None, Some(fills)) => {
-                unknown_oid_logger.finish()?;
-                if let Some(active_writer) = writer.take() {
-                    let closed_start = current_file_actual_start_block.unwrap_or(fills.block_number);
-                    let closed_end = last_emitted_block.unwrap_or(fills.block_number);
-                    let tmp_path = current_tmp_output_path
-                        .take()
-                        .ok_or_else(|| anyhow!("missing current tmp parquet path at fills eof"))?;
-                    let final_path = close_and_finalize_output_file(
-                        &args.output_parquet,
-                        active_writer,
-                        &mut rows,
-                        &schema,
-                        &tmp_path,
-                        closed_start,
-                        closed_end,
-                    )?;
-                    generated_output_files.push(final_path.clone());
-                    info!(
-                        "[file] close parquet={} actual_range={}..{}",
-                        final_path.display(),
-                        closed_start,
-                        closed_end
-                    );
+                for state in &mut coin_states {
+                    state.unknown_oid_logger.finish()?;
+                    close_open_output_for_coin_state(&args.output_parquet, state, fills.block_number).await?;
                 }
-                if let Some(client) = upload_client.as_ref() {
-                    upload_newly_generated_files(
-                        client.as_ref(),
-                        PRIMARY_ASSET_SYMBOL,
-                        &mut generated_output_files,
-                        &mut generated_snapshot_files,
-                        &mut latest_local_uploaded_snapshot,
-                        &mut uploaded_parquet_files,
-                    )
-                    .await?;
-                }
+                upload_pending_files_for_states(
+                    upload_client.as_ref(),
+                    &mut coin_states,
+                    &mut generated_snapshot_files,
+                    &mut latest_local_uploaded_snapshot,
+                )
+                .await?;
                 bail!(
                     "replica_cmds hit EOF before node_fills_by_block; unpaired fills block {} remains",
                     fills.block_number
@@ -5422,57 +5937,46 @@ async fn main() -> Result<()> {
         }
     }
 
-    unknown_oid_logger.finish()?;
-    if let Some(active_writer) = writer.take() {
-        let closed_start = current_file_actual_start_block.unwrap_or(0);
-        let closed_end = last_emitted_block.unwrap_or(0);
-        let tmp_path =
-            current_tmp_output_path.take().ok_or_else(|| anyhow!("missing current tmp parquet path at final close"))?;
-        let final_path = close_and_finalize_output_file(
-            &args.output_parquet,
-            active_writer,
-            &mut rows,
-            &schema,
-            &tmp_path,
-            closed_start,
-            closed_end,
-        )?;
-        generated_output_files.push(final_path.clone());
-        info!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
+    for state in &mut coin_states {
+        state.unknown_oid_logger.finish()?;
+        let fallback_block = state.last_emitted_block.unwrap_or(0);
+        close_open_output_for_coin_state(&args.output_parquet, state, fallback_block).await?;
     }
 
-    if let Some(client) = upload_client.as_ref() {
-        upload_newly_generated_files(
-            client.as_ref(),
-            PRIMARY_ASSET_SYMBOL,
-            &mut generated_output_files,
-            &mut generated_snapshot_files,
-            &mut latest_local_uploaded_snapshot,
-            &mut uploaded_parquet_files,
-        )
-        .await?;
-    }
+    upload_pending_files_for_states(
+        upload_client.as_ref(),
+        &mut coin_states,
+        &mut generated_snapshot_files,
+        &mut latest_local_uploaded_snapshot,
+    )
+    .await?;
 
     perf_stats.log_summary(processed_blocks_total, started_at.elapsed().as_secs_f64());
     perf_stats.log_read_pair_breakdown(replica_reader.perf_snapshot(), fills_reader.perf_snapshot());
 
-    info!(
-        "Wrote BTC diff parquet files={} output_dir={} unknown_oid_sqlite={} requester_pays={} remaining_live_orders={}",
-        if args.upload {
-            uploaded_parquet_files
-        } else {
-            generated_output_files.len()
-        },
-        args.output_parquet.display(),
-        args.unknown_oid_log_sqlite.display(),
-        requester_pays,
-        orders.len()
-    );
-    if !args.upload {
-        for path in &generated_output_files {
-            info!("  - {}", path.display());
+    for state in &coin_states {
+        info!(
+            "Wrote {} diff parquet files={} output_dir={} unknown_oid_sqlite={} requester_pays={} remaining_live_orders={}",
+            state.config.symbol,
+            if args.upload {
+                state.uploaded_parquet_files
+            } else {
+                state.generated_output_files.len()
+            },
+            args.output_parquet.display(),
+            args.unknown_oid_log_sqlite.display(),
+            requester_pays,
+            state.orders.len()
+        );
+        if !args.upload {
+            for path in &state.generated_output_files {
+                info!("  - {}", path.display());
+            }
         }
     }
+
+    drop(coin_states);
+    unknown_oid_sqlite_worker.finish()?;
 
     Ok(())
 }
