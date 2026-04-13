@@ -64,12 +64,12 @@ const PROGRESS_LOG_INTERVAL_BLOCKS: u64 = 10_000;
 const ENABLE_MISSING_STATUS_WARN: bool = false;
 const LZ4_IO_BUFFER_BYTES: usize = 4 << 20;
 const MAX_REPLICA_PREFETCH_WORKERS: usize = 16;
-const DEFAULT_REPLICA_PREFETCH_WORKERS: usize = 4;
+const DEFAULT_REPLICA_JSON_WORKERS: usize = 3;
+const DEFAULT_REPLICA_LZ4_WORKERS: usize = 2;
 const DEFAULT_REPLICA_PREFETCH: usize = 16;
-const DEFAULT_REPLICA_S3_CONNECTIONS: usize = 2;
+const DEFAULT_REPLICA_S3_RANGE_WORKERS: usize = 3;
 const DEFAULT_REPLICA_PREFETCH_BUFFER_MB: usize = 256;
 const TARGET_REPLICA_CPU_CORES: usize = 4;
-const REPLICA_WORKER_SCALE_UP: usize = 2;
 const REPLICA_PREFETCH_BUFFER_PERMIT_BYTES: usize = 1 << 20;
 const REPLICA_S3_RANGE_PART_BYTES: usize = 16 << 20;
 const WARMUP_STATE_FORMAT_VERSION: u32 = 3;
@@ -111,10 +111,6 @@ fn parse_height_span(raw: &str) -> std::result::Result<u64, String> {
     })?;
 
     parsed.checked_mul(multiplier).ok_or_else(|| format!("--span overflow for '{raw}'"))
-}
-
-fn optional_usize_arg(value: Option<usize>) -> String {
-    value.map(|v| v.to_string()).unwrap_or_else(|| "auto".to_owned())
 }
 
 #[derive(Debug, Parser)]
@@ -187,29 +183,26 @@ struct Args {
     replica_prefetch: usize,
 
     #[arg(
-        long,
-        default_value_t = DEFAULT_REPLICA_PREFETCH_WORKERS,
-        help = "Replica JSON parse worker base value used by auto-tuning (default 4, capped at 16)"
+        long = "json",
+        visible_aliases = ["replica-json-workers", "replica-prefetch-workers"],
+        default_value_t = DEFAULT_REPLICA_JSON_WORKERS,
+        help = "Replica JSON parse workers (default 3, capped at 16)"
     )]
-    replica_prefetch_workers: usize,
+    replica_json_workers: usize,
 
     #[arg(
-        long,
-        help = "Replica JSON parse workers final override; if omitted, auto-tuned from --replica-prefetch-workers and CPU"
+        long = "lz4",
+        visible_alias = "replica-lz4-workers",
+        default_value_t = DEFAULT_REPLICA_LZ4_WORKERS,
+        help = "Replica LZ4 decode workers (default 2)"
     )]
-    replica_json_workers: Option<usize>,
+    replica_lz4_workers: usize,
 
     #[arg(
-        long,
-        help = "Replica LZ4 decode workers override; if omitted, auto-tuned by CPU"
-    )]
-    replica_lz4_workers: Option<usize>,
-
-    #[arg(
-        long = "replica-s3-range-workers",
-        visible_alias = "replica-s3-connections",
-        default_value_t = DEFAULT_REPLICA_S3_CONNECTIONS,
-        help = "Replica S3 range download workers per active object (default 2; old flag --replica-s3-connections is still accepted)"
+        long = "s3",
+        visible_aliases = ["replica-s3-range-workers", "replica-s3-connections"],
+        default_value_t = DEFAULT_REPLICA_S3_RANGE_WORKERS,
+        help = "Replica S3 range download workers per active object (default 3)"
     )]
     replica_s3_range_workers: usize,
 
@@ -2386,13 +2379,12 @@ impl ParallelReplicaLz4Reader {
             .max(s3_range_workers * 2)
             .max(8);
         info!(
-            "[config] replica_prefetch_ring_buffer_mb={} permit_bytes={} total_permits={} range_part_bytes={} chunk_queue_cap={} s3_range_workers={}",
+            "[config] replica_prefetch_ring_buffer_mb={} permit_bytes={} total_permits={} range_part_bytes={} chunk_queue_cap={}",
             replica_prefetch_buffer_mb,
             REPLICA_PREFETCH_BUFFER_PERMIT_BYTES,
             prefetch_buffer_permits,
             REPLICA_S3_RANGE_PART_BYTES,
-            prefetch_stream_chunk_cap,
-            s3_range_workers
+            prefetch_stream_chunk_cap
         );
         Ok(Self {
             source,
@@ -2524,10 +2516,6 @@ impl ReplicaCmdsReader {
         replica_prefetch_buffer_mb: usize,
     ) -> Result<Self> {
         if parallel_lz4_workers > 1 {
-            info!(
-                "[config] replica_lz4_decode=parallel workers={}",
-                parallel_lz4_workers
-            );
             let reader = ParallelReplicaLz4Reader::new(
                 source,
                 s3_client,
@@ -2900,19 +2888,18 @@ impl ReplicaPrefetchReader {
         s3_client: Option<Arc<S3Client>>,
         requester_pays: bool,
         queue_depth: usize,
-        requested_workers: usize,
-        replica_json_workers_override: Option<usize>,
-        replica_lz4_workers_override: Option<usize>,
-        replica_s3_range_workers: usize,
+        requested_json_workers: usize,
+        requested_lz4_workers: usize,
+        requested_s3_range_workers: usize,
         replica_prefetch_buffer_mb: usize,
     ) -> Result<Self> {
-        let requested_workers = requested_workers.clamp(1, MAX_REPLICA_PREFETCH_WORKERS);
         let host_parallelism = std::thread::available_parallelism().map(|parallelism| parallelism.get()).unwrap_or(1);
         let cpu_budget = host_parallelism.clamp(1, TARGET_REPLICA_CPU_CORES);
-        let base_parse_worker_budget = cpu_budget.saturating_sub(1).max(1);
-        let base_parse_workers = requested_workers.min(base_parse_worker_budget);
-        let auto_lz4_workers = host_parallelism.min(REPLICA_WORKER_SCALE_UP).max(1);
-        let requested_lz4_workers = replica_lz4_workers_override.unwrap_or(auto_lz4_workers);
+        let auto_s3_range_workers = DEFAULT_REPLICA_S3_RANGE_WORKERS;
+        let auto_lz4_workers = DEFAULT_REPLICA_LZ4_WORKERS.min(host_parallelism.max(1));
+        let auto_json_workers = DEFAULT_REPLICA_JSON_WORKERS.min(MAX_REPLICA_PREFETCH_WORKERS);
+
+        let s3_range_workers = requested_s3_range_workers.max(1);
         let replica_lz4_decode_workers = requested_lz4_workers.clamp(1, host_parallelism.max(1));
         if requested_lz4_workers != replica_lz4_decode_workers {
             warn!(
@@ -2923,33 +2910,38 @@ impl ReplicaPrefetchReader {
             );
         }
 
-        let auto_parse_workers = base_parse_workers
-            .saturating_mul(REPLICA_WORKER_SCALE_UP)
-            .clamp(1, MAX_REPLICA_PREFETCH_WORKERS);
-        let requested_parse_workers = replica_json_workers_override.unwrap_or(auto_parse_workers);
-        let effective_workers = requested_parse_workers.clamp(1, MAX_REPLICA_PREFETCH_WORKERS);
-        if requested_parse_workers != effective_workers {
+        let effective_workers = requested_json_workers.clamp(1, MAX_REPLICA_PREFETCH_WORKERS);
+        if requested_json_workers != effective_workers {
             warn!(
                 "[config] replica_json_workers requested={} adjusted_to={} max={}",
-                requested_parse_workers,
+                requested_json_workers,
                 effective_workers,
                 MAX_REPLICA_PREFETCH_WORKERS
             );
         }
 
-        let parse_source = if replica_json_workers_override.is_some() { "override" } else { "auto" };
-        let lz4_source = if replica_lz4_workers_override.is_some() { "override" } else { "auto" };
         info!(
-            "[config] replica_prefetch_cpu_plan host_parallelism={} cpu_budget={} prefetch_workers_base={} parse_workers_auto={} parse_workers={} parse_source={} lz4_workers_auto={} lz4_workers={} lz4_source={}",
+            "[config.cpu] host_parallelism={} cpu_budget={}",
             host_parallelism,
-            cpu_budget,
-            base_parse_workers,
-            auto_parse_workers,
-            effective_workers,
-            parse_source,
+            cpu_budget
+        );
+        info!(
+            "[config.s3] workers[auto={}][override={}][effective={}]",
+            auto_s3_range_workers,
+            requested_s3_range_workers,
+            s3_range_workers
+        );
+        info!(
+            "[config.lz4] workers[auto={}][override={}][effective={}]",
             auto_lz4_workers,
-            replica_lz4_decode_workers,
-            lz4_source
+            requested_lz4_workers,
+            replica_lz4_decode_workers
+        );
+        info!(
+            "[config.json] workers[auto={}][override={}][effective={}]",
+            auto_json_workers,
+            requested_json_workers,
+            effective_workers
         );
         let channel_capacity = queue_depth.max(1);
 
@@ -2958,7 +2950,7 @@ impl ReplicaPrefetchReader {
             s3_client,
             requester_pays,
             replica_lz4_decode_workers,
-            replica_s3_range_workers,
+            s3_range_workers,
             replica_prefetch_buffer_mb,
         )
         .await?;
@@ -4503,15 +4495,15 @@ async fn main() -> Result<()> {
     Builder::from_env(Env::default().default_filter_or("info")).format_timestamp_micros().init();
 
     let args = Args::parse();
-    let requested_prefetch_workers = args.replica_prefetch_workers;
-    if requested_prefetch_workers == 0 {
-        bail!("--replica-prefetch-workers must be >= 1");
+    let requested_json_workers = args.replica_json_workers;
+    if requested_json_workers == 0 {
+        bail!("--json must be >= 1");
     }
-    let replica_prefetch_workers = requested_prefetch_workers.min(MAX_REPLICA_PREFETCH_WORKERS);
-    if requested_prefetch_workers > MAX_REPLICA_PREFETCH_WORKERS {
+    let replica_json_workers = requested_json_workers.min(MAX_REPLICA_PREFETCH_WORKERS);
+    if requested_json_workers > MAX_REPLICA_PREFETCH_WORKERS {
         warn!(
-            "[config] replica_prefetch_workers={} exceeds max {}; clamping",
-            requested_prefetch_workers,
+            "[config] json_workers={} exceeds max {}; clamping",
+            requested_json_workers,
             MAX_REPLICA_PREFETCH_WORKERS
         );
     }
@@ -4519,17 +4511,13 @@ async fn main() -> Result<()> {
     if replica_prefetch == 0 {
         bail!("--replica-prefetch must be >= 1");
     }
-    let replica_json_workers_override = args.replica_json_workers;
-    if replica_json_workers_override == Some(0) {
-        bail!("--replica-json-workers must be >= 1");
-    }
-    let replica_lz4_workers_override = args.replica_lz4_workers;
-    if replica_lz4_workers_override == Some(0) {
-        bail!("--replica-lz4-workers must be >= 1");
+    let replica_lz4_workers = args.replica_lz4_workers;
+    if replica_lz4_workers == 0 {
+        bail!("--lz4 must be >= 1");
     }
     let replica_s3_range_workers = args.replica_s3_range_workers;
     if replica_s3_range_workers == 0 {
-        bail!("--replica-s3-range-workers must be >= 1");
+        bail!("--s3 must be >= 1");
     }
     let replica_prefetch_buffer_mb = args.replica_prefetch_buffer_mb;
     if replica_prefetch_buffer_mb == 0 {
@@ -4538,12 +4526,8 @@ async fn main() -> Result<()> {
     let requester_pays = REQUESTER_PAYS_ALWAYS;
     let startup_started_at = Instant::now();
     info!(
-        "[config] json_parser=simd-json replica_prefetch={} replica_prefetch_workers_base={} replica_json_workers={} replica_lz4_workers={} replica_s3_range_workers={} replica_prefetch_buffer_mb={}",
+        "[config] json_parser=simd-json replica_prefetch={} replica_prefetch_buffer_mb={}",
         replica_prefetch,
-        requested_prefetch_workers,
-        optional_usize_arg(replica_json_workers_override),
-        optional_usize_arg(replica_lz4_workers_override),
-        replica_s3_range_workers,
         replica_prefetch_buffer_mb
     );
     if args.start.is_some() ^ args.span.is_some() {
@@ -4708,9 +4692,8 @@ async fn main() -> Result<()> {
         s3_client.clone(),
         requester_pays,
         replica_prefetch,
-        replica_prefetch_workers,
-        replica_json_workers_override,
-        replica_lz4_workers_override,
+        replica_json_workers,
+        replica_lz4_workers,
         replica_s3_range_workers,
         replica_prefetch_buffer_mb,
     )
