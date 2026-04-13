@@ -4138,6 +4138,49 @@ async fn upload_and_cleanup_generated_files(
     Ok(())
 }
 
+async fn upload_newly_generated_files(
+    s3_client: &S3Client,
+    coin_symbol: &str,
+    generated_output_files: &mut Vec<PathBuf>,
+    generated_snapshot_files: &mut Vec<PathBuf>,
+    latest_local_snapshot: &mut Option<PathBuf>,
+    uploaded_parquet_files: &mut usize,
+) -> Result<()> {
+    if !generated_output_files.is_empty() {
+        let parquet_files = std::mem::take(generated_output_files);
+        *uploaded_parquet_files = uploaded_parquet_files.saturating_add(parquet_files.len());
+        upload_and_cleanup_generated_files(s3_client, coin_symbol, &parquet_files, &[]).await?;
+    }
+
+    if generated_snapshot_files.is_empty() {
+        return Ok(());
+    }
+
+    let snapshot_files = std::mem::take(generated_snapshot_files);
+    for path in snapshot_files {
+        upload_and_cleanup_generated_files(s3_client, coin_symbol, &[], std::slice::from_ref(&path)).await?;
+
+        if let Some(previous) = latest_local_snapshot.replace(path.clone())
+            && previous != path
+            && previous.is_file()
+        {
+            std::fs::remove_file(&previous).with_context(|| {
+                format!(
+                    "failed to remove superseded local warmup snapshot {}",
+                    previous.display()
+                )
+            })?;
+            info!(
+                "[upload] removed_superseded_snapshot path={} kept={}",
+                previous.display(),
+                path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn auto_match_warmup_state_path(
     output_dir: Option<&Path>,
     output_block_range: Option<(u64, u64)>,
@@ -4640,6 +4683,10 @@ async fn main() -> Result<()> {
         replica_queue_depth,
         replica_prefetch_buffer_mb
     );
+    info!(
+        "[config.upload] enabled={} mode=incremental_parquet_and_snapshot",
+        args.upload
+    );
     if args.start.is_some() ^ args.span.is_some() {
         bail!("--start and --span must be provided together");
     }
@@ -4751,6 +4798,16 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let upload_client = if args.upload {
+        Some(
+            s3_client
+                .as_ref()
+                .ok_or_else(|| anyhow!("--upload requires initialized S3 client"))?
+                .clone(),
+        )
+    } else {
+        None
+    };
 
     let replica_reader_source = match &replica_source {
         InputSource::LocalFile(path) => {
@@ -4854,6 +4911,8 @@ async fn main() -> Result<()> {
     let mut last_emitted_block: Option<u64> = None;
     let mut generated_output_files: Vec<PathBuf> = Vec::new();
     let mut generated_snapshot_files: Vec<PathBuf> = Vec::new();
+    let mut latest_local_uploaded_snapshot = selected_warmup_state_path.clone();
+    let mut uploaded_parquet_files: usize = 0;
 
     let mut rows = RowBuffer::default();
     let mut orders: HashMap<u64, OrderState> = HashMap::new();
@@ -4956,6 +5015,17 @@ async fn main() -> Result<()> {
                                 closed_start,
                                 closed_end
                             );
+                        }
+                        if let Some(client) = upload_client.as_ref() {
+                            upload_newly_generated_files(
+                                client.as_ref(),
+                                PRIMARY_ASSET_SYMBOL,
+                                &mut generated_output_files,
+                                &mut generated_snapshot_files,
+                                &mut latest_local_uploaded_snapshot,
+                                &mut uploaded_parquet_files,
+                            )
+                            .await?;
                         }
                         bail!(
                             "block {} timestamp mismatch: replica={}ms fills={}ms delta={}ms tolerance={}ms",
@@ -5091,6 +5161,17 @@ async fn main() -> Result<()> {
                         &trigger_refs,
                         &mut generated_snapshot_files,
                     )?;
+                    if let Some(client) = upload_client.as_ref() {
+                        upload_newly_generated_files(
+                            client.as_ref(),
+                            PRIMARY_ASSET_SYMBOL,
+                            &mut generated_output_files,
+                            &mut generated_snapshot_files,
+                            &mut latest_local_uploaded_snapshot,
+                            &mut uploaded_parquet_files,
+                        )
+                        .await?;
+                    }
                     let (fetched_replica, fetched_fills) =
                         {
                             let fetch_pair_started_at = Instant::now();
@@ -5233,6 +5314,17 @@ async fn main() -> Result<()> {
                     &trigger_refs,
                     &mut generated_snapshot_files,
                 )?;
+                if let Some(client) = upload_client.as_ref() {
+                    upload_newly_generated_files(
+                        client.as_ref(),
+                        PRIMARY_ASSET_SYMBOL,
+                        &mut generated_output_files,
+                        &mut generated_snapshot_files,
+                        &mut latest_local_uploaded_snapshot,
+                        &mut uploaded_parquet_files,
+                    )
+                    .await?;
+                }
                 let fetch_fills_started_at = Instant::now();
                 next_fills = fills_reader.next_batch().await?;
                 perf_stats.fetch_fills_only_ns += fetch_fills_started_at.elapsed().as_nanos();
@@ -5269,6 +5361,17 @@ async fn main() -> Result<()> {
                         closed_end
                     );
                 }
+                if let Some(client) = upload_client.as_ref() {
+                    upload_newly_generated_files(
+                        client.as_ref(),
+                        PRIMARY_ASSET_SYMBOL,
+                        &mut generated_output_files,
+                        &mut generated_snapshot_files,
+                        &mut latest_local_uploaded_snapshot,
+                        &mut uploaded_parquet_files,
+                    )
+                    .await?;
+                }
                 bail!(
                     "node_fills_by_block hit EOF before replica_cmds; unpaired replica timestamp remains: {}ms",
                     replica.block_time_ms
@@ -5299,6 +5402,17 @@ async fn main() -> Result<()> {
                         closed_end
                     );
                 }
+                if let Some(client) = upload_client.as_ref() {
+                    upload_newly_generated_files(
+                        client.as_ref(),
+                        PRIMARY_ASSET_SYMBOL,
+                        &mut generated_output_files,
+                        &mut generated_snapshot_files,
+                        &mut latest_local_uploaded_snapshot,
+                        &mut uploaded_parquet_files,
+                    )
+                    .await?;
+                }
                 bail!(
                     "replica_cmds hit EOF before node_fills_by_block; unpaired fills block {} remains",
                     fills.block_number
@@ -5327,15 +5441,14 @@ async fn main() -> Result<()> {
         info!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
     }
 
-    if args.upload {
-        let upload_client = s3_client
-            .as_ref()
-            .ok_or_else(|| anyhow!("--upload requires initialized S3 client"))?;
-        upload_and_cleanup_generated_files(
-            upload_client.as_ref(),
+    if let Some(client) = upload_client.as_ref() {
+        upload_newly_generated_files(
+            client.as_ref(),
             PRIMARY_ASSET_SYMBOL,
-            &generated_output_files,
-            &generated_snapshot_files,
+            &mut generated_output_files,
+            &mut generated_snapshot_files,
+            &mut latest_local_uploaded_snapshot,
+            &mut uploaded_parquet_files,
         )
         .await?;
     }
@@ -5345,14 +5458,20 @@ async fn main() -> Result<()> {
 
     info!(
         "Wrote BTC diff parquet files={} output_dir={} unknown_oid_sqlite={} requester_pays={} remaining_live_orders={}",
-        generated_output_files.len(),
+        if args.upload {
+            uploaded_parquet_files
+        } else {
+            generated_output_files.len()
+        },
         args.output_parquet.display(),
         args.unknown_oid_log_sqlite.display(),
         requester_pays,
         orders.len()
     );
-    for path in &generated_output_files {
-        info!("  - {}", path.display());
+    if !args.upload {
+        for path in &generated_output_files {
+            info!("  - {}", path.display());
+        }
     }
 
     Ok(())
