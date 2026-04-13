@@ -23,6 +23,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use async_compression::tokio::bufread::Lz4Decoder;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::RequestPayer;
 use chrono::{Datelike, Days, NaiveDate, Timelike};
 use clap::Parser;
@@ -63,13 +64,15 @@ const CANCEL_STATUS_CANCELED: &str = "canceled";
 const PROGRESS_LOG_INTERVAL_BLOCKS: u64 = 10_000;
 const ENABLE_MISSING_STATUS_WARN: bool = false;
 const LZ4_IO_BUFFER_BYTES: usize = 4 << 20;
-const MAX_REPLICA_PREFETCH_WORKERS: usize = 16;
+const MAX_REPLICA_JSON_WORKERS: usize = 8;
 const DEFAULT_REPLICA_JSON_WORKERS: usize = 3;
 const DEFAULT_REPLICA_LZ4_WORKERS: usize = 2;
-const DEFAULT_REPLICA_PREFETCH: usize = 16;
+const DEFAULT_REPLICA_JSON_QUEUE_DEPTH: usize = 16;
 const DEFAULT_REPLICA_S3_RANGE_WORKERS: usize = 3;
 const DEFAULT_REPLICA_PREFETCH_BUFFER_MB: usize = 256;
 const TARGET_REPLICA_CPU_CORES: usize = 4;
+const BLOCK_TIME_TOLERANCE_NS: i64 = 2_000_000;
+const BLOCK_TIME_MATCH_TOLERANCE_MS: i64 = 0;
 const REPLICA_PREFETCH_BUFFER_PERMIT_BYTES: usize = 1 << 20;
 const REPLICA_S3_RANGE_PART_BYTES: usize = 16 << 20;
 const WARMUP_STATE_FORMAT_VERSION: u32 = 3;
@@ -77,6 +80,8 @@ const WARMUP_STATE_ZSTD_LEVEL: i32 = 3;
 const DEFAULT_OUTPUT_DIR: &str = "/home/aimee/hyperliquid";
 const DEFAULT_UNKNOWN_OID_SQLITE_FILE: &str = "/home/aimee/hyperliquid/build_btc_diff_unknown_oid.sqlite";
 const PRIMARY_ASSET_SYMBOL: &str = "BTC";
+const UPLOAD_BUCKET: &str = "hyper0";
+const UPLOAD_ROOT_PREFIX: &str = "hyperliquid";
 
 fn parse_height_span(raw: &str) -> std::result::Result<u64, String> {
     let trimmed = raw.trim();
@@ -136,6 +141,13 @@ struct Args {
     #[arg(long, default_value = DEFAULT_UNKNOWN_OID_SQLITE_FILE)]
     unknown_oid_log_sqlite: PathBuf,
 
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Upload generated parquet and warmup msgpack.zst files to s3://hyper0; parquet is deleted locally after upload, latest warmup msgpack.zst is kept for local resume"
+    )]
+    upload: bool,
+
     #[arg(long = "start", visible_alias = "start-height")]
     start: Option<u64>,
 
@@ -169,24 +181,11 @@ struct Args {
     )]
     warmup_state_file: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 2_000_000)]
-    block_time_tolerance_ns: i64,
-
-    #[arg(long, default_value_t = 0)]
-    block_time_match_tolerance_ms: i64,
-
-    #[arg(
-        long,
-        default_value_t = DEFAULT_REPLICA_PREFETCH,
-        help = "Replica async preparse queue depth to overlap read/parse with processing (default 16)"
-    )]
-    replica_prefetch: usize,
-
     #[arg(
         long = "json",
-        visible_aliases = ["replica-json-workers", "replica-prefetch-workers"],
+        visible_alias = "replica-json-workers",
         default_value_t = DEFAULT_REPLICA_JSON_WORKERS,
-        help = "Replica JSON parse workers (default 3, capped at 16)"
+        help = "Replica JSON parse workers (default 3, capped at 8)"
     )]
     replica_json_workers: usize,
 
@@ -2897,7 +2896,7 @@ impl ReplicaPrefetchReader {
         let cpu_budget = host_parallelism.clamp(1, TARGET_REPLICA_CPU_CORES);
         let auto_s3_range_workers = DEFAULT_REPLICA_S3_RANGE_WORKERS;
         let auto_lz4_workers = DEFAULT_REPLICA_LZ4_WORKERS.min(host_parallelism.max(1));
-        let auto_json_workers = DEFAULT_REPLICA_JSON_WORKERS.min(MAX_REPLICA_PREFETCH_WORKERS);
+        let auto_json_workers = DEFAULT_REPLICA_JSON_WORKERS.min(MAX_REPLICA_JSON_WORKERS);
 
         let s3_range_workers = requested_s3_range_workers.max(1);
         let replica_lz4_decode_workers = requested_lz4_workers.clamp(1, host_parallelism.max(1));
@@ -2910,13 +2909,13 @@ impl ReplicaPrefetchReader {
             );
         }
 
-        let effective_workers = requested_json_workers.clamp(1, MAX_REPLICA_PREFETCH_WORKERS);
+        let effective_workers = requested_json_workers.clamp(1, MAX_REPLICA_JSON_WORKERS);
         if requested_json_workers != effective_workers {
             warn!(
                 "[config] replica_json_workers requested={} adjusted_to={} max={}",
                 requested_json_workers,
                 effective_workers,
-                MAX_REPLICA_PREFETCH_WORKERS
+                MAX_REPLICA_JSON_WORKERS
             );
         }
 
@@ -4027,6 +4026,118 @@ fn build_warmup_state_output_path(output_dir: &Path, checkpoint_block_number: u6
     Ok(output_dir.join(format!("warmup_state_{checkpoint_block_number}.msgpack.zst")))
 }
 
+fn build_upload_key(path: &Path, coin_lower: &str) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    if file_name.ends_with(".parquet") {
+        return Some(format!("{UPLOAD_ROOT_PREFIX}/{coin_lower}_diff/{file_name}"));
+    }
+    if file_name.ends_with(".msgpack.zst") {
+        return Some(format!("{UPLOAD_ROOT_PREFIX}/{coin_lower}_snapshot/{file_name}"));
+    }
+    None
+}
+
+fn snapshot_checkpoint_from_path(path: &Path) -> Option<u64> {
+    let file_name = path.file_name()?.to_str()?;
+    let checkpoint = file_name
+        .strip_prefix("warmup_state_")?
+        .strip_suffix(".msgpack.zst")?;
+    checkpoint.parse::<u64>().ok()
+}
+
+async fn upload_and_cleanup_generated_files(
+    s3_client: &S3Client,
+    coin_symbol: &str,
+    parquet_files: &[PathBuf],
+    snapshot_files: &[PathBuf],
+) -> Result<()> {
+    let coin_lower = coin_symbol.to_ascii_lowercase();
+    info!(
+        "[upload] start bucket={} coin={} parquet_files={} snapshot_files={}",
+        UPLOAD_BUCKET,
+        coin_lower,
+        parquet_files.len(),
+        snapshot_files.len()
+    );
+
+    let retained_snapshot = snapshot_files
+        .iter()
+        .filter_map(|path| snapshot_checkpoint_from_path(path).map(|checkpoint| (checkpoint, path.clone())))
+        .max_by_key(|(checkpoint, _)| *checkpoint)
+        .map(|(_, path)| path)
+        .or_else(|| snapshot_files.last().cloned());
+    if let Some(path) = retained_snapshot.as_ref() {
+        info!("[upload] retain_latest_snapshot local={}", path.display());
+    }
+
+    let mut uploaded_files = 0usize;
+    let mut removed_files = 0usize;
+
+    for path in parquet_files {
+        let Some(key) = build_upload_key(path, &coin_lower) else {
+            continue;
+        };
+        let body = ByteStream::from_path(path)
+            .await
+            .with_context(|| format!("failed to open upload source file {}", path.display()))?;
+        s3_client
+            .put_object()
+            .bucket(UPLOAD_BUCKET)
+            .key(&key)
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("failed to upload {} to s3://{}/{}", path.display(), UPLOAD_BUCKET, key))?;
+        info!("[upload] uploaded local={} remote=s3://{}/{}", path.display(), UPLOAD_BUCKET, key);
+
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove uploaded local file {}", path.display()))?;
+        info!("[upload] removed_local path={}", path.display());
+        uploaded_files += 1;
+        removed_files += 1;
+    }
+
+    for path in snapshot_files {
+        let Some(key) = build_upload_key(path, &coin_lower) else {
+            continue;
+        };
+        let body = ByteStream::from_path(path)
+            .await
+            .with_context(|| format!("failed to open upload source file {}", path.display()))?;
+        s3_client
+            .put_object()
+            .bucket(UPLOAD_BUCKET)
+            .key(&key)
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("failed to upload {} to s3://{}/{}", path.display(), UPLOAD_BUCKET, key))?;
+        info!("[upload] uploaded local={} remote=s3://{}/{}", path.display(), UPLOAD_BUCKET, key);
+
+        if retained_snapshot.as_ref().is_some_and(|retained| retained == path) {
+            info!("[upload] kept_local_snapshot path={} reason=warmup_resume_cache", path.display());
+            uploaded_files += 1;
+            continue;
+        }
+
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove uploaded local file {}", path.display()))?;
+        info!("[upload] removed_local path={}", path.display());
+        uploaded_files += 1;
+        removed_files += 1;
+    }
+
+    info!(
+        "[upload] complete bucket={} uploaded_files={} removed_local_files={} parquet_files={} snapshot_files={}",
+        UPLOAD_BUCKET,
+        uploaded_files,
+        removed_files,
+        parquet_files.len(),
+        snapshot_files.len()
+    );
+    Ok(())
+}
+
 fn auto_match_warmup_state_path(
     output_dir: Option<&Path>,
     output_block_range: Option<(u64, u64)>,
@@ -4116,6 +4227,7 @@ fn maybe_write_warmup_state_snapshot(
     orders: &HashMap<u64, OrderState>,
     cloid_to_oid: &HashMap<String, HashMap<String, u64>>,
     trigger_refs: &TriggerOrderRefs,
+    generated_snapshot_files: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let Some(output_dir) = output_dir else {
         return Ok(());
@@ -4148,6 +4260,7 @@ fn maybe_write_warmup_state_snapshot(
         cloid_mapping_entry_count(cloid_to_oid),
         trigger_refs.oid_to_cloid.len(),
     );
+    generated_snapshot_files.push(final_path);
     Ok(())
 }
 
@@ -4499,18 +4612,15 @@ async fn main() -> Result<()> {
     if requested_json_workers == 0 {
         bail!("--json must be >= 1");
     }
-    let replica_json_workers = requested_json_workers.min(MAX_REPLICA_PREFETCH_WORKERS);
-    if requested_json_workers > MAX_REPLICA_PREFETCH_WORKERS {
+    let replica_json_workers = requested_json_workers.min(MAX_REPLICA_JSON_WORKERS);
+    if requested_json_workers > MAX_REPLICA_JSON_WORKERS {
         warn!(
             "[config] json_workers={} exceeds max {}; clamping",
             requested_json_workers,
-            MAX_REPLICA_PREFETCH_WORKERS
+            MAX_REPLICA_JSON_WORKERS
         );
     }
-    let replica_prefetch = args.replica_prefetch;
-    if replica_prefetch == 0 {
-        bail!("--replica-prefetch must be >= 1");
-    }
+    let replica_queue_depth = DEFAULT_REPLICA_JSON_QUEUE_DEPTH;
     let replica_lz4_workers = args.replica_lz4_workers;
     if replica_lz4_workers == 0 {
         bail!("--lz4 must be >= 1");
@@ -4526,8 +4636,8 @@ async fn main() -> Result<()> {
     let requester_pays = REQUESTER_PAYS_ALWAYS;
     let startup_started_at = Instant::now();
     info!(
-        "[config] json_parser=simd-json replica_prefetch={} replica_prefetch_buffer_mb={}",
-        replica_prefetch,
+        "[config] json_parser=simd-json replica_queue_depth={} replica_prefetch_buffer_mb={}",
+        replica_queue_depth,
         replica_prefetch_buffer_mb
     );
     if args.start.is_some() ^ args.span.is_some() {
@@ -4629,7 +4739,7 @@ async fn main() -> Result<()> {
 
     let replica_source = InputSource::parse(&args.replica_cmds).context("parsing --replica_cmds")?;
     let node_fills_source = InputSource::parse(&args.node_fills_by_block).context("parsing --node_fills_by_block")?;
-    let uses_s3 = replica_source.requires_s3() || node_fills_source.requires_s3();
+    let uses_s3 = replica_source.requires_s3() || node_fills_source.requires_s3() || args.upload;
     let mut startup_aws_config_secs: Option<f64> = None;
     let mut startup_replica_keys_resolve_secs: Option<f64> = None;
     let mut startup_replica_keys_count: Option<usize> = None;
@@ -4691,7 +4801,7 @@ async fn main() -> Result<()> {
         replica_reader_source,
         s3_client.clone(),
         requester_pays,
-        replica_prefetch,
+        replica_queue_depth,
         replica_json_workers,
         replica_lz4_workers,
         replica_s3_range_workers,
@@ -4743,6 +4853,7 @@ async fn main() -> Result<()> {
     let mut current_file_actual_start_block: Option<u64> = None;
     let mut last_emitted_block: Option<u64> = None;
     let mut generated_output_files: Vec<PathBuf> = Vec::new();
+    let mut generated_snapshot_files: Vec<PathBuf> = Vec::new();
 
     let mut rows = RowBuffer::default();
     let mut orders: HashMap<u64, OrderState> = HashMap::new();
@@ -4799,7 +4910,7 @@ async fn main() -> Result<()> {
         .map(|(start_height, end_height)| format!("{start_height}..{end_height}"))
         .unwrap_or_else(|| "all".to_owned());
     info!(
-        "[startup] ready_for_processing elapsed_total={:.3}s s3={} aws_cfg={} replica_keys={} key_resolve={} prefetch_workers={} cleaned_tmp={} read_range={} output_range={}",
+        "[startup] ready_for_processing elapsed_total={:.3}s s3={} aws_cfg={} replica_keys={} key_resolve={} reader_workers={} cleaned_tmp={} read_range={} output_range={}",
         startup_started_at.elapsed().as_secs_f64(),
         uses_s3,
         startup_aws_config,
@@ -4819,9 +4930,9 @@ async fn main() -> Result<()> {
         match (&next_replica, &next_fills) {
             (Some(replica), Some(fills)) => {
                 let delta_ns = (replica.block_time_ns - fills.block_time_ns).abs();
-                if delta_ns <= args.block_time_tolerance_ns {
+                if delta_ns <= BLOCK_TIME_TOLERANCE_NS {
                     let block_time_delta = (replica.block_time_ms - fills.block_time_ms).abs();
-                    if block_time_delta > args.block_time_match_tolerance_ms {
+                    if block_time_delta > BLOCK_TIME_MATCH_TOLERANCE_MS {
                         unknown_oid_logger.finish()?;
                         if let Some(active_writer) = writer.take() {
                             let closed_start = current_file_actual_start_block.unwrap_or(fills.block_number);
@@ -4852,7 +4963,7 @@ async fn main() -> Result<()> {
                             replica.block_time_ms,
                             fills.block_time_ms,
                             block_time_delta,
-                            args.block_time_match_tolerance_ms
+                            BLOCK_TIME_MATCH_TOLERANCE_MS
                         );
                     }
 
@@ -4978,6 +5089,7 @@ async fn main() -> Result<()> {
                         &orders,
                         &cloid_to_oid,
                         &trigger_refs,
+                        &mut generated_snapshot_files,
                     )?;
                     let (fetched_replica, fetched_fills) =
                         {
@@ -5119,6 +5231,7 @@ async fn main() -> Result<()> {
                     &orders,
                     &cloid_to_oid,
                     &trigger_refs,
+                    &mut generated_snapshot_files,
                 )?;
                 let fetch_fills_started_at = Instant::now();
                 next_fills = fills_reader.next_batch().await?;
@@ -5127,7 +5240,7 @@ async fn main() -> Result<()> {
             (Some(replica), None) => {
                 if last_seen_fills_ts_ns
                     .is_some_and(|last_ts_ns| {
-                        replica.block_time_ns > last_ts_ns.saturating_add(args.block_time_tolerance_ns)
+                        replica.block_time_ns > last_ts_ns.saturating_add(BLOCK_TIME_TOLERANCE_NS)
                     })
                 {
                     break;
@@ -5212,6 +5325,19 @@ async fn main() -> Result<()> {
         )?;
         generated_output_files.push(final_path.clone());
         info!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
+    }
+
+    if args.upload {
+        let upload_client = s3_client
+            .as_ref()
+            .ok_or_else(|| anyhow!("--upload requires initialized S3 client"))?;
+        upload_and_cleanup_generated_files(
+            upload_client.as_ref(),
+            PRIMARY_ASSET_SYMBOL,
+            &generated_output_files,
+            &generated_snapshot_files,
+        )
+        .await?;
     }
 
     perf_stats.log_summary(processed_blocks_total, started_at.elapsed().as_secs_f64());
