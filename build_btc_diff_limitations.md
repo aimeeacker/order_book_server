@@ -10,10 +10,40 @@
 
 本轮代码变更后做了快速回归验证（`2026-04-12`, `span=2000`）：
 
-- 执行命令：`./target/release/build_btc_diff --output-parquet /tmp/btc_diff_out --start-height 951980001 --height-span 2000`
+- 编译命令：`RUSTFLAGS="-C target-cpu=native" cargo build --release -p binaries --bin build_btc_diff`
+- 执行命令：
+
+```bash
+./target/release/build_btc_diff \
+  --output-parquet "$out_dir" \
+  --unknown-oid-log-sqlite "$out_sqlite" \
+  --start-height "$START" \
+  --height-span "$SPAN" \
+  --warmup "$WARMUP" \
+  --warmup-state-output-dir "$state_dir" \
+  --warmup-state-file "$state_file" \
+  --replica-prefetch-workers 4 \
+  --replica-prefetch 16
+```
 - 输出目录：`/tmp/btc_diff_out`（文件名由程序按实际起止高度生成）
+- 状态快照目录：`--warmup-state-output-dir` 可选；warmup 期间不落快照，warmup 结束块（`output_start-1`，例如 `938000000`）会立即输出一次 `warmup_state_<block>.msgpack.zst`，之后按 1m block 边界继续输出（zstd level 3）
+- 状态恢复文件：`--warmup-state-file` 可选，启动时先恢复 live state/trigger 索引，缩短或消除 warmup 回放窗口
 - `remove/fill` 行数：`0`
 - `remove/cancel` 中 `oid IS NULL` 行数：`0`
+
+## 最近主要改动
+
+下面是这轮 git 变更的主线，便于快速理解当前代码和旧版本的差异：
+
+- `replica_cmds` 读路径新增并行 LZ4 分块解压，并保持输出顺序不变。
+- 读取链路从“串行解压 + 并行 JSON 解析”扩展成“并行解压 + 并行 JSON 解析 + 有序回放”。
+- `replica_prefetch_workers` 默认值是 `4`，`replica_prefetch` 未显式传入时默认 `16`，并保留 `--replica-prefetch-workers` 上限为 16。
+- `build_btc_diff` 的进度日志改为每 `10000 block` 打印一次，warmup/processing 两段都统一使用同一间隔。
+- `--warmup` 从固定必填改为可选参数，支持不传表示禁用、单独传 `--warmup` 使用默认值，也支持 `20k / 2m` 这类后缀。
+- 运行时新增更细的 perf 统计，包括 `read_line_lz4`、`json_parse`、`s3_get`、`process_block`、`prune` 等分段。
+- 新增独立 LZ4 并发解压 bench，用于验证顺序、完整性和加速比。
+
+结合当前压测结果，`w4/p16` 仍是固定 `workers=4` 时更稳的甜点，`w4/p20` 没有继续带来收益。
 
 ## 输入与基本假设
 
@@ -46,12 +76,17 @@
 - 未知 `oid` 的 `cancel` fallback 已禁用（不再落 `remove/cancel`）
 - 未知旧单的 `modify` cancel fallback 已禁用（不再落 `remove/cancel`）
 - live state 引入 24 小时 TTL：订单入 state 时记录创建 `block/time`，仅在 10000 block 边界执行一次过期清理，避免内存无限增长
+- live state 过期索引改为“按 `(created_time_ms, oid)` 排序的活跃索引”，不再累计历史入簿事件队列，过期清理与取消/成交删除都会同步回收索引
 - 未知 `oid` 的 `modify/cancel` 诊断日志按 10000 block 窗口写入 SQLite
+- 进度日志除 `live_orders` 外，额外打印 `known_oids / order_expiry_index / known_oid_expiry_queue / cloid_map_entries`，用于观察内存相关结构体积
 - parquet row-group 按 `10000 block` 边界切分（按区块窗口落组，而非按固定行数）
 - parquet 文件按 `1000000 block` 边界轮转：跨 1m 边界会先关闭当前文件再打开新文件
+- 若配置 `--warmup-state-output-dir`，warmup 期间不会输出快照；warmup 结束块（`output_start-1`）会强制输出一份，之后在每个 `1000000 block` 边界额外输出（msgpack + zstd3）
+- 支持 `--warmup-state-file <path>` 在启动时恢复 `live orders / trigger refs / known oids`，用于替代超长 warmup（例如 1.2m）
 - `--output-parquet` 现在传入输出目录，产物命名改为 `btc_diff_<actual_start>_<actual_end>.parquet`，重名自动 `_dupN`
 - `replica_cmds` 在 `20250720..20260331` 区间使用硬编码日索引直达 S3 key，不再递归扫描目录
-- 支持 `--warmup <blocks>`（默认 `1200000`）：读取区间会向前扩展 warmup，但 warmup 期间不写 parquet、不写 unknown-oid SQLite，仅用于恢复 live state
+- `--height-span` 现在支持 `20k / 2m` 这类后缀，便于快速指定长区间压测范围
+- 支持 `--warmup [blocks]`：不传则禁用 warmup，只写 `--warmup` 时使用默认 `1200000`，也支持 `20k / 2m` 这类后缀；warmup 期间不写 parquet、不写 unknown-oid SQLite，仅用于恢复 live state
 - 控制台会打印 warmup 开始/结束
 
 ## replica_cmds 硬编码索引
