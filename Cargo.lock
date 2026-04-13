@@ -1692,6 +1692,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "binaries"
 version = "0.1.0"
 dependencies = [
+ "ahash 0.8.12",
  "anyhow",
  "arrow-array 54.3.1",
  "arrow-schema 54.3.1",
@@ -1702,6 +1703,7 @@ dependencies = [
  "clap",
  "env_logger",
  "futures-util",
+ "log",
  "lz4",
  "parquet 54.3.1",
  "rayon",
