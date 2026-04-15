@@ -134,8 +134,7 @@ where
         }
 
         let mut descriptor = [0_u8; 2];
-        read_exact_required(&mut reader, &mut descriptor, "reading lz4 FLG/BD")
-            .await?;
+        read_exact_required(&mut reader, &mut descriptor, "reading lz4 FLG/BD").await?;
         let flg = descriptor[0];
         let bd = descriptor[1];
 
@@ -155,20 +154,18 @@ where
             bail!("lz4 frame has dependent blocks; parallel block decode requires independent blocks");
         }
 
-        let mut descriptor_tail = vec![0_u8; 1 + if content_size_present { 8 } else { 0 } + if dict_id_present { 4 } else { 0 }];
-        read_exact_required(&mut reader, &mut descriptor_tail, "reading lz4 descriptor tail")
-            .await?;
+        let mut descriptor_tail =
+            vec![0_u8; 1 + if content_size_present { 8 } else { 0 } + if dict_id_present { 4 } else { 0 }];
+        read_exact_required(&mut reader, &mut descriptor_tail, "reading lz4 descriptor tail").await?;
 
         loop {
             let mut block_header = [0_u8; 4];
-            read_exact_required(&mut reader, &mut block_header, "reading lz4 block header")
-                .await?;
+            read_exact_required(&mut reader, &mut block_header, "reading lz4 block header").await?;
             let block_descriptor = u32::from_le_bytes(block_header);
             if block_descriptor == 0 {
                 if content_checksum_present {
                     let mut checksum = [0_u8; 4];
-                    read_exact_required(&mut reader, &mut checksum, "reading lz4 content checksum")
-                        .await?;
+                    read_exact_required(&mut reader, &mut checksum, "reading lz4 content checksum").await?;
                 }
                 break;
             }
@@ -176,37 +173,27 @@ where
             let is_raw = (block_descriptor & 0x8000_0000) != 0;
             let payload_size = (block_descriptor & 0x7FFF_FFFF) as usize;
             if payload_size > max_block_size {
-                bail!(
-                    "lz4 block payload size {} exceeds max block size {}",
-                    payload_size,
-                    max_block_size
-                );
+                bail!("lz4 block payload size {} exceeds max block size {}", payload_size, max_block_size);
             }
 
             let mut payload = vec![0_u8; payload_size];
             if payload_size > 0 {
-                read_exact_required(&mut reader, &mut payload, "reading lz4 block payload")
-                    .await?;
+                read_exact_required(&mut reader, &mut payload, "reading lz4 block payload").await?;
             }
 
             if block_checksum {
                 let mut checksum = [0_u8; 4];
-                read_exact_required(&mut reader, &mut checksum, "reading lz4 block checksum")
-                    .await?;
+                read_exact_required(&mut reader, &mut checksum, "reading lz4 block checksum").await?;
             }
 
             let current_seq = seq;
             seq = seq.saturating_add(1);
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .context("acquiring lz4 decode worker permit")?;
+            let permit = semaphore.clone().acquire_owned().await.context("acquiring lz4 decode worker permit")?;
             let tx_clone = tx.clone();
 
             joins.push(tokio::spawn(async move {
-                let decoded = tokio::task::spawn_blocking(move || decode_lz4_block(payload, is_raw, max_block_size))
-                    .await;
+                let decoded =
+                    tokio::task::spawn_blocking(move || decode_lz4_block(payload, is_raw, max_block_size)).await;
 
                 let send_result = match decoded {
                     Ok(Ok(bytes)) => tx_clone.send(Ok(DecodedBlock { seq: current_seq, bytes })).await,
@@ -275,9 +262,5 @@ async fn read_exact_required<R>(reader: &mut R, buf: &mut [u8], context: &str) -
 where
     R: AsyncRead + Unpin,
 {
-    if read_exact_or_eof(reader, buf).await? {
-        Ok(())
-    } else {
-        bail!("unexpected EOF while {context}")
-    }
+    if read_exact_or_eof(reader, buf).await? { Ok(()) } else { bail!("unexpected EOF while {context}") }
 }
