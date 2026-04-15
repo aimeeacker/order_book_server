@@ -6,11 +6,11 @@ mod lz4_parallel_common;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{File, create_dir_all, rename};
-use std::pin::Pin;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::mpsc as std_mpsc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 
@@ -77,6 +77,7 @@ const WARMUP_STATE_ZSTD_LEVEL: i32 = 3;
 const DEFAULT_OUTPUT_DIR: &str = "/home/aimee/hyperliquid";
 const DEFAULT_UNKNOWN_OID_SQLITE_FILE: &str = "/home/aimee/hyperliquid/build_btc_diff_unknown_oid.sqlite";
 const DEFAULT_COIN_SYMBOL: &str = "BTC";
+const DISABLE_UNKNOWN_OID_SQLITE: bool = true;
 const UPLOAD_BUCKET: &str = "hyper0";
 const UPLOAD_ROOT_PREFIX: &str = "hyperliquid";
 const UPLOAD_MAX_CONCURRENCY: usize = 8;
@@ -90,38 +91,15 @@ struct CoinConfig {
 }
 
 const SUPPORTED_COINS: [CoinConfig; 4] = [
-    CoinConfig {
-        symbol: "BTC",
-        asset_id: 0,
-        px_scale: 1,
-        sz_scale: 5,
-    },
-    CoinConfig {
-        symbol: "ETH",
-        asset_id: 1,
-        px_scale: 3,
-        sz_scale: 4,
-    },
-    CoinConfig {
-        symbol: "SOL",
-        asset_id: 5,
-        px_scale: 3,
-        sz_scale: 2,
-    },
-    CoinConfig {
-        symbol: "HYPE",
-        asset_id: 150,
-        px_scale: 4,
-        sz_scale: 2,
-    },
+    CoinConfig { symbol: "BTC", asset_id: 0, px_scale: 1, sz_scale: 5 },
+    CoinConfig { symbol: "ETH", asset_id: 1, px_scale: 3, sz_scale: 4 },
+    CoinConfig { symbol: "SOL", asset_id: 5, px_scale: 3, sz_scale: 2 },
+    CoinConfig { symbol: "HYPE", asset_id: 150, px_scale: 4, sz_scale: 2 },
 ];
 
 fn coin_config_by_symbol(raw: &str) -> Option<CoinConfig> {
     let normalized = raw.trim().to_ascii_uppercase();
-    SUPPORTED_COINS
-        .iter()
-        .copied()
-        .find(|coin| coin.symbol == normalized)
+    SUPPORTED_COINS.iter().copied().find(|coin| coin.symbol == normalized)
 }
 
 fn parse_coin_configs(raw: &str) -> Result<Vec<CoinConfig>> {
@@ -132,12 +110,8 @@ fn parse_coin_configs(raw: &str) -> Result<Vec<CoinConfig>> {
         .map(str::trim)
         .filter(|token| !token.is_empty())
     {
-        let coin = coin_config_by_symbol(token).ok_or_else(|| {
-            anyhow!(
-                "unsupported --coin '{}'; supported: BTC, ETH, SOL, HYPE",
-                token
-            )
-        })?;
+        let coin = coin_config_by_symbol(token)
+            .ok_or_else(|| anyhow!("unsupported --coin '{}'; supported: BTC, ETH, SOL, HYPE", token))?;
         if seen_symbols.insert(coin.symbol) {
             selected.push(coin);
         }
@@ -164,21 +138,17 @@ fn parse_height_span(raw: &str) -> std::result::Result<u64, String> {
     };
 
     if digits.is_empty() {
-        return Err(format!(
-            "invalid --span '{raw}', expected integer or suffix k/m (e.g. 20000, 20k, 2m)"
-        ));
+        return Err(format!("invalid --span '{raw}', expected integer or suffix k/m (e.g. 20000, 20k, 2m)"));
     }
 
     let base = digits.replace('_', "");
     if base.is_empty() {
-        return Err(format!(
-            "invalid --span '{raw}', expected integer or suffix k/m (e.g. 20000, 20k, 2m)"
-        ));
+        return Err(format!("invalid --span '{raw}', expected integer or suffix k/m (e.g. 20000, 20k, 2m)"));
     }
 
-    let parsed = base.parse::<u64>().map_err(|_| {
-        format!("invalid --span '{raw}', expected integer or suffix k/m (e.g. 20000, 20k, 2m)")
-    })?;
+    let parsed = base
+        .parse::<u64>()
+        .map_err(|_| format!("invalid --span '{raw}', expected integer or suffix k/m (e.g. 20000, 20k, 2m)"))?;
 
     parsed.checked_mul(multiplier).ok_or_else(|| format!("--span overflow for '{raw}'"))
 }
@@ -247,10 +217,7 @@ struct Args {
     )]
     warmup_state_output_dir: Option<PathBuf>,
 
-    #[arg(
-        long,
-        help = "Warmup state snapshot file (.msgpack.zst) to restore state and reduce warmup replay"
-    )]
+    #[arg(long, help = "Warmup state snapshot file (.msgpack.zst) to restore state and reduce warmup replay")]
     warmup_state_file: Option<PathBuf>,
 
     #[arg(
@@ -525,22 +492,18 @@ impl StatusEntry {
 
     fn resting_oid(&self) -> Option<u64> {
         match self {
-            Self::Object(value) => value
-                .resting
-                .as_ref()
-                .and_then(|resting| resting.oid.as_ref())
-                .and_then(JsonU64OrString::as_u64),
+            Self::Object(value) => {
+                value.resting.as_ref().and_then(|resting| resting.oid.as_ref()).and_then(JsonU64OrString::as_u64)
+            }
             Self::Text(_raw) => None,
         }
     }
 
     fn filled_oid(&self) -> Option<u64> {
         match self {
-            Self::Object(value) => value
-                .filled
-                .as_ref()
-                .and_then(|filled| filled.oid.as_ref())
-                .and_then(JsonU64OrString::as_u64),
+            Self::Object(value) => {
+                value.filled.as_ref().and_then(|filled| filled.oid.as_ref()).and_then(JsonU64OrString::as_u64)
+            }
             Self::Text(_raw) => None,
         }
     }
@@ -912,8 +875,9 @@ impl UnknownOidSqliteWorker {
         let (tx, rx) = std_mpsc::channel::<UnknownOidSqliteTask>();
         let sqlite_path = path.to_path_buf();
         let handle = std::thread::spawn(move || -> Result<()> {
-            let mut conn = Connection::open(&sqlite_path)
-                .with_context(|| format!("failed to open unknown oid sqlite for read/write: {}", sqlite_path.display()))?;
+            let mut conn = Connection::open(&sqlite_path).with_context(|| {
+                format!("failed to open unknown oid sqlite for read/write: {}", sqlite_path.display())
+            })?;
             init_unknown_oid_sqlite_schema(&conn)?;
             while let Ok(task) = rx.recv() {
                 match task {
@@ -928,11 +892,7 @@ impl UnknownOidSqliteWorker {
 
     fn sender(&self) -> UnknownOidSqliteSender {
         UnknownOidSqliteSender {
-            tx: self
-                .tx
-                .as_ref()
-                .expect("sqlite worker sender should exist while worker is alive")
-                .clone(),
+            tx: self.tx.as_ref().expect("sqlite worker sender should exist while worker is alive").clone(),
         }
     }
 
@@ -960,7 +920,7 @@ impl Drop for UnknownOidSqliteWorker {
 
 #[derive(Debug)]
 struct UnknownOidWindowLogger {
-    sender: UnknownOidSqliteSender,
+    sender: Option<UnknownOidSqliteSender>,
     asset_symbol: String,
     enabled: bool,
     current_window_start: Option<u64>,
@@ -970,7 +930,7 @@ struct UnknownOidWindowLogger {
 }
 
 impl UnknownOidWindowLogger {
-    fn new(asset_symbol: &str, sender: UnknownOidSqliteSender) -> Self {
+    fn new(asset_symbol: &str, sender: Option<UnknownOidSqliteSender>) -> Self {
         Self {
             sender,
             asset_symbol: asset_symbol.to_owned(),
@@ -1049,10 +1009,17 @@ impl UnknownOidWindowLogger {
         let Some(window_start_block) = self.current_window_start else {
             return Ok(());
         };
+        let Some(sender) = self.sender.as_ref() else {
+            self.stats = UnknownOidWindowStats::default();
+            self.samples.clear();
+            self.stale_prune_runs.clear();
+            self.current_window_start = None;
+            return Ok(());
+        };
         let stats = std::mem::take(&mut self.stats);
         let samples = std::mem::take(&mut self.samples);
         let stale_prune_runs = std::mem::take(&mut self.stale_prune_runs);
-        self.sender
+        sender
             .tx
             .send(UnknownOidSqliteTask::Flush(UnknownOidWindowPayload {
                 asset_symbol: self.asset_symbol.clone(),
@@ -1362,18 +1329,7 @@ fn parse_fixed_digits_u32(bytes: &[u8]) -> Option<u32> {
 
 fn parse_timestamp_ns_ms(raw: &str) -> Result<(i64, i64)> {
     const BASE_LEN: usize = 19;
-    const NS_SCALE: [i64; 10] = [
-        1_000_000_000,
-        100_000_000,
-        10_000_000,
-        1_000_000,
-        100_000,
-        10_000,
-        1_000,
-        100,
-        10,
-        1,
-    ];
+    const NS_SCALE: [i64; 10] = [1_000_000_000, 100_000_000, 10_000_000, 1_000_000, 100_000, 10_000, 1_000, 100, 10, 1];
 
     let bytes = raw.as_bytes();
     if bytes.len() < BASE_LEN
@@ -1386,8 +1342,9 @@ fn parse_timestamp_ns_ms(raw: &str) -> Result<(i64, i64)> {
         bail!("failed to parse timestamp: {raw}");
     }
 
-    let year = i32::try_from(parse_fixed_digits_u32(&bytes[0..4]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?)
-        .map_err(|_| anyhow!("failed to parse timestamp: {raw}"))?;
+    let year =
+        i32::try_from(parse_fixed_digits_u32(&bytes[0..4]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?)
+            .map_err(|_| anyhow!("failed to parse timestamp: {raw}"))?;
     let month = parse_fixed_digits_u32(&bytes[5..7]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
     let day = parse_fixed_digits_u32(&bytes[8..10]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
     let hour = parse_fixed_digits_u32(&bytes[11..13]).ok_or_else(|| anyhow!("failed to parse timestamp: {raw}"))?;
@@ -2066,12 +2023,8 @@ impl Lz4JsonLineReader {
 
             line.clear();
             let line_read_started_at = Instant::now();
-            let bytes_read = self
-                .current_reader
-                .as_mut()
-                .expect("current_reader checked")
-                .read_until(b'\n', line)
-                .await?;
+            let bytes_read =
+                self.current_reader.as_mut().expect("current_reader checked").read_until(b'\n', line).await?;
             self.perf.line_read_ns += line_read_started_at.elapsed().as_nanos();
             self.perf.line_read_calls = self.perf.line_read_calls.saturating_add(1);
             self.perf.line_read_bytes = self.perf.line_read_bytes.saturating_add(u64::try_from(bytes_read)?);
@@ -2503,17 +2456,14 @@ impl ParallelReplicaLz4Reader {
             bail!("S3 input requires initialized S3 client");
         }
         let prefetch_buffer_bytes = replica_prefetch_buffer_mb.saturating_mul(1024 * 1024);
-        let prefetch_buffer_permits =
-            ((prefetch_buffer_bytes + REPLICA_PREFETCH_BUFFER_PERMIT_BYTES - 1) / REPLICA_PREFETCH_BUFFER_PERMIT_BYTES)
-                .max(1);
+        let prefetch_buffer_permits = ((prefetch_buffer_bytes + REPLICA_PREFETCH_BUFFER_PERMIT_BYTES - 1)
+            / REPLICA_PREFETCH_BUFFER_PERMIT_BYTES)
+            .max(1);
         let s3_range_workers = requested_s3_range_workers.max(1);
-        let range_part_permits =
-            ((REPLICA_S3_RANGE_PART_BYTES + REPLICA_PREFETCH_BUFFER_PERMIT_BYTES - 1)
-                / REPLICA_PREFETCH_BUFFER_PERMIT_BYTES)
-                .max(1);
-        let prefetch_stream_chunk_cap = (prefetch_buffer_permits / range_part_permits)
-            .max(s3_range_workers * 2)
-            .max(8);
+        let range_part_permits = ((REPLICA_S3_RANGE_PART_BYTES + REPLICA_PREFETCH_BUFFER_PERMIT_BYTES - 1)
+            / REPLICA_PREFETCH_BUFFER_PERMIT_BYTES)
+            .max(1);
+        let prefetch_stream_chunk_cap = (prefetch_buffer_permits / range_part_permits).max(s3_range_workers * 2).max(8);
         info!(
             "[config] replica_prefetch_ring_buffer_mb={} permit_bytes={} total_permits={} range_part_bytes={} chunk_queue_cap={}",
             replica_prefetch_buffer_mb,
@@ -2574,7 +2524,8 @@ impl ParallelReplicaLz4Reader {
             }
             self.local_opened = true;
             let open_started_at = Instant::now();
-            let file = tokio::fs::File::open(path).await.with_context(|| format!("failed to open {}", path.display()))?;
+            let file =
+                tokio::fs::File::open(path).await.with_context(|| format!("failed to open {}", path.display()))?;
             self.current_reader = Some(self.make_parallel_reader(file));
             self.perf.open_reader_ns += open_started_at.elapsed().as_nanos();
             self.perf.open_reader_calls = self.perf.open_reader_calls.saturating_add(1);
@@ -2620,12 +2571,7 @@ impl ParallelReplicaLz4Reader {
             }
 
             let line_started_at = Instant::now();
-            let has_line = self
-                .current_reader
-                .as_mut()
-                .expect("current_reader checked")
-                .next_line_into(line)
-                .await?;
+            let has_line = self.current_reader.as_mut().expect("current_reader checked").next_line_into(line).await?;
             self.perf.line_read_ns += line_started_at.elapsed().as_nanos();
             self.perf.line_read_calls = self.perf.line_read_calls.saturating_add(1);
             if has_line {
@@ -2664,9 +2610,7 @@ impl ReplicaCmdsReader {
             return Ok(Self { reader: ReplicaRawReader::Parallel(reader) });
         }
 
-        Ok(Self {
-            reader: ReplicaRawReader::Stream(Lz4JsonLineReader::new(source, s3_client, requester_pays).await?),
-        })
+        Ok(Self { reader: ReplicaRawReader::Stream(Lz4JsonLineReader::new(source, s3_client, requester_pays).await?) })
     }
 
     async fn next_raw_line_into(&mut self, line: &mut Vec<u8>) -> Result<bool> {
@@ -2751,7 +2695,12 @@ impl ReplicaCmdsReader {
                                 }
                                 BookedSzDecision::FullyFilled => continue,
                                 BookedSzDecision::InvalidFilledTotalSz => {
-                                    events.push(CmdEvent::Skipped { asset_id: asset, user: Some(user), oid: Some(oid), event: "add".to_owned() });
+                                    events.push(CmdEvent::Skipped {
+                                        asset_id: asset,
+                                        user: Some(user),
+                                        oid: Some(oid),
+                                        event: "add".to_owned(),
+                                    });
                                 }
                             }
                         }
@@ -2907,7 +2856,8 @@ impl ReplicaCmdsReader {
                             let Some(user) = response_item.user.clone() else {
                                 continue;
                             };
-                            let Some(old_order_ref) = parse_order_ref(modify.oid.as_ref(), modify.cloid.as_deref()) else {
+                            let Some(old_order_ref) = parse_order_ref(modify.oid.as_ref(), modify.cloid.as_deref())
+                            else {
                                 continue;
                             };
                             let status = statuses.get(idx);
@@ -3054,9 +3004,7 @@ impl ReplicaPrefetchReader {
         if requested_lz4_workers != replica_lz4_decode_workers {
             warn!(
                 "[config] replica_lz4_workers requested={} adjusted_to={} host_parallelism={}",
-                requested_lz4_workers,
-                replica_lz4_decode_workers,
-                host_parallelism
+                requested_lz4_workers, replica_lz4_decode_workers, host_parallelism
             );
         }
 
@@ -3064,34 +3012,22 @@ impl ReplicaPrefetchReader {
         if requested_json_workers != effective_workers {
             warn!(
                 "[config] replica_json_workers requested={} adjusted_to={} max={}",
-                requested_json_workers,
-                effective_workers,
-                MAX_REPLICA_JSON_WORKERS
+                requested_json_workers, effective_workers, MAX_REPLICA_JSON_WORKERS
             );
         }
 
-        info!(
-            "[config.cpu] host_parallelism={} cpu_budget={}",
-            host_parallelism,
-            cpu_budget
-        );
+        info!("[config.cpu] host_parallelism={} cpu_budget={}", host_parallelism, cpu_budget);
         info!(
             "[config.s3] workers[auto={}][override={}][effective={}]",
-            auto_s3_range_workers,
-            requested_s3_range_workers,
-            s3_range_workers
+            auto_s3_range_workers, requested_s3_range_workers, s3_range_workers
         );
         info!(
             "[config.lz4] workers[auto={}][override={}][effective={}]",
-            auto_lz4_workers,
-            requested_lz4_workers,
-            replica_lz4_decode_workers
+            auto_lz4_workers, requested_lz4_workers, replica_lz4_decode_workers
         );
         info!(
             "[config.json] workers[auto={}][override={}][effective={}]",
-            auto_json_workers,
-            requested_json_workers,
-            effective_workers
+            auto_json_workers, requested_json_workers, effective_workers
         );
         let channel_capacity = queue_depth.max(1);
 
@@ -3390,11 +3326,8 @@ fn insert_trigger_ref(
 ) {
     remove_trigger_ref(trigger_refs, oid);
     if let Some(cloid) = cloid {
-        if let Some(existing_oid) = trigger_refs
-            .cloid_to_oid
-            .get(user)
-            .and_then(|by_cloid| by_cloid.get(cloid))
-            .copied()
+        if let Some(existing_oid) =
+            trigger_refs.cloid_to_oid.get(user).and_then(|by_cloid| by_cloid.get(cloid)).copied()
             && existing_oid != oid
         {
             remove_trigger_ref(trigger_refs, existing_oid);
@@ -3447,10 +3380,7 @@ fn insert_live_order(
 ) {
     drop(remove_live_order(orders, cloid_to_oid, order_expiry_index, oid));
     if let Some(cloid) = cloid {
-        if let Some(existing_oid) = cloid_to_oid
-            .get(user)
-            .and_then(|by_cloid| by_cloid.get(cloid))
-            .copied()
+        if let Some(existing_oid) = cloid_to_oid.get(user).and_then(|by_cloid| by_cloid.get(cloid)).copied()
             && existing_oid != oid
         {
             drop(remove_live_order(orders, cloid_to_oid, order_expiry_index, existing_oid));
@@ -3536,10 +3466,8 @@ fn prune_stale_trigger_oids(trigger_refs: &mut TriggerOrderRefs, current_time_ms
             break;
         }
         trigger_refs.oid_created_queue.pop_front();
-        let should_prune = trigger_refs
-            .oid_created_time_ms
-            .get(&oid)
-            .is_some_and(|known_created| *known_created == created_time_ms);
+        let should_prune =
+            trigger_refs.oid_created_time_ms.get(&oid).is_some_and(|known_created| *known_created == created_time_ms);
         if !should_prune {
             continue;
         }
@@ -3554,21 +3482,14 @@ fn rebuild_trigger_cloid_index(trigger_refs: &mut TriggerOrderRefs) {
     trigger_refs.cloid_to_oid.clear();
     for (&oid, cloid_key) in trigger_refs.oid_to_cloid.iter() {
         if let Some(cloid_key) = cloid_key {
-            trigger_refs
-                .cloid_to_oid
-                .entry(cloid_key.user.clone())
-                .or_default()
-                .insert(cloid_key.cloid.clone(), oid);
+            trigger_refs.cloid_to_oid.entry(cloid_key.user.clone()).or_default().insert(cloid_key.cloid.clone(), oid);
         }
     }
 }
 
 fn rebuild_trigger_created_queue(trigger_refs: &mut TriggerOrderRefs) {
-    let mut ordered: Vec<(i64, u64)> = trigger_refs
-        .oid_created_time_ms
-        .iter()
-        .map(|(&oid, &created_time_ms)| (created_time_ms, oid))
-        .collect();
+    let mut ordered: Vec<(i64, u64)> =
+        trigger_refs.oid_created_time_ms.iter().map(|(&oid, &created_time_ms)| (created_time_ms, oid)).collect();
     ordered.sort_unstable();
     trigger_refs.oid_created_queue = VecDeque::from(ordered);
 }
@@ -3636,8 +3557,7 @@ fn process_block(
     unknown_oid_logger.set_enabled(emit_json_logs);
     unknown_oid_logger.observe_block(block_number)?;
     if block_number == row_group_window_start_block(block_number) {
-        let prune_run =
-            prune_stale_live_orders(orders, cloid_to_oid, order_expiry_index, block_number, block_time_ms);
+        let prune_run = prune_stale_live_orders(orders, cloid_to_oid, order_expiry_index, block_number, block_time_ms);
         block_prune_stats.live_pruned_orders = prune_run.pruned_total;
         let pruned_trigger_oids = prune_stale_trigger_oids(trigger_refs, block_time_ms);
         block_prune_stats.trigger_pruned_oids = u64::try_from(pruned_trigger_oids).unwrap_or(u64::MAX);
@@ -3687,12 +3607,7 @@ fn process_block(
                         )?;
                     }
                 }
-                CmdEvent::Cancel {
-                    asset_id,
-                    user,
-                    order_ref,
-                    fallback_on_missing,
-                } => {
+                CmdEvent::Cancel { asset_id, user, order_ref, fallback_on_missing } => {
                     if *asset_id != target_asset_id {
                         continue;
                     }
@@ -3789,18 +3704,7 @@ fn process_block(
                         }
                     }
                 }
-                CmdEvent::Modify {
-                    asset_id,
-                    user,
-                    old_order_ref,
-                    new_oid,
-                    new_cloid,
-                    side,
-                    px,
-                    sz,
-                    raw_sz,
-                    meta,
-                } => {
+                CmdEvent::Modify { asset_id, user, old_order_ref, new_oid, new_cloid, side, px, sz, raw_sz, meta } => {
                     if *asset_id != target_asset_id {
                         continue;
                     }
@@ -3910,13 +3814,7 @@ fn process_block(
                     }
                     insert_pending_trigger_ref(trigger_refs, user, cloid.as_deref());
                 }
-                CmdEvent::TrackTriggerModify {
-                    asset_id,
-                    user,
-                    old_order_ref,
-                    new_oid,
-                    new_cloid,
-                } => {
+                CmdEvent::TrackTriggerModify { asset_id, user, old_order_ref, new_oid, new_cloid } => {
                     if *asset_id != target_asset_id {
                         continue;
                     }
@@ -4165,8 +4063,8 @@ fn build_output_tmp_path(output_dir: &Path, coin_lower: &str, actual_start_block
         return Ok(candidate);
     }
     for idx in 1..=9_999usize {
-        candidate = output_dir
-            .join(format!(".tmp_{coin_lower}_diff_start{actual_start_block}_pid{pid}_{idx}.parquet.tmp"));
+        candidate =
+            output_dir.join(format!(".tmp_{coin_lower}_diff_start{actual_start_block}_pid{pid}_{idx}.parquet.tmp"));
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -4220,9 +4118,7 @@ fn build_upload_key(path: &Path, coin_lower: &str) -> Option<String> {
 
 fn snapshot_checkpoint_from_path(path: &Path) -> Option<u64> {
     let file_name = path.file_name()?.to_str()?;
-    let checkpoint = file_name
-        .strip_prefix("warmup_state_")?
-        .strip_suffix(".msgpack.zst")?;
+    let checkpoint = file_name.strip_prefix("warmup_state_")?.strip_suffix(".msgpack.zst")?;
     checkpoint.parse::<u64>().ok()
 }
 
@@ -4247,21 +4143,9 @@ fn spawn_upload_job(
         let body = ByteStream::from_path(&local_path)
             .await
             .with_context(|| format!("failed to open upload source file {}", local_path.display()))?;
-        client
-            .put_object()
-            .bucket(UPLOAD_BUCKET)
-            .key(&remote_key)
-            .body(body)
-            .send()
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to upload {} to s3://{}/{}",
-                    local_path.display(),
-                    UPLOAD_BUCKET,
-                    remote_key
-                )
-            })?;
+        client.put_object().bucket(UPLOAD_BUCKET).key(&remote_key).body(body).send().await.with_context(|| {
+            format!("failed to upload {} to s3://{}/{}", local_path.display(), UPLOAD_BUCKET, remote_key)
+        })?;
         Ok((local_path, remote_key, keep_local))
     });
 }
@@ -4358,12 +4242,8 @@ async fn upload_newly_generated_files(
         && previous != path
         && previous.is_file()
     {
-        std::fs::remove_file(&previous).with_context(|| {
-            format!(
-                "failed to remove superseded local warmup snapshot {}",
-                previous.display()
-            )
-        })?;
+        std::fs::remove_file(&previous)
+            .with_context(|| format!("failed to remove superseded local warmup snapshot {}", previous.display()))?;
     }
 
     Ok(())
@@ -4407,8 +4287,7 @@ fn write_warmup_state_snapshot(
     create_dir_all(output_dir)
         .with_context(|| format!("failed to create warmup state output directory: {}", output_dir.display()))?;
     let pid = std::process::id();
-    let tmp_path =
-        output_dir.join(format!(".tmp_warmup_state_{checkpoint_block_number}_pid{pid}.msgpack.zst"));
+    let tmp_path = output_dir.join(format!(".tmp_warmup_state_{checkpoint_block_number}_pid{pid}.msgpack.zst"));
     std::fs::write(&tmp_path, compressed)
         .with_context(|| format!("failed to write warmup state temp file {}", tmp_path.display()))?;
 
@@ -4424,8 +4303,8 @@ fn read_warmup_state_snapshot(path: &Path) -> Result<WarmupStateSnapshot> {
         std::fs::read(path).with_context(|| format!("failed to read warmup state file {}", path.display()))?;
     let decoded = zstd::stream::decode_all(compressed.as_slice())
         .with_context(|| format!("failed to decompress warmup state file {}", path.display()))?;
-    let snapshot: WarmupStateSnapshot =
-        rmp_serde::from_slice(&decoded).with_context(|| format!("invalid warmup state msgpack in {}", path.display()))?;
+    let snapshot: WarmupStateSnapshot = rmp_serde::from_slice(&decoded)
+        .with_context(|| format!("invalid warmup state msgpack in {}", path.display()))?;
     if snapshot.format_version != WARMUP_STATE_FORMAT_VERSION {
         bail!(
             "unsupported warmup state format_version={} in {}, expected {}",
@@ -4458,17 +4337,11 @@ async fn maybe_write_warmup_state_snapshot(
         return Ok(());
     }
     let reason = if warmup_just_ended { "warmup_end" } else { "file_boundary_1m" };
-    let (live_orders, user_cloid_oid_map_entries, trigger_oids, _buffered_rows) =
-        aggregate_coin_state_metrics(states);
+    let (live_orders, user_cloid_oid_map_entries, trigger_oids, _buffered_rows) = aggregate_coin_state_metrics(states);
     let output_dir = output_dir.to_path_buf();
     let snapshot_assets = build_multi_asset_warmup_snapshot(states);
     let final_path = tokio::task::spawn_blocking(move || {
-        write_warmup_state_snapshot(
-            output_dir.as_path(),
-            block_number,
-            block_time_ms,
-            snapshot_assets,
-        )
+        write_warmup_state_snapshot(output_dir.as_path(), block_number, block_time_ms, snapshot_assets)
     })
     .await
     .context("join warmup snapshot export task")??;
@@ -4526,14 +4399,9 @@ fn restore_warmup_state_snapshot(
     *trigger_refs = primary_asset.trigger_refs.clone();
 
     for &oid in trigger_refs.oid_to_cloid.keys() {
-        trigger_refs
-            .oid_created_time_ms
-            .entry(oid)
-            .or_insert(checkpoint_time_ms);
+        trigger_refs.oid_created_time_ms.entry(oid).or_insert(checkpoint_time_ms);
     }
-    trigger_refs
-        .oid_created_time_ms
-        .retain(|oid, _| trigger_refs.oid_to_cloid.contains_key(oid));
+    trigger_refs.oid_created_time_ms.retain(|oid, _| trigger_refs.oid_to_cloid.contains_key(oid));
     rebuild_trigger_cloid_index(trigger_refs);
     rebuild_trigger_created_queue(trigger_refs);
 
@@ -4570,10 +4438,7 @@ async fn finish_pending_output_flush(state: &mut CoinRuntimeState) -> Result<()>
 }
 
 async fn collect_finished_output_flush_if_ready(state: &mut CoinRuntimeState) -> Result<()> {
-    let should_collect = state
-        .pending_flush_writer
-        .as_ref()
-        .is_some_and(JoinHandle::is_finished);
+    let should_collect = state.pending_flush_writer.as_ref().is_some_and(JoinHandle::is_finished);
     if should_collect {
         finish_pending_output_flush(state).await?;
     }
@@ -4587,27 +4452,18 @@ async fn dispatch_output_flush_if_needed(state: &mut CoinRuntimeState) -> Result
 
     finish_pending_output_flush(state).await?;
 
-    let Some(batch) = state
-        .rows
-        .take_batch(&state.schema, state.config.px_scale, state.config.sz_scale)?
-    else {
+    let Some(batch) = state.rows.take_batch(&state.schema, state.config.px_scale, state.config.sz_scale)? else {
         return Ok(());
     };
 
-    let writer = state
-        .writer
-        .take()
-        .ok_or_else(|| anyhow!("missing parquet writer while dispatching row-group flush"))?;
+    let writer =
+        state.writer.take().ok_or_else(|| anyhow!("missing parquet writer while dispatching row-group flush"))?;
     let coin = state.config.symbol.to_owned();
 
     state.pending_flush_writer = Some(tokio::task::spawn_blocking(move || -> Result<ArrowWriter<File>> {
         let mut writer = writer;
-        writer
-            .write(&batch)
-            .with_context(|| format!("writing parquet batch for {}", coin))?;
-        writer
-            .flush()
-            .with_context(|| format!("flushing parquet writer for {}", coin))?;
+        writer.write(&batch).with_context(|| format!("writing parquet batch for {}", coin))?;
+        writer.flush().with_context(|| format!("flushing parquet writer for {}", coin))?;
         Ok(writer)
     }));
     Ok(())
@@ -4639,11 +4495,7 @@ async fn close_current_output_file(
         writer.close().context("closing parquet writer")?;
         let final_path = build_final_output_path(&output_dir, &coin_lower, closed_start, closed_end)?;
         rename(&tmp_path, &final_path).with_context(|| {
-            format!(
-                "failed to rename parquet temp file {} -> {}",
-                tmp_path.display(),
-                final_path.display()
-            )
+            format!("failed to rename parquet temp file {} -> {}", tmp_path.display(), final_path.display())
         })?;
         Ok(final_path)
     })
@@ -4684,12 +4536,7 @@ async fn ensure_output_ready_for_block(
             close_current_output_file(output_dir, state, block_number).await?
         {
             state.generated_output_files.push(final_path.clone());
-            info!(
-                "[file] close parquet={} actual_range={}..{}",
-                final_path.display(),
-                closed_start,
-                closed_end
-            );
+            info!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
         }
 
         let tmp_path = build_output_tmp_path(output_dir, state.coin_lower.as_str(), block_number)?;
@@ -4715,14 +4562,11 @@ async fn close_open_output_for_coin_state(
     state: &mut CoinRuntimeState,
     fallback_block: u64,
 ) -> Result<()> {
-    if let Some((final_path, closed_start, closed_end)) = close_current_output_file(output_dir, state, fallback_block).await? {
+    if let Some((final_path, closed_start, closed_end)) =
+        close_current_output_file(output_dir, state, fallback_block).await?
+    {
         state.generated_output_files.push(final_path.clone());
-        info!(
-            "[file] close parquet={} actual_range={}..{}",
-            final_path.display(),
-            closed_start,
-            closed_end
-        );
+        info!("[file] close parquet={} actual_range={}..{}", final_path.display(), closed_start, closed_end);
     }
     Ok(())
 }
@@ -4795,11 +4639,7 @@ impl ProcessingPerfStats {
     }
 
     fn pct_of_total(ns: u128, total_secs: f64) -> f64 {
-        if total_secs <= 0.0 {
-            0.0
-        } else {
-            (Self::ns_to_secs(ns) / total_secs) * 100.0
-        }
+        if total_secs <= 0.0 { 0.0 } else { (Self::ns_to_secs(ns) / total_secs) * 100.0 }
     }
 
     fn log_summary(&self, processed_blocks: u64, total_elapsed_secs: f64) {
@@ -4822,11 +4662,7 @@ impl ProcessingPerfStats {
     }
 
     fn pct_of_reader(ns: u128, reader_total_ns: u128) -> f64 {
-        if reader_total_ns == 0 {
-            0.0
-        } else {
-            (ns as f64 / reader_total_ns as f64) * 100.0
-        }
+        if reader_total_ns == 0 { 0.0 } else { (ns as f64 / reader_total_ns as f64) * 100.0 }
     }
 
     fn log_reader_breakdown(label: &str, perf: ReaderReadPerfStats) {
@@ -4921,10 +4757,10 @@ fn log_processing_progress(
         format_u64_thousands(block_window),
         block_time,
         format_usize_thousands(live_orders),
-        format_u64_thousands(pruned_live_orders),        
+        format_u64_thousands(pruned_live_orders),
         format_usize_thousands(cloid_map_entries),
         format_usize_thousands(trigger_oids),
-        format_u64_thousands(pruned_trigger_oids),        
+        format_u64_thousands(pruned_trigger_oids),
         format_usize_thousands(buffered_rows),
         elapsed_secs,
         total_secs
@@ -4954,10 +4790,7 @@ struct CoinRuntimeState {
 
 fn aggregate_coin_state_metrics(states: &[CoinRuntimeState]) -> (usize, usize, usize, usize) {
     let live_orders = states.iter().map(|state| state.orders.len()).sum();
-    let cloid_entries = states
-        .iter()
-        .map(|state| cloid_mapping_entry_count(&state.cloid_to_oid))
-        .sum();
+    let cloid_entries = states.iter().map(|state| cloid_mapping_entry_count(&state.cloid_to_oid)).sum();
     let trigger_oids = states.iter().map(|state| state.trigger_refs.oid_to_cloid.len()).sum();
     let buffered_rows = states.iter().map(|state| state.rows.len()).sum();
     (live_orders, cloid_entries, trigger_oids, buffered_rows)
@@ -5020,11 +4853,7 @@ async fn main() -> Result<()> {
     }
     let replica_json_workers = requested_json_workers.min(MAX_REPLICA_JSON_WORKERS);
     if requested_json_workers > MAX_REPLICA_JSON_WORKERS {
-        warn!(
-            "[config] json_workers={} exceeds max {}; clamping",
-            requested_json_workers,
-            MAX_REPLICA_JSON_WORKERS
-        );
+        warn!("[config] json_workers={} exceeds max {}; clamping", requested_json_workers, MAX_REPLICA_JSON_WORKERS);
     }
     let replica_queue_depth = DEFAULT_REPLICA_JSON_QUEUE_DEPTH;
     let replica_lz4_workers = args.replica_lz4_workers;
@@ -5043,27 +4872,16 @@ async fn main() -> Result<()> {
     let startup_started_at = Instant::now();
     info!(
         "[config] json_parser=simd-json replica_queue_depth={} replica_prefetch_buffer_mb={}",
-        replica_queue_depth,
-        replica_prefetch_buffer_mb
+        replica_queue_depth, replica_prefetch_buffer_mb
     );
-    info!(
-        "[config.coin] selected={} count={}",
-        selected_coin_text,
-        selected_coins.len()
-    );
+    info!("[config.coin] selected={} count={}", selected_coin_text, selected_coins.len());
     for coin in &selected_coins {
         info!(
             "[config.coin.detail] symbol={} asset_id={} px_scale={} sz_scale={}",
-            coin.symbol,
-            coin.asset_id,
-            coin.px_scale,
-            coin.sz_scale
+            coin.symbol, coin.asset_id, coin.px_scale, coin.sz_scale
         );
     }
-    info!(
-        "[config.upload] enabled={} mode=incremental_parquet_and_snapshot",
-        args.upload
-    );
+    info!("[config.upload] enabled={} mode=incremental_parquet_and_snapshot", args.upload);
     if args.start.is_some() ^ args.span.is_some() {
         bail!("--start and --span must be provided together");
     }
@@ -5083,23 +4901,18 @@ async fn main() -> Result<()> {
     let mut selected_warmup_state_path = args.warmup_state_file.clone();
     let mut auto_matched_warmup_state = false;
     if selected_warmup_state_path.is_none() {
-        selected_warmup_state_path = auto_match_warmup_state_path(
-            args.warmup_state_output_dir.as_deref(),
-            output_block_range,
-            warmup_blocks,
-        );
+        selected_warmup_state_path =
+            auto_match_warmup_state_path(args.warmup_state_output_dir.as_deref(), output_block_range, warmup_blocks);
         auto_matched_warmup_state = selected_warmup_state_path.is_some();
     }
 
     let mut warmup_state_snapshot = if let Some(path) = selected_warmup_state_path.as_deref() {
-        let source_flag = if auto_matched_warmup_state {
-            "auto-matched local warmup state"
-        } else {
-            "--warmup-state-file"
-        };
-        Some(read_warmup_state_snapshot(path).with_context(|| {
-            format!("failed to load {} {}", source_flag, path.display())
-        })?)
+        let source_flag =
+            if auto_matched_warmup_state { "auto-matched local warmup state" } else { "--warmup-state-file" };
+        Some(
+            read_warmup_state_snapshot(path)
+                .with_context(|| format!("failed to load {} {}", source_flag, path.display()))?,
+        )
     } else {
         None
     };
@@ -5150,11 +4963,7 @@ async fn main() -> Result<()> {
         read_block_range = Some((resume_start, output_end));
         if let Some(path) = selected_warmup_state_path.as_deref() {
             let warmup_skipped = resume_start >= output_start;
-            let source = if auto_matched_warmup_state {
-                "auto_local_match"
-            } else {
-                "explicit"
-            };
+            let source = if auto_matched_warmup_state { "auto_local_match" } else { "explicit" };
             info!(
                 "[warmup.state] using_local_snapshot source={} file={} checkpoint_block={} replay_start={} output_start={} warmup_skipped={}",
                 source,
@@ -5195,12 +5004,7 @@ async fn main() -> Result<()> {
         None
     };
     let upload_client = if args.upload {
-        Some(
-            s3_client
-                .as_ref()
-                .ok_or_else(|| anyhow!("--upload requires initialized S3 client"))?
-                .clone(),
-        )
+        Some(s3_client.as_ref().ok_or_else(|| anyhow!("--upload requires initialized S3 client"))?.clone())
     } else {
         None
     };
@@ -5246,16 +5050,15 @@ async fn main() -> Result<()> {
         }
     };
 
-    let mut fills_reader =
-        NodeFillsReader::new(
-            fills_reader_source.clone(),
-            s3_client.clone(),
-            requester_pays,
-            read_block_range,
-            selected_asset_ids.clone(),
-        )
-            .await
-            .context("opening node_fills_by_block")?;
+    let mut fills_reader = NodeFillsReader::new(
+        fills_reader_source.clone(),
+        s3_client.clone(),
+        requester_pays,
+        read_block_range,
+        selected_asset_ids.clone(),
+    )
+    .await
+    .context("opening node_fills_by_block")?;
     let mut replica_reader = ReplicaPrefetchReader::new(
         replica_reader_source,
         s3_client.clone(),
@@ -5289,23 +5092,19 @@ async fn main() -> Result<()> {
     if let Some(parent) = args.unknown_oid_log_sqlite.parent()
         && !parent.as_os_str().is_empty()
     {
-        create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create unknown oid sqlite parent directory: {}",
-                parent.display()
-            )
-        })?;
+        create_dir_all(parent)
+            .with_context(|| format!("failed to create unknown oid sqlite parent directory: {}", parent.display()))?;
     }
     if let Some(path) = args.warmup_state_output_dir.as_deref() {
-        create_dir_all(path).with_context(|| {
-            format!(
-                "failed to create warmup state output directory: {}",
-                path.display()
-            )
-        })?;
+        create_dir_all(path)
+            .with_context(|| format!("failed to create warmup state output directory: {}", path.display()))?;
     }
-    let mut unknown_oid_sqlite_worker = UnknownOidSqliteWorker::start(&args.unknown_oid_log_sqlite)?;
-    let unknown_oid_sqlite_sender = unknown_oid_sqlite_worker.sender();
+    let mut unknown_oid_sqlite_worker = if DISABLE_UNKNOWN_OID_SQLITE {
+        None
+    } else {
+        Some(UnknownOidSqliteWorker::start(&args.unknown_oid_log_sqlite)?)
+    };
+    let unknown_oid_sqlite_sender = unknown_oid_sqlite_worker.as_ref().map(|worker| worker.sender());
     let mut generated_snapshot_files: Vec<PathBuf> = Vec::new();
     let mut latest_local_uploaded_snapshot = selected_warmup_state_path.clone();
 
@@ -5355,11 +5154,8 @@ async fn main() -> Result<()> {
         coin_states.push(state);
     }
 
-    let coin_state_idx_by_asset: HashMap<u64, usize> = coin_states
-        .iter()
-        .enumerate()
-        .map(|(idx, state)| (state.config.asset_id, idx))
-        .collect();
+    let coin_state_idx_by_asset: HashMap<u64, usize> =
+        coin_states.iter().enumerate().map(|(idx, state)| (state.config.asset_id, idx)).collect();
 
     let started_at = Instant::now();
     let mut processed_blocks_total: u64 = 0;
@@ -5375,15 +5171,12 @@ async fn main() -> Result<()> {
     let mut progress_pruned_trigger_oids_interval: u64 = 0;
     let mut last_seen_fills_ts_ns: Option<i64> = None;
     let mut perf_stats = ProcessingPerfStats::default();
-    let startup_aws_config = startup_aws_config_secs
-        .map(|secs| format!("{secs:.3}s"))
-        .unwrap_or_else(|| "-".to_owned());
-    let startup_replica_keys_resolve = startup_replica_keys_resolve_secs
-        .map(|secs| format!("{secs:.3}s"))
-        .unwrap_or_else(|| "-".to_owned());
-    let startup_replica_keys = startup_replica_keys_count
-        .map(|count| count.to_string())
-        .unwrap_or_else(|| "-".to_owned());
+    let startup_aws_config =
+        startup_aws_config_secs.map(|secs| format!("{secs:.3}s")).unwrap_or_else(|| "-".to_owned());
+    let startup_replica_keys_resolve =
+        startup_replica_keys_resolve_secs.map(|secs| format!("{secs:.3}s")).unwrap_or_else(|| "-".to_owned());
+    let startup_replica_keys =
+        startup_replica_keys_count.map(|count| count.to_string()).unwrap_or_else(|| "-".to_owned());
     let read_range_text = read_block_range
         .map(|(start_height, end_height)| format!("{start_height}..{end_height}"))
         .unwrap_or_else(|| "all".to_owned());
@@ -5494,9 +5287,8 @@ async fn main() -> Result<()> {
                         )?;
                         block_prune_stats.live_pruned_orders =
                             block_prune_stats.live_pruned_orders.saturating_add(coin_prune_stats.live_pruned_orders);
-                        block_prune_stats.trigger_pruned_oids = block_prune_stats
-                            .trigger_pruned_oids
-                            .saturating_add(coin_prune_stats.trigger_pruned_oids);
+                        block_prune_stats.trigger_pruned_oids =
+                            block_prune_stats.trigger_pruned_oids.saturating_add(coin_prune_stats.trigger_pruned_oids);
 
                         if emit_rows {
                             state.last_emitted_block = Some(block_number);
@@ -5619,10 +5411,10 @@ async fn main() -> Result<()> {
                     block_time_ms: fills_block_time_ms,
                     fills,
                 } = fills;
-                let fills_by_coin_state =
-                    split_fills_by_coin_state(fills, &coin_state_idx_by_asset, coin_states.len());
+                let fills_by_coin_state = split_fills_by_coin_state(fills, &coin_state_idx_by_asset, coin_states.len());
                 last_seen_fills_ts_ns = Some(fills_block_time_ns);
-                let emit_rows = output_block_range.map(|(start_height, _)| block_number >= start_height).unwrap_or(true);
+                let emit_rows =
+                    output_block_range.map(|(start_height, _)| block_number >= start_height).unwrap_or(true);
 
                 let mut block_prune_stats = BlockPruneStats::default();
                 let needs_maintenance = block_number == row_group_window_start_block(block_number);
@@ -5662,9 +5454,8 @@ async fn main() -> Result<()> {
                     )?;
                     block_prune_stats.live_pruned_orders =
                         block_prune_stats.live_pruned_orders.saturating_add(coin_prune_stats.live_pruned_orders);
-                    block_prune_stats.trigger_pruned_oids = block_prune_stats
-                        .trigger_pruned_oids
-                        .saturating_add(coin_prune_stats.trigger_pruned_oids);
+                    block_prune_stats.trigger_pruned_oids =
+                        block_prune_stats.trigger_pruned_oids.saturating_add(coin_prune_stats.trigger_pruned_oids);
 
                     if emit_rows {
                         state.last_emitted_block = Some(block_number);
@@ -5770,11 +5561,9 @@ async fn main() -> Result<()> {
                 perf_stats.fetch_fills_only_ns += fetch_fills_started_at.elapsed().as_nanos();
             }
             (Some(replica), None) => {
-                if last_seen_fills_ts_ns
-                    .is_some_and(|last_ts_ns| {
-                        replica.block_time_ns > last_ts_ns.saturating_add(BLOCK_TIME_TOLERANCE_NS)
-                    })
-                {
+                if last_seen_fills_ts_ns.is_some_and(|last_ts_ns| {
+                    replica.block_time_ns > last_ts_ns.saturating_add(BLOCK_TIME_TOLERANCE_NS)
+                }) {
                     break;
                 }
 
@@ -5837,11 +5626,7 @@ async fn main() -> Result<()> {
         info!(
             "Wrote {} diff parquet files={} output_dir={} unknown_oid_sqlite={} requester_pays={} remaining_live_orders={}",
             state.config.symbol,
-            if args.upload {
-                state.uploaded_parquet_files
-            } else {
-                state.generated_output_files.len()
-            },
+            if args.upload { state.uploaded_parquet_files } else { state.generated_output_files.len() },
             args.output_parquet.display(),
             args.unknown_oid_log_sqlite.display(),
             requester_pays,
@@ -5855,7 +5640,9 @@ async fn main() -> Result<()> {
     }
 
     drop(coin_states);
-    unknown_oid_sqlite_worker.finish()?;
+    if let Some(worker) = unknown_oid_sqlite_worker.as_mut() {
+        worker.finish()?;
+    }
 
     Ok(())
 }
