@@ -31,6 +31,12 @@
 - `remove/fill` 行数：`0`
 - `remove/cancel` 中 `oid IS NULL` 行数：`0`
 
+当前 BTC diff schema 已收敛为：
+
+- 已移除：`diff_type`、`status`、`trigger_condition`、`trigger_px`、`is_position_tpsl`、`tp_trigger_px`、`sl_trigger_px`
+- 新增：`fill_sz`，仅 `update/fill` 行有效
+- `lifetime` 采用 6 位整数编码：`<= 999999` 时写入毫秒，超过后写入负分钟
+
 ## 最近主要改动
 
 下面是这轮 git 变更的主线，便于快速理解当前代码和旧版本的差异：
@@ -149,12 +155,11 @@
 - `new/add`: `missing=129`, `extra=2`
 - 同键错量：`20`
 
-主要原因：
+归因建议：
 
-- `modify / batchModify` 的 `type=default / no-status` 路径拿不到新 `oid`
+- `missing` 主要还是上游返回不足，集中在 `type=default / no-status` 路径，程序拿不到可恢复的新 `oid`
 - 少量 reference 中的订单在当前可见输入里没有完整链路
-- `2` 条 extra 来自当前对 `filled-only GTC` 的保守入簿判断
-- 完全无痕的非 trigger 缺失仍主要集中在 `0x53310...` 这组 reduce-only GTC，以及少量 `default/no-status modify` 用户
+- `extra` 里很小的一部分，可能来自 `reduce_only` 自动缩量或残量计算口径与参考不完全一致
 - `20` 条同键错量仍主要是 reduce-only 超过仓位大小的特殊情况，当前数据无法识别，属于已知接受项
 
 ## update/fill
@@ -215,6 +220,7 @@
 - `cancelByCloid` 如果映射链不完整，当前策略是直接不落 `remove/cancel`
 - 对于 non-trigger `cancel success`，上游返回成功不等于参考文件一定记录这条 cancel
 - 对于 non-trigger `modify type=default`，当前不会再写未知旧单的 fallback cancel，因此可能相对参考增加 `missing`
+- 当前只保留约 24 小时左右的 live order 历史，24 小时之前的订单即使发生 cancel 也可能无法记录
 
 ### 当前和参考的差异
 
@@ -222,6 +228,13 @@
 
 - 未知 oid 的 `cancel` fallback 禁用后，`oid=NULL` 的 `remove/cancel` 应接近 `0`（短区间实测为 `0`）
 - 相比参考文件，`remove/cancel` 的缺失会增多，但“伪造 fallback 行”会显著减少
+- 参考文件里以下 cancel reason 在当前实现里可能缺失，或者被合并成普通 `canceled`：
+  - `reduceOnlyCanceled`
+  - `scheduledCancel`
+  - `selfTradeCanceled`
+  - `marginCanceled`
+  - `liquidatedCanceled`
+  - `vaultWithdrawalCanceled`
 
 以下分解来自历史样本（开启未知 cancel fallback 的版本），用于解释差异来源：
 
@@ -336,6 +349,9 @@
 
 这说明当前按 `node_fills_by_block + tid` 的 fill 还原，已足够覆盖键集合，但在少量多笔成交合并/拆分上仍和参考不完全一致。
 
+> [!WARNING]
+> 这类差异不要误判成 `node_fills_by_block` 本身少了一笔。当前已核对到的 3 个 `(block, oid)` 样本里，原始 fills 输入和当前 parquet 的 maker-side 记录数一致，参考文件只是保留了更细的 fill split 语义。
+
 ### 4. trigger 触发后转为普通单的后续生命周期未还原
 
 当前程序采取 trigger 完全不入 parquet 的保守策略。
@@ -355,6 +371,11 @@
 - 一个仅基于公开 `cmds + fills_by_block` 可见信息重建的 diff 生成器
 - 它可以非常接近参考文件，但不能保证在所有 cancel reason、trigger 链路、pre-range live orders、以及 `type=default` 降级返回上完全等价
 
+补充说明：
+
+- `new/add` 的少量 extra，优先怀疑 `reduce_only` 自动缩量或残量计算口径差异
+- `new/add` 的 missing，优先怀疑上游返回不足，尤其是 `type=default / no-status`
+
 ## 完整 Snapshot 可避免的差异
 
 这里的“完整 snapshot”指区间起点时刻的完整 live state（至少包括非 trigger/trigger 的 `user + oid + cloid + remaining_sz`）。
@@ -370,7 +391,7 @@
 
 - `remove/fill` 全缺失（当前实现已显式禁用该输出）
 - `update/cancel` 全缺失（当前实现未输出该类型）
-- `type=default` / `no-status` 返回导致的新 `oid` 不可恢复
-- `filled-only GTC` 的入簿判断偏差（当前仍有 `new/add extra=2`）
+- `type=default` / no-status 返回导致的新 `oid` 不可恢复
+- `filled-only GTC` 的入簿判断偏差仍可能存在，但当前更应优先关注 `reduce_only` 自动缩量 / 残量口径差异对 `new/add extra` 的影响
 - reduce-only 超仓等场景的 `sz/raw_sz` 偏差（缺少持仓快照与撮合细节）
 - 少量 `update/fill` 行级 multiplicity 偏差（同 block、同 oid 多笔 fill 拆分差异）

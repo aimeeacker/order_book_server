@@ -58,7 +58,6 @@ const UNKNOWN_OID_WINDOW_BLOCKS: u64 = 10_000;
 const UNKNOWN_OID_SAMPLE_LIMIT_PER_WINDOW: usize = 200;
 const PRUNE_SAMPLE_LIMIT_PER_RUN: usize = 200;
 const REQUESTER_PAYS_ALWAYS: bool = true;
-const CANCEL_STATUS_CANCELED: &str = "canceled";
 const PROGRESS_LOG_INTERVAL_BLOCKS: u64 = 10_000;
 const ENABLE_MISSING_STATUS_WARN: bool = false;
 const LZ4_IO_BUFFER_BYTES: usize = 4 << 20;
@@ -419,8 +418,6 @@ struct OrderTypeInput {
 struct OrderTriggerInput {
     #[serde(rename = "triggerPx", default)]
     trigger_px: Option<String>,
-    #[serde(rename = "isMarket", default)]
-    is_market: bool,
     #[serde(default)]
     tpsl: Option<String>,
 }
@@ -1077,7 +1074,6 @@ impl UnknownOidWindowLogger {
 struct OrderMeta {
     tif: Option<String>,
     reduce_only: Option<bool>,
-    order_type: Option<String>,
     is_trigger: bool,
     trigger_condition: Option<String>,
     trigger_px: Option<Decimal>,
@@ -1155,7 +1151,6 @@ enum CmdEvent {
         user: Option<String>,
         oid: Option<u64>,
         event: String,
-        status: String,
     },
 }
 
@@ -1184,7 +1179,6 @@ struct OrderState {
     remaining_sz: Decimal,
     tif: Option<String>,
     reduce_only: Option<bool>,
-    order_type: Option<String>,
     is_trigger: bool,
     trigger_condition: Option<String>,
     trigger_px: Option<Decimal>,
@@ -1229,21 +1223,13 @@ struct OutputRow {
     oid: Option<i64>,
     side: Option<String>,
     px: Option<Decimal>,
-    diff_type: String,
     event: String,
     sz: Option<Decimal>,
     orig_sz: Option<Decimal>,
     raw_sz: Option<Decimal>,
-    is_trigger: Option<bool>,
+    fill_sz: Option<Decimal>,
     tif: Option<String>,
     reduce_only: Option<bool>,
-    order_type: Option<String>,
-    trigger_condition: Option<String>,
-    trigger_px: Option<Decimal>,
-    is_position_tpsl: Option<bool>,
-    tp_trigger_px: Option<Decimal>,
-    sl_trigger_px: Option<Decimal>,
-    status: Option<String>,
     lifetime: Option<i32>,
 }
 
@@ -1275,7 +1261,6 @@ impl RowBuffer {
         let mut side = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 4);
         let mut px = Decimal128Builder::with_capacity(self.rows.len())
             .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, px_scale));
-        let mut diff_type = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 16);
         let mut event = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 16);
         let mut sz = Decimal128Builder::with_capacity(self.rows.len())
             .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, sz_scale));
@@ -1283,19 +1268,10 @@ impl RowBuffer {
             .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, sz_scale));
         let mut raw_sz = Decimal128Builder::with_capacity(self.rows.len())
             .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, sz_scale));
-        let mut is_trigger = BooleanBuilder::with_capacity(self.rows.len());
+        let mut fill_sz = Decimal128Builder::with_capacity(self.rows.len())
+            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, sz_scale));
         let mut tif = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 8);
         let mut reduce_only = BooleanBuilder::with_capacity(self.rows.len());
-        let mut order_type = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 16);
-        let mut trigger_condition = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 24);
-        let mut trigger_px = Decimal128Builder::with_capacity(self.rows.len())
-            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, px_scale));
-        let mut is_position_tpsl = BooleanBuilder::with_capacity(self.rows.len());
-        let mut tp_trigger_px = Decimal128Builder::with_capacity(self.rows.len())
-            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, px_scale));
-        let mut sl_trigger_px = Decimal128Builder::with_capacity(self.rows.len())
-            .with_data_type(DataType::Decimal128(DECIMAL_PRECISION, px_scale));
-        let mut status = StringBuilder::with_capacity(self.rows.len(), self.rows.len() * 24);
         let mut lifetime = Int32Builder::with_capacity(self.rows.len());
 
         for row in self.rows.drain(..) {
@@ -1315,7 +1291,6 @@ impl RowBuffer {
                 Some(value) => px.append_value(decimal_to_i128(value, px_scale)),
                 None => px.append_null(),
             }
-            diff_type.append_value(&row.diff_type);
             event.append_value(&row.event);
             match row.sz {
                 Some(value) => sz.append_value(decimal_to_i128(value, sz_scale)),
@@ -1329,9 +1304,9 @@ impl RowBuffer {
                 Some(value) => raw_sz.append_value(decimal_to_i128(value, sz_scale)),
                 None => raw_sz.append_null(),
             }
-            match row.is_trigger {
-                Some(value) => is_trigger.append_value(value),
-                None => is_trigger.append_null(),
+            match row.fill_sz {
+                Some(value) => fill_sz.append_value(decimal_to_i128(value, sz_scale)),
+                None => fill_sz.append_null(),
             }
             match row.tif {
                 Some(value) => tif.append_value(value),
@@ -1340,34 +1315,6 @@ impl RowBuffer {
             match row.reduce_only {
                 Some(value) => reduce_only.append_value(value),
                 None => reduce_only.append_null(),
-            }
-            match row.order_type {
-                Some(value) => order_type.append_value(value),
-                None => order_type.append_null(),
-            }
-            match row.trigger_condition {
-                Some(value) => trigger_condition.append_value(value),
-                None => trigger_condition.append_null(),
-            }
-            match row.trigger_px {
-                Some(value) => trigger_px.append_value(decimal_to_i128(value, px_scale)),
-                None => trigger_px.append_null(),
-            }
-            match row.is_position_tpsl {
-                Some(value) => is_position_tpsl.append_value(value),
-                None => is_position_tpsl.append_null(),
-            }
-            match row.tp_trigger_px {
-                Some(value) => tp_trigger_px.append_value(decimal_to_i128(value, px_scale)),
-                None => tp_trigger_px.append_null(),
-            }
-            match row.sl_trigger_px {
-                Some(value) => sl_trigger_px.append_value(decimal_to_i128(value, px_scale)),
-                None => sl_trigger_px.append_null(),
-            }
-            match row.status {
-                Some(value) => status.append_value(value),
-                None => status.append_null(),
             }
             match row.lifetime {
                 Some(value) => lifetime.append_value(value),
@@ -1383,21 +1330,13 @@ impl RowBuffer {
             Arc::new(oid.finish()),
             Arc::new(side.finish()),
             Arc::new(px.finish()),
-            Arc::new(diff_type.finish()),
             Arc::new(event.finish()),
             Arc::new(sz.finish()),
             Arc::new(orig_sz.finish()),
             Arc::new(raw_sz.finish()),
-            Arc::new(is_trigger.finish()),
+            Arc::new(fill_sz.finish()),
             Arc::new(tif.finish()),
             Arc::new(reduce_only.finish()),
-            Arc::new(order_type.finish()),
-            Arc::new(trigger_condition.finish()),
-            Arc::new(trigger_px.finish()),
-            Arc::new(is_position_tpsl.finish()),
-            Arc::new(tp_trigger_px.finish()),
-            Arc::new(sl_trigger_px.finish()),
-            Arc::new(status.finish()),
             Arc::new(lifetime.finish()),
         ];
 
@@ -1534,7 +1473,6 @@ fn parse_order_fields(order: &OrderInput) -> Option<(u64, String, Decimal, Decim
         OrderMeta {
             tif: None,
             reduce_only,
-            order_type: Some(if trigger.is_market { "Stop Market".to_owned() } else { "Stop Limit".to_owned() }),
             is_trigger: true,
             trigger_condition: None,
             trigger_px: Some(trigger_px),
@@ -1547,7 +1485,6 @@ fn parse_order_fields(order: &OrderInput) -> Option<(u64, String, Decimal, Decim
         OrderMeta {
             tif,
             reduce_only,
-            order_type: Some("Limit".to_owned()),
             is_trigger: false,
             trigger_condition: None,
             trigger_px: None,
@@ -2814,13 +2751,7 @@ impl ReplicaCmdsReader {
                                 }
                                 BookedSzDecision::FullyFilled => continue,
                                 BookedSzDecision::InvalidFilledTotalSz => {
-                                    events.push(CmdEvent::Skipped {
-                                        asset_id: asset,
-                                        user: Some(user),
-                                        oid: Some(oid),
-                                        event: "add".to_owned(),
-                                        status: "skipped_invalid_filled_total_sz".to_owned(),
-                                    });
+                                    events.push(CmdEvent::Skipped { asset_id: asset, user: Some(user), oid: Some(oid), event: "add".to_owned() });
                                 }
                             }
                         }
@@ -2956,7 +2887,6 @@ impl ReplicaCmdsReader {
                                 user: Some(user),
                                 oid: oid_from_resting.or(oid_from_filled),
                                 event: "modify".to_owned(),
-                                status: "skipped_invalid_filled_total_sz".to_owned(),
                             });
                         }
                     }
@@ -3060,7 +2990,6 @@ impl ReplicaCmdsReader {
                                     user: Some(user),
                                     oid: oid_from_resting.or(oid_from_filled),
                                     event: "modify".to_owned(),
-                                    status: "skipped_invalid_filled_total_sz".to_owned(),
                                 });
                             }
                         }
@@ -3327,21 +3256,13 @@ fn output_schema(px_scale: i8, sz_scale: i8) -> Arc<Schema> {
         Field::new("oid", DataType::Int64, true),
         Field::new("side", DataType::Utf8, true),
         Field::new("px", DataType::Decimal128(DECIMAL_PRECISION, px_scale), true),
-        Field::new("diff_type", DataType::Utf8, false),
         Field::new("event", DataType::Utf8, false),
         Field::new("sz", DataType::Decimal128(DECIMAL_PRECISION, sz_scale), true),
         Field::new("orig_sz", DataType::Decimal128(DECIMAL_PRECISION, sz_scale), true),
         Field::new("raw_sz", DataType::Decimal128(DECIMAL_PRECISION, sz_scale), true),
-        Field::new("is_trigger", DataType::Boolean, true),
+        Field::new("fill_sz", DataType::Decimal128(DECIMAL_PRECISION, sz_scale), true),
         Field::new("tif", DataType::Utf8, true),
         Field::new("reduce_only", DataType::Boolean, true),
-        Field::new("order_type", DataType::Utf8, true),
-        Field::new("trigger_condition", DataType::Utf8, true),
-        Field::new("trigger_px", DataType::Decimal128(DECIMAL_PRECISION, px_scale), true),
-        Field::new("is_position_tpsl", DataType::Boolean, true),
-        Field::new("tp_trigger_px", DataType::Decimal128(DECIMAL_PRECISION, px_scale), true),
-        Field::new("sl_trigger_px", DataType::Decimal128(DECIMAL_PRECISION, px_scale), true),
-        Field::new("status", DataType::Utf8, true),
         Field::new("lifetime", DataType::Int32, true),
     ]))
 }
@@ -3351,9 +3272,16 @@ fn decimal_to_i128(mut value: Decimal, scale: i8) -> i128 {
     value.mantissa()
 }
 
-fn clamp_lifetime_ms(created_time_ms: i64, current_time_ms: i64) -> Option<i32> {
+fn encode_lifetime(created_time_ms: i64, current_time_ms: i64) -> Option<i32> {
     let delta = current_time_ms - created_time_ms;
-    i32::try_from(delta).ok()
+    if delta < 0 {
+        return None;
+    }
+    if delta <= 999_999 {
+        return i32::try_from(delta).ok();
+    }
+    let rounded_minutes = delta.checked_add(30_000)?.checked_div(60_000)?;
+    i32::try_from(rounded_minutes).ok().and_then(|minutes| minutes.checked_neg())
 }
 
 fn resolve_order_ref(
@@ -3541,7 +3469,6 @@ fn insert_live_order(
             remaining_sz: sz,
             tif: meta.tif.clone(),
             reduce_only: meta.reduce_only,
-            order_type: meta.order_type.clone(),
             is_trigger: meta.is_trigger,
             trigger_condition: meta.trigger_condition.clone(),
             trigger_px: meta.trigger_px,
@@ -3667,21 +3594,13 @@ fn push_add_row(
         oid: Some(i64::try_from(oid)?),
         side: Some(side.to_owned()),
         px: Some(px),
-        diff_type: "new".to_owned(),
         event: "add".to_owned(),
         sz: Some(sz),
         orig_sz: None,
         raw_sz,
-        is_trigger: Some(meta.is_trigger),
+        fill_sz: None,
         tif: meta.tif.clone(),
         reduce_only: meta.reduce_only,
-        order_type: meta.order_type.clone(),
-        trigger_condition: meta.trigger_condition.clone(),
-        trigger_px: meta.trigger_px,
-        is_position_tpsl: meta.is_position_tpsl,
-        tp_trigger_px: meta.tp_trigger_px,
-        sl_trigger_px: meta.sl_trigger_px,
-        status: None,
         lifetime: None,
     });
     Ok(())
@@ -3809,22 +3728,14 @@ fn process_block(
                                     oid: Some(i64::try_from(oid)?),
                                     side: Some(state.side),
                                     px: Some(state.px),
-                                    diff_type: "remove".to_owned(),
                                     event: "cancel".to_owned(),
                                     sz: Some(Decimal::ZERO),
                                     orig_sz: Some(state.remaining_sz),
                                     raw_sz: None,
-                                    is_trigger: Some(state.is_trigger),
+                                    fill_sz: None,
                                     tif: state.tif.clone(),
                                     reduce_only: state.reduce_only,
-                                    order_type: state.order_type.clone(),
-                                    trigger_condition: state.trigger_condition.clone(),
-                                    trigger_px: state.trigger_px,
-                                    is_position_tpsl: state.is_position_tpsl,
-                                    tp_trigger_px: state.tp_trigger_px,
-                                    sl_trigger_px: state.sl_trigger_px,
-                                    status: Some(CANCEL_STATUS_CANCELED.to_owned()),
-                                    lifetime: clamp_lifetime_ms(state.created_time_ms, block_time_ms),
+                                    lifetime: encode_lifetime(state.created_time_ms, block_time_ms),
                                 });
                             }
                             emitted_remove = true;
@@ -3905,22 +3816,14 @@ fn process_block(
                                     oid: Some(i64::try_from(old_oid)?),
                                     side: Some(old_state.side),
                                     px: Some(old_state.px),
-                                    diff_type: "remove".to_owned(),
                                     event: "cancel".to_owned(),
                                     sz: Some(Decimal::ZERO),
                                     orig_sz: Some(old_state.remaining_sz),
                                     raw_sz: None,
-                                    is_trigger: Some(old_state.is_trigger),
+                                    fill_sz: None,
                                     tif: old_state.tif.clone(),
                                     reduce_only: old_state.reduce_only,
-                                    order_type: old_state.order_type.clone(),
-                                    trigger_condition: old_state.trigger_condition.clone(),
-                                    trigger_px: old_state.trigger_px,
-                                    is_position_tpsl: old_state.is_position_tpsl,
-                                    tp_trigger_px: old_state.tp_trigger_px,
-                                    sl_trigger_px: old_state.sl_trigger_px,
-                                    status: Some(CANCEL_STATUS_CANCELED.to_owned()),
-                                    lifetime: clamp_lifetime_ms(old_state.created_time_ms, block_time_ms),
+                                    lifetime: encode_lifetime(old_state.created_time_ms, block_time_ms),
                                 });
                             }
                         } else {
@@ -4028,7 +3931,7 @@ fn process_block(
                         insert_pending_trigger_ref(trigger_refs, user, new_cloid.as_deref());
                     }
                 }
-                CmdEvent::Skipped { asset_id, user, oid, event, status } => {
+                CmdEvent::Skipped { asset_id, user, oid, event } => {
                     if *asset_id != target_asset_id {
                         continue;
                     }
@@ -4042,21 +3945,13 @@ fn process_block(
                             oid,
                             side: None,
                             px: None,
-                            diff_type: "skip".to_owned(),
                             event: event.clone(),
                             sz: None,
                             orig_sz: None,
                             raw_sz: None,
-                            is_trigger: None,
+                            fill_sz: None,
                             tif: None,
                             reduce_only: None,
-                            order_type: None,
-                            trigger_condition: None,
-                            trigger_px: None,
-                            is_position_tpsl: None,
-                            tp_trigger_px: None,
-                            sl_trigger_px: None,
-                            status: Some(status.clone()),
                             lifetime: None,
                         });
                     }
@@ -4093,22 +3988,14 @@ fn process_block(
                             oid: Some(i64::try_from(oid)?),
                             side: Some(state.side),
                             px: Some(state.px),
-                            diff_type: "remove".to_owned(),
                             event: "cancel".to_owned(),
                             sz: Some(Decimal::ZERO),
                             orig_sz: Some(state.remaining_sz),
                             raw_sz: None,
-                            is_trigger: Some(state.is_trigger),
+                            fill_sz: None,
                             tif: state.tif.clone(),
                             reduce_only: state.reduce_only,
-                            order_type: state.order_type.clone(),
-                            trigger_condition: state.trigger_condition.clone(),
-                            trigger_px: state.trigger_px,
-                            is_position_tpsl: state.is_position_tpsl,
-                            tp_trigger_px: state.tp_trigger_px,
-                            sl_trigger_px: state.sl_trigger_px,
-                            status: Some(CANCEL_STATUS_CANCELED.to_owned()),
-                            lifetime: clamp_lifetime_ms(state.created_time_ms, block_time_ms),
+                            lifetime: encode_lifetime(state.created_time_ms, block_time_ms),
                         });
                     }
                     emitted_remove = true;
@@ -4206,21 +4093,13 @@ fn process_block(
                     oid: Some(i64::try_from(fill.oid)?),
                     side: fill.side.clone(),
                     px: fill.px,
-                    diff_type: "update".to_owned(),
                     event: "fill".to_owned(),
                     sz: None,
                     orig_sz: None,
                     raw_sz: None,
-                    is_trigger: None,
+                    fill_sz: Some(fill.sz),
                     tif: None,
                     reduce_only: None,
-                    order_type: None,
-                    trigger_condition: None,
-                    trigger_px: None,
-                    is_position_tpsl: None,
-                    tp_trigger_px: None,
-                    sl_trigger_px: None,
-                    status: None,
                     lifetime: None,
                 });
             }
