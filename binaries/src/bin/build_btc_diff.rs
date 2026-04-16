@@ -26,7 +26,7 @@ use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::RequestPayer;
-use chrono::{Datelike, Days, NaiveDate, Timelike};
+use chrono::{Datelike, NaiveDate, Timelike};
 use clap::Parser;
 use env_logger::{Builder, Env};
 use log::{info, warn};
@@ -44,8 +44,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use lz4_parallel_common::{ParallelLz4LineReader, ParallelLz4ReaderConfig};
 
 use crate::build_btc_diff_replica_day_index::{
-    REPLICA_DAY_INDEX, REPLICA_INDEX_END_DATE_YYYYMMDD, REPLICA_INDEX_END_EXCLUSIVE_CHUNK,
-    REPLICA_INDEX_START_DATE_YYYYMMDD, REPLICA_SNAPSHOT_DIRS,
+    REPLICA_CHUNK_INDEX, REPLICA_INDEX_END_EXCLUSIVE_CHUNK, REPLICA_SNAPSHOT_DIRS,
 };
 
 const ROW_GROUP_BLOCKS: u64 = 10_000;
@@ -1726,7 +1725,7 @@ fn replica_chunk_starts_for_range(start_height: u64, height_span: u64) -> Result
     Ok(chunks)
 }
 
-fn resolve_replica_keys_via_hardcoded_day_index(
+fn resolve_replica_keys_via_hardcoded_chunk_index(
     normalized_prefix: &str,
     required_chunks: &[u64],
 ) -> Result<Option<Vec<String>>> {
@@ -1734,15 +1733,10 @@ fn resolve_replica_keys_via_hardcoded_day_index(
         return Ok(None);
     }
 
-    let Some(first_entry) = REPLICA_DAY_INDEX.first() else {
+    let Some(first_entry) = REPLICA_CHUNK_INDEX.first() else {
         return Ok(None);
     };
     let first_chunk = first_entry.start_chunk;
-
-    let base_date = NaiveDate::parse_from_str(REPLICA_INDEX_START_DATE_YYYYMMDD, "%Y%m%d")
-        .with_context(|| format!("invalid hardcoded start date: {REPLICA_INDEX_START_DATE_YYYYMMDD}"))?;
-    let end_date = NaiveDate::parse_from_str(REPLICA_INDEX_END_DATE_YYYYMMDD, "%Y%m%d")
-        .with_context(|| format!("invalid hardcoded end date: {REPLICA_INDEX_END_DATE_YYYYMMDD}"))?;
 
     let mut resolved = Vec::with_capacity(required_chunks.len());
     for &chunk in required_chunks {
@@ -1750,22 +1744,15 @@ fn resolve_replica_keys_via_hardcoded_day_index(
             return Ok(None);
         }
 
-        let pos = REPLICA_DAY_INDEX.partition_point(|entry| entry.start_chunk <= chunk);
+        let pos = REPLICA_CHUNK_INDEX.partition_point(|entry| entry.start_chunk <= chunk);
         if pos == 0 {
             return Ok(None);
         }
-        let day_idx = pos - 1;
-        let day_entry = REPLICA_DAY_INDEX[day_idx];
-        let snapshot = REPLICA_SNAPSHOT_DIRS
-            .get(usize::from(day_entry.snapshot_idx))
-            .ok_or_else(|| anyhow!("invalid snapshot idx in hardcoded replica index: {}", day_entry.snapshot_idx))?;
-        let date = base_date
-            .checked_add_days(Days::new(day_idx as u64))
-            .ok_or_else(|| anyhow!("hardcoded replica day index overflow at idx {}", day_idx))?;
-        if date > end_date {
-            return Ok(None);
-        }
-        let date_str = date.format("%Y%m%d");
+        let segment_entry = REPLICA_CHUNK_INDEX[pos - 1];
+        let snapshot = REPLICA_SNAPSHOT_DIRS.get(usize::from(segment_entry.snapshot_idx)).ok_or_else(|| {
+            anyhow!("invalid snapshot idx in hardcoded replica index: {}", segment_entry.snapshot_idx)
+        })?;
+        let date_str = format!("{:08}", segment_entry.date_yyyymmdd);
         resolved.push(format!("{normalized_prefix}/{snapshot}/{date_str}/{chunk}.lz4"));
     }
 
@@ -1783,9 +1770,9 @@ async fn resolve_replica_keys_for_range(
     let required_chunks = replica_chunk_starts_for_range(start_height, height_span)?;
     let normalized_prefix = prefix.trim_matches('/');
 
-    if let Some(resolved) = resolve_replica_keys_via_hardcoded_day_index(normalized_prefix, &required_chunks)? {
+    if let Some(resolved) = resolve_replica_keys_via_hardcoded_chunk_index(normalized_prefix, &required_chunks)? {
         info!(
-            "[index] resolved replica_cmds via hardcoded day index for {} chunks (range {}..{})",
+            "[index] resolved replica_cmds via hardcoded chunk index for {} chunks (range {}..{})",
             resolved.len(),
             start_height,
             start_height + height_span - 1
@@ -4724,13 +4711,35 @@ fn format_usize_thousands(value: usize) -> String {
     format_u64_thousands(u64::try_from(value).unwrap_or(u64::MAX))
 }
 
-fn format_timestamp_utc8(block_time_ms: i64) -> String {
-    let Some(offset) = chrono::FixedOffset::east_opt(8 * 3600) else {
-        return "invalid_timezone".to_owned();
-    };
+fn format_weekday_short(weekday: chrono::Weekday) -> &'static str {
+    match weekday {
+        chrono::Weekday::Mon => "Mon.",
+        chrono::Weekday::Tue => "Tue.",
+        chrono::Weekday::Wed => "Wed.",
+        chrono::Weekday::Thu => "Thu.",
+        chrono::Weekday::Fri => "Fri.",
+        chrono::Weekday::Sat => "Sat.",
+        chrono::Weekday::Sun => "Sun.",
+    }
+}
+
+fn format_timestamp_utc(block_time_ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(block_time_ms)
-        .map(|value| value.with_timezone(&offset).to_rfc3339())
+        .map(|value| format!("{} {}", value.to_rfc3339(), format_weekday_short(value.weekday())))
         .unwrap_or_else(|| "invalid_timestamp".to_owned())
+}
+
+fn format_elapsed_clock(total_secs: f64) -> String {
+    if !total_secs.is_finite() {
+        return "invalid_duration".to_owned();
+    }
+    let total_tenths = (total_secs.max(0.0) * 10.0).round() as u64;
+    let total_seconds = total_tenths / 10;
+    let tenths = total_tenths % 10;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}.{tenths}")
 }
 
 fn log_processing_progress(
@@ -4748,10 +4757,10 @@ fn log_processing_progress(
     in_warmup: bool,
 ) {
     let phase = if in_warmup { "[warmup]" } else { "[progress]" };
-    let block_time = format_timestamp_utc8(block_time_ms);
+    let block_time = format_timestamp_utc(block_time_ms);
     let block_window = block_number / ROW_GROUP_BLOCKS;
     info!(
-        "{} blocks={} last={} time={} live={}|-{} cloid={} trigger={}|-{} rows={} elapsed={:.1}s total={:.1}s",
+        "{} blocks={} last={} time={} live={}|-{} cloid={} trigger={}|-{} rows={} elapsed={:.1}s total={}",
         phase,
         format_u64_thousands(processed_blocks),
         format_u64_thousands(block_window),
@@ -4763,7 +4772,7 @@ fn log_processing_progress(
         format_u64_thousands(pruned_trigger_oids),
         format_usize_thousands(buffered_rows),
         elapsed_secs,
-        total_secs
+        format_elapsed_clock(total_secs)
     );
 }
 

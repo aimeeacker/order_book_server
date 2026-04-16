@@ -98,16 +98,17 @@
 ## replica_cmds 硬编码索引
 
 - 索引文件：`binaries/src/bin/build_btc_diff_replica_day_index.rs`
-- 覆盖范围：`20250720..20260331`（共 `255` 天）
-- 探索结果：原桶下该区间存在 `31` 个“同日多 snapshot”重叠日期，索引固定选择该日期的最新 snapshot
+- 覆盖范围：`20250720..20260415`
+- 真实对象列表显示该区间存在大量“同日跨多个 snapshot 分段”的情况；当前索引已按实际 chunk 分段显式记录，而不是再假设“一天只对应一个 snapshot”
 - 结构：
-  - `REPLICA_SNAPSHOT_DIRS`：snapshot 目录表（`32` 个）
-  - `REPLICA_DAY_INDEX`：按天顺序记录 `snapshot_idx + start_chunk`
+  - `REPLICA_SNAPSHOT_DIRS`：snapshot 目录表（`35` 个）
+  - `REPLICA_CHUNK_INDEX`：按 `start_chunk` 排序记录 `snapshot_idx + date_yyyymmdd + start_chunk`（共 `338` 段）
 - 解析方式：
   - 先把目标高度转成 chunk（`<height-1>` 对齐 `10000`）
-  - 对 `REPLICA_DAY_INDEX.start_chunk` 做二分，定位所属日期
+  - 对 `REPLICA_CHUNK_INDEX.start_chunk` 做二分，定位所属分段
   - 直接拼接 `replica_cmds/<snapshot>/<yyyymmdd>/<chunk>.lz4`
-- 范围外（早于 `20250720` 或晚于 `20260331`）仍回退到原有动态查找逻辑
+- 像 `20250823`、`20260413` 这类单日被拆到两个 snapshot 的情况，只有分段索引才能正确命中
+- 范围外（早于 `20250720` 或晚于 `20260415`）仍回退到原有动态查找逻辑
 
 ## unknown oid 调试日志（SQLite）
 
