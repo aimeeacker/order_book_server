@@ -288,7 +288,7 @@ enum ReaderSource {
 struct ReplicaLine {
     abci_block: AbciBlock,
     #[serde(default)]
-    resps: ReplicaResponses,
+    resps: Option<ReplicaResponses>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1524,12 +1524,38 @@ fn trim_newline(line: &mut Vec<u8>) {
     }
 }
 
+fn format_json_line_debug(line: &[u8]) -> String {
+    const PREVIEW_LEN: usize = 64;
+
+    let preview = &line[..line.len().min(PREVIEW_LEN)];
+    let hex_preview = preview
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text_preview = String::from_utf8_lossy(preview);
+    let first_non_ws = line.iter().copied().find(|byte| !byte.is_ascii_whitespace());
+    let first_non_ws_text = first_non_ws
+        .map(|byte| format!("0x{byte:02x}"))
+        .unwrap_or_else(|| "none".to_owned());
+
+    format!(
+        "len={} first_non_ws={} hex_prefix=[{}] text_prefix={:?}",
+        line.len(),
+        first_non_ws_text,
+        hex_preview,
+        text_preview
+    )
+}
+
 fn parse_json_line<T>(line: &mut Vec<u8>) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
     trim_newline(line);
-    simd_json::serde::from_slice(line).map_err(anyhow::Error::from).context("failed to parse json line with simd-json")
+    simd_json::serde::from_slice(line)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("failed to parse json line with simd-json ({})", format_json_line_debug(line)))
 }
 
 fn floor_hour_ms(ts_ms: i64) -> i64 {
@@ -1849,6 +1875,7 @@ struct Lz4JsonLineReader {
     next_key_idx: usize,
     local_opened: bool,
     current_reader: Option<Box<dyn AsyncBufRead + Unpin + Send>>,
+    current_input_label: Option<Arc<str>>,
     line: Vec<u8>,
     perf: ReaderReadPerfStats,
 }
@@ -1888,6 +1915,7 @@ impl Lz4JsonLineReader {
             next_key_idx: 0,
             local_opened: false,
             current_reader: None,
+            current_input_label: None,
             line: Vec::with_capacity(1 << 20),
             perf: ReaderReadPerfStats::default(),
         })
@@ -1981,6 +2009,7 @@ impl Lz4JsonLineReader {
                 let file =
                     tokio::fs::File::open(&path).await.with_context(|| format!("failed to open {}", path.display()))?;
                 self.current_reader = Some(Self::make_lz4_reader(file));
+                self.current_input_label = Some(Arc::<str>::from(path.display().to_string()));
                 Ok(true)
             }
             OpenPlan::S3Key { bucket, key, allow_missing, advance_hour } => {
@@ -1990,8 +2019,10 @@ impl Lz4JsonLineReader {
                         *next_hour_ms += HOUR_MS;
                     }
                     self.current_reader = Some(reader);
+                    self.current_input_label = Some(Arc::<str>::from(format!("s3://{bucket}/{key}")));
                     true
                 } else {
+                    self.current_input_label = None;
                     false
                 };
                 Ok(opened)
@@ -2017,6 +2048,7 @@ impl Lz4JsonLineReader {
             self.perf.line_read_bytes = self.perf.line_read_bytes.saturating_add(u64::try_from(bytes_read)?);
             if bytes_read == 0 {
                 self.current_reader = None;
+                self.current_input_label = None;
                 continue;
             }
 
@@ -2043,6 +2075,14 @@ impl Lz4JsonLineReader {
         parsed.map(Some)
     }
 
+    fn current_input_label_arc(&self) -> Option<Arc<str>> {
+        self.current_input_label.clone()
+    }
+
+    fn current_input_label(&self) -> Option<&str> {
+        self.current_input_label.as_deref()
+    }
+
     fn perf_snapshot(&self) -> ReaderReadPerfStats {
         self.perf
     }
@@ -2052,6 +2092,7 @@ struct NodeFillsReader {
     reader: Lz4JsonLineReader,
     block_range: Option<(u64, u64)>,
     target_asset_ids: HashSet<u64>,
+    last_ok_block_number: Option<u64>,
 }
 
 impl NodeFillsReader {
@@ -2066,12 +2107,23 @@ impl NodeFillsReader {
             reader: Lz4JsonLineReader::new(source, s3_client, requester_pays).await?,
             block_range,
             target_asset_ids,
+            last_ok_block_number: None,
         })
     }
 
     async fn next_batch(&mut self) -> Result<Option<NodeFillsBatch>> {
         let block = loop {
-            let Some(block) = self.reader.next_json_line::<NodeFillsBlock>().await? else {
+            let current_input = self.reader.current_input_label().unwrap_or("unknown_input").to_owned();
+            let Some(block) = self.reader.next_json_line::<NodeFillsBlock>().await.with_context(|| {
+                format!(
+                    "node_fills_by_block parse failed input={} last_ok_block={}",
+                    current_input,
+                    self.last_ok_block_number
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_owned())
+                )
+            })?
+            else {
                 return Ok(None);
             };
 
@@ -2085,6 +2137,7 @@ impl NodeFillsReader {
             }
             break block;
         };
+        self.last_ok_block_number = Some(block.block_number);
 
         let (block_time_ns, block_time_ms) = parse_timestamp_ns_ms(&block.block_time)?;
         let mut fills = Vec::with_capacity(block.events.len());
@@ -2138,6 +2191,7 @@ struct ParallelReplicaLz4Reader {
     next_key_idx: usize,
     local_opened: bool,
     current_reader: Option<ParallelLz4LineReader>,
+    current_input_label: Option<Arc<str>>,
     perf: ReaderReadPerfStats,
 }
 
@@ -2470,6 +2524,7 @@ impl ParallelReplicaLz4Reader {
             next_key_idx: 0,
             local_opened: false,
             current_reader: None,
+            current_input_label: None,
             perf: ReaderReadPerfStats::default(),
         })
     }
@@ -2514,6 +2569,7 @@ impl ParallelReplicaLz4Reader {
             let file =
                 tokio::fs::File::open(path).await.with_context(|| format!("failed to open {}", path.display()))?;
             self.current_reader = Some(self.make_parallel_reader(file));
+            self.current_input_label = Some(Arc::<str>::from(path.display().to_string()));
             self.perf.open_reader_ns += open_started_at.elapsed().as_nanos();
             self.perf.open_reader_calls = self.perf.open_reader_calls.saturating_add(1);
             return Ok(true);
@@ -2527,6 +2583,7 @@ impl ParallelReplicaLz4Reader {
             let Some((bucket, key, allow_missing)) = self.next_s3_plan()? else {
                 return Ok(false);
             };
+            let input_label = Arc::<str>::from(format!("s3://{bucket}/{key}"));
 
             let prefetched = fetch_parallel_s3_reader(
                 Arc::clone(&client),
@@ -2546,8 +2603,10 @@ impl ParallelReplicaLz4Reader {
 
             if let Some(reader) = prefetched.reader {
                 self.current_reader = Some(self.make_parallel_reader(reader));
+                self.current_input_label = Some(input_label);
                 return Ok(true);
             }
+            self.current_input_label = None;
         }
     }
 
@@ -2567,7 +2626,12 @@ impl ParallelReplicaLz4Reader {
             }
 
             self.current_reader = None;
+            self.current_input_label = None;
         }
+    }
+
+    fn current_input_label_arc(&self) -> Option<Arc<str>> {
+        self.current_input_label.clone()
     }
 
     fn perf_snapshot(&self) -> ReaderReadPerfStats {
@@ -2607,6 +2671,13 @@ impl ReplicaCmdsReader {
         }
     }
 
+    fn current_input_label_arc(&self) -> Option<Arc<str>> {
+        match &self.reader {
+            ReplicaRawReader::Stream(reader) => reader.current_input_label_arc(),
+            ReplicaRawReader::Parallel(reader) => reader.current_input_label_arc(),
+        }
+    }
+
     fn parse_raw_line(line: &mut Vec<u8>, target_asset_ids: &HashSet<u64>) -> Result<ReplicaBatch> {
         let replica = parse_json_line::<ReplicaLine>(line)?;
         Self::parse_replica_line(replica, target_asset_ids)
@@ -2622,7 +2693,8 @@ impl ReplicaCmdsReader {
         }
         let mut events = Vec::new();
 
-        for (tx_hash, responses) in replica.resps.full {
+        let replica_responses = replica.resps.unwrap_or_default();
+        for (tx_hash, responses) in replica_responses.full {
             let Some(payload) = action_map.get(&tx_hash) else {
                 continue;
             };
@@ -2949,6 +3021,7 @@ impl ReplicaCmdsReader {
 
 struct ReplicaParseTask {
     seq: u64,
+    source_label: Arc<str>,
     line: Vec<u8>,
 }
 
@@ -3043,8 +3116,8 @@ impl ReplicaPrefetchReader {
                 tokio::spawn(async move {
                     while let Some(mut task) = task_rx.recv().await {
                         let parse_started_at = Instant::now();
-                        let parsed =
-                            ReplicaCmdsReader::parse_raw_line(&mut task.line, worker_target_asset_ids.as_ref());
+                        let parsed = ReplicaCmdsReader::parse_raw_line(&mut task.line, worker_target_asset_ids.as_ref())
+                            .with_context(|| format!("replica_cmds parse failed input={}", task.source_label));
                         let parse_ns = parse_started_at.elapsed().as_nanos();
                         task.line.clear();
                         if worker_result_tx
@@ -3089,7 +3162,13 @@ impl ReplicaPrefetchReader {
 
                     let worker_slot = next_worker_idx % effective_workers;
                     next_worker_idx = next_worker_idx.wrapping_add(1);
-                    if task_txs[worker_slot].send(ReplicaParseTask { seq: next_seq_to_assign, line }).await.is_err() {
+                    let source_label =
+                        reader.current_input_label_arc().unwrap_or_else(|| Arc::<str>::from("unknown_input"));
+                    if task_txs[worker_slot]
+                        .send(ReplicaParseTask { seq: next_seq_to_assign, source_label, line })
+                        .await
+                        .is_err()
+                    {
                         drop(tx.send(Err(anyhow!("replica prefetch parser worker channel closed unexpectedly"))).await);
                         return;
                     }
@@ -4604,7 +4683,10 @@ async fn fetch_next_pair(
     replica_reader: &mut ReplicaPrefetchReader,
     fills_reader: &mut NodeFillsReader,
 ) -> Result<(Option<ReplicaBatch>, Option<NodeFillsBatch>)> {
-    let (next_replica, next_fills) = tokio::try_join!(replica_reader.next_batch(), fills_reader.next_batch())?;
+    let (next_replica, next_fills) = tokio::try_join!(
+        async { replica_reader.next_batch().await.context("replica_reader.next_batch inside fetch_next_pair") },
+        async { fills_reader.next_batch().await.context("fills_reader.next_batch inside fetch_next_pair") }
+    )?;
     Ok((next_replica, next_fills))
 }
 
@@ -5179,6 +5261,7 @@ async fn main() -> Result<()> {
     let mut progress_pruned_live_orders_interval: u64 = 0;
     let mut progress_pruned_trigger_oids_interval: u64 = 0;
     let mut last_seen_fills_ts_ns: Option<i64> = None;
+    let mut last_seen_fills_block_number: Option<u64> = None;
     let mut perf_stats = ProcessingPerfStats::default();
     let startup_aws_config =
         startup_aws_config_secs.map(|secs| format!("{secs:.3}s")).unwrap_or_else(|| "-".to_owned());
@@ -5206,7 +5289,16 @@ async fn main() -> Result<()> {
     );
     info!("[phase] processing blocks ...");
     let fetch_pair_started_at = Instant::now();
-    let (mut next_replica, mut next_fills) = fetch_next_pair(&mut replica_reader, &mut fills_reader).await?;
+    let (mut next_replica, mut next_fills) = fetch_next_pair(&mut replica_reader, &mut fills_reader)
+        .await
+        .with_context(|| {
+            format!(
+                "initial fetch_next_pair failed last_seen_fills_block={}",
+                last_seen_fills_block_number
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned())
+            )
+        })?;
     perf_stats.fetch_pair_ns += fetch_pair_started_at.elapsed().as_nanos();
 
     while next_replica.is_some() || next_fills.is_some() {
@@ -5251,6 +5343,7 @@ async fn main() -> Result<()> {
                     let fills_by_coin_state =
                         split_fills_by_coin_state(fills, &coin_state_idx_by_asset, coin_states.len());
                     last_seen_fills_ts_ns = Some(fills_block_time_ns);
+                    last_seen_fills_block_number = Some(block_number);
                     let emit_rows =
                         output_block_range.map(|(start_height, _)| block_number >= start_height).unwrap_or(true);
 
@@ -5399,7 +5492,14 @@ async fn main() -> Result<()> {
                     .await?;
 
                     let fetch_pair_started_at = Instant::now();
-                    let pair = fetch_next_pair(&mut replica_reader, &mut fills_reader).await?;
+                    let pair = fetch_next_pair(&mut replica_reader, &mut fills_reader).await.with_context(|| {
+                        format!(
+                            "fetch_next_pair failed last_seen_fills_block={}",
+                            last_seen_fills_block_number
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "none".to_owned())
+                        )
+                    })?;
                     perf_stats.fetch_pair_ns += fetch_pair_started_at.elapsed().as_nanos();
                     next_replica = pair.0;
                     next_fills = pair.1;
@@ -5408,7 +5508,14 @@ async fn main() -> Result<()> {
 
                 if replica.block_time_ns < fills.block_time_ns {
                     let fetch_replica_started_at = Instant::now();
-                    next_replica = replica_reader.next_batch().await?;
+                    next_replica = replica_reader.next_batch().await.with_context(|| {
+                        format!(
+                            "replica_reader.next_batch failed last_seen_fills_block={}",
+                            last_seen_fills_block_number
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "none".to_owned())
+                        )
+                    })?;
                     perf_stats.fetch_replica_only_ns += fetch_replica_started_at.elapsed().as_nanos();
                     continue;
                 }
@@ -5422,6 +5529,7 @@ async fn main() -> Result<()> {
                 } = fills;
                 let fills_by_coin_state = split_fills_by_coin_state(fills, &coin_state_idx_by_asset, coin_states.len());
                 last_seen_fills_ts_ns = Some(fills_block_time_ns);
+                last_seen_fills_block_number = Some(block_number);
                 let emit_rows =
                     output_block_range.map(|(start_height, _)| block_number >= start_height).unwrap_or(true);
 
@@ -5566,7 +5674,14 @@ async fn main() -> Result<()> {
                 .await?;
 
                 let fetch_fills_started_at = Instant::now();
-                next_fills = fills_reader.next_batch().await?;
+                next_fills = fills_reader.next_batch().await.with_context(|| {
+                    format!(
+                        "fills_reader.next_batch failed last_seen_fills_block={}",
+                        last_seen_fills_block_number
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "none".to_owned())
+                    )
+                })?;
                 perf_stats.fetch_fills_only_ns += fetch_fills_started_at.elapsed().as_nanos();
             }
             (Some(replica), None) => {
