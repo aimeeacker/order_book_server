@@ -1528,16 +1528,10 @@ fn format_json_line_debug(line: &[u8]) -> String {
     const PREVIEW_LEN: usize = 64;
 
     let preview = &line[..line.len().min(PREVIEW_LEN)];
-    let hex_preview = preview
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let hex_preview = preview.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ");
     let text_preview = String::from_utf8_lossy(preview);
     let first_non_ws = line.iter().copied().find(|byte| !byte.is_ascii_whitespace());
-    let first_non_ws_text = first_non_ws
-        .map(|byte| format!("0x{byte:02x}"))
-        .unwrap_or_else(|| "none".to_owned());
+    let first_non_ws_text = first_non_ws.map(|byte| format!("0x{byte:02x}")).unwrap_or_else(|| "none".to_owned());
 
     format!(
         "len={} first_non_ws={} hex_prefix=[{}] text_prefix={:?}",
@@ -1716,6 +1710,94 @@ fn resolve_required_chunks_from_keys(required_chunks: &[u64], keys: Vec<String>)
     Some(resolved)
 }
 
+#[derive(Debug, Default, Clone)]
+struct RuntimeReplicaChunkIndex {
+    chunk_to_key: HashMap<u64, String>,
+    min_chunk: u64,
+    max_chunk: Option<u64>,
+    scanned_snapshots: usize,
+    scanned_date_prefixes: usize,
+}
+
+fn parse_yyyymmdd_from_prefix(prefix: &str) -> Option<u32> {
+    let leaf = prefix.rsplit('/').next()?;
+    if leaf.len() == 8 && leaf.bytes().all(|ch| ch.is_ascii_digit()) {
+        return leaf.parse::<u32>().ok();
+    }
+    if leaf.len() >= 10 {
+        let date = NaiveDate::parse_from_str(&leaf[..10], "%Y-%m-%d").ok()?;
+        return Some((date.year() as u32) * 10_000 + date.month() * 100 + date.day());
+    }
+    None
+}
+
+fn parse_chunk_from_lz4_key(key: &str) -> Option<u64> {
+    let file_name = key.rsplit('/').next()?;
+    let chunk = file_name.strip_suffix(".lz4")?;
+    chunk.parse::<u64>().ok()
+}
+
+async fn build_runtime_replica_chunk_index(
+    client: &S3Client,
+    bucket: &str,
+    normalized_prefix: &str,
+    requester_pays: bool,
+) -> Result<RuntimeReplicaChunkIndex> {
+    let mut index = RuntimeReplicaChunkIndex { min_chunk: REPLICA_INDEX_END_EXCLUSIVE_CHUNK, ..Default::default() };
+
+    if normalized_prefix != "replica_cmds" {
+        return Ok(index);
+    }
+
+    let mut snapshots = list_child_prefixes(client, bucket, normalized_prefix, requester_pays).await?;
+    if snapshots.is_empty() {
+        return Ok(index);
+    }
+
+    snapshots.sort_unstable();
+    let builtin_end_date = REPLICA_CHUNK_INDEX.last().map(|entry| entry.date_yyyymmdd).unwrap_or_default();
+
+    for snapshot_prefix in snapshots.into_iter().rev() {
+        if let Some(snapshot_date) = parse_yyyymmdd_from_prefix(&snapshot_prefix)
+            && snapshot_date < builtin_end_date
+        {
+            continue;
+        }
+        index.scanned_snapshots += 1;
+
+        let mut date_prefixes = list_child_prefixes(client, bucket, &snapshot_prefix, requester_pays).await?;
+        date_prefixes.sort_unstable();
+
+        for date_prefix in date_prefixes.into_iter().rev() {
+            if let Some(date_yyyymmdd) = parse_yyyymmdd_from_prefix(&date_prefix)
+                && date_yyyymmdd < builtin_end_date
+            {
+                continue;
+            }
+            index.scanned_date_prefixes += 1;
+
+            let keys = list_lz4_keys(client, bucket, &date_prefix, requester_pays).await?;
+            for key in keys {
+                let Some(chunk) = parse_chunk_from_lz4_key(&key) else {
+                    continue;
+                };
+                if chunk < index.min_chunk {
+                    continue;
+                }
+                index.max_chunk = Some(index.max_chunk.map_or(chunk, |prev| prev.max(chunk)));
+                match index.chunk_to_key.get(&chunk) {
+                    Some(existing) if existing >= &key => {}
+                    _ => {
+                        index.chunk_to_key.insert(chunk, key);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(index)
+}
+
 async fn resolve_required_chunks_in_prefix(
     client: &S3Client,
     bucket: &str,
@@ -1785,6 +1867,31 @@ fn resolve_replica_keys_via_hardcoded_chunk_index(
     Ok(Some(resolved))
 }
 
+fn resolve_replica_key_via_hardcoded_chunk_index(normalized_prefix: &str, chunk: u64) -> Result<Option<String>> {
+    if normalized_prefix != "replica_cmds" {
+        return Ok(None);
+    }
+
+    let Some(first_entry) = REPLICA_CHUNK_INDEX.first() else {
+        return Ok(None);
+    };
+    let first_chunk = first_entry.start_chunk;
+    if chunk < first_chunk || chunk >= REPLICA_INDEX_END_EXCLUSIVE_CHUNK {
+        return Ok(None);
+    }
+
+    let pos = REPLICA_CHUNK_INDEX.partition_point(|entry| entry.start_chunk <= chunk);
+    if pos == 0 {
+        return Ok(None);
+    }
+    let segment_entry = REPLICA_CHUNK_INDEX[pos - 1];
+    let snapshot = REPLICA_SNAPSHOT_DIRS
+        .get(usize::from(segment_entry.snapshot_idx))
+        .ok_or_else(|| anyhow!("invalid snapshot idx in hardcoded replica index: {}", segment_entry.snapshot_idx))?;
+    let date_str = format!("{:08}", segment_entry.date_yyyymmdd);
+    Ok(Some(format!("{normalized_prefix}/{snapshot}/{date_str}/{chunk}.lz4")))
+}
+
 async fn resolve_replica_keys_for_range(
     client: &S3Client,
     bucket: &str,
@@ -1792,6 +1899,7 @@ async fn resolve_replica_keys_for_range(
     start_height: u64,
     height_span: u64,
     requester_pays: bool,
+    runtime_index: Option<&RuntimeReplicaChunkIndex>,
 ) -> Result<Vec<String>> {
     let required_chunks = replica_chunk_starts_for_range(start_height, height_span)?;
     let normalized_prefix = prefix.trim_matches('/');
@@ -1804,6 +1912,40 @@ async fn resolve_replica_keys_for_range(
             start_height + height_span - 1
         );
         return Ok(resolved);
+    }
+
+    if normalized_prefix == "replica_cmds" {
+        let mut resolved = Vec::with_capacity(required_chunks.len());
+        let mut missing = Vec::new();
+        for &chunk in &required_chunks {
+            if let Some(key) = resolve_replica_key_via_hardcoded_chunk_index(normalized_prefix, chunk)? {
+                resolved.push(key);
+                continue;
+            }
+            if let Some(key) = runtime_index.and_then(|index| index.chunk_to_key.get(&chunk)).cloned() {
+                resolved.push(key);
+                continue;
+            }
+            missing.push(chunk);
+        }
+
+        if missing.is_empty() {
+            info!(
+                "[index] resolved replica_cmds via hardcoded+runtime index for {} chunks (range {}..{})",
+                resolved.len(),
+                start_height,
+                start_height + height_span - 1
+            );
+            return Ok(resolved);
+        }
+
+        info!(
+            "[index] unresolved replica chunks after hardcoded+runtime index: missing={} first_missing={} range={}..{} (fallback listing enabled)",
+            missing.len(),
+            missing[0],
+            start_height,
+            start_height + height_span - 1
+        );
     }
 
     // Fast path: try deterministic keys directly under the provided prefix.
@@ -2118,9 +2260,7 @@ impl NodeFillsReader {
                 format!(
                     "node_fills_by_block parse failed input={} last_ok_block={}",
                     current_input,
-                    self.last_ok_block_number
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "none".to_owned())
+                    self.last_ok_block_number.map(|value| value.to_string()).unwrap_or_else(|| "none".to_owned())
                 )
             })?
             else {
@@ -3116,8 +3256,9 @@ impl ReplicaPrefetchReader {
                 tokio::spawn(async move {
                     while let Some(mut task) = task_rx.recv().await {
                         let parse_started_at = Instant::now();
-                        let parsed = ReplicaCmdsReader::parse_raw_line(&mut task.line, worker_target_asset_ids.as_ref())
-                            .with_context(|| format!("replica_cmds parse failed input={}", task.source_label));
+                        let parsed =
+                            ReplicaCmdsReader::parse_raw_line(&mut task.line, worker_target_asset_ids.as_ref())
+                                .with_context(|| format!("replica_cmds parse failed input={}", task.source_label));
                         let parse_ns = parse_started_at.elapsed().as_nanos();
                         task.line.clear();
                         if worker_result_tx
@@ -5086,6 +5227,8 @@ async fn main() -> Result<()> {
     let mut startup_aws_config_secs: Option<f64> = None;
     let mut startup_replica_keys_resolve_secs: Option<f64> = None;
     let mut startup_replica_keys_count: Option<usize> = None;
+    let mut startup_replica_runtime_index_secs: Option<f64> = None;
+    let mut startup_replica_runtime_index_chunks: Option<usize> = None;
     let s3_client = if uses_s3 {
         let aws_config_started_at = Instant::now();
         let config = aws_config::defaults(aws_config::BehaviorVersion::latest()).load().await;
@@ -5099,6 +5242,35 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let mut runtime_replica_chunk_index: Option<RuntimeReplicaChunkIndex> = None;
+    if let InputSource::S3Prefix { bucket, prefix } = &replica_source
+        && let Some(client) = s3_client.as_ref()
+    {
+        let normalized_prefix = prefix.trim_matches('/');
+        if normalized_prefix == "replica_cmds" {
+            let runtime_index_started_at = Instant::now();
+            let runtime_index =
+                build_runtime_replica_chunk_index(client, bucket, normalized_prefix, requester_pays).await?;
+            startup_replica_runtime_index_secs = Some(runtime_index_started_at.elapsed().as_secs_f64());
+            startup_replica_runtime_index_chunks = Some(runtime_index.chunk_to_key.len());
+            if let Some(max_chunk) = runtime_index.max_chunk {
+                info!(
+                    "[index] startup incremental replica index ready chunks={} range={}..{} scanned_snapshots={} scanned_dates={}",
+                    runtime_index.chunk_to_key.len(),
+                    runtime_index.min_chunk,
+                    max_chunk,
+                    runtime_index.scanned_snapshots,
+                    runtime_index.scanned_date_prefixes
+                );
+            } else {
+                info!(
+                    "[index] startup incremental replica index ready chunks=0 from_chunk={} scanned_snapshots={} scanned_dates={}",
+                    runtime_index.min_chunk, runtime_index.scanned_snapshots, runtime_index.scanned_date_prefixes
+                );
+            }
+            runtime_replica_chunk_index = Some(runtime_index);
+        }
+    }
 
     let replica_reader_source = match &replica_source {
         InputSource::LocalFile(path) => {
@@ -5116,10 +5288,17 @@ async fn main() -> Result<()> {
                 bail!("S3 replica_cmds requires initialized S3 client");
             };
             let resolve_replica_keys_started_at = Instant::now();
-            let keys =
-                resolve_replica_keys_for_range(client, bucket, prefix, start_height, height_span, requester_pays)
-                    .await
-                    .context("resolving replica_cmds keys from S3 layout")?;
+            let keys = resolve_replica_keys_for_range(
+                client,
+                bucket,
+                prefix,
+                start_height,
+                height_span,
+                requester_pays,
+                runtime_replica_chunk_index.as_ref(),
+            )
+            .await
+            .context("resolving replica_cmds keys from S3 layout")?;
             startup_replica_keys_resolve_secs = Some(resolve_replica_keys_started_at.elapsed().as_secs_f64());
             startup_replica_keys_count = Some(keys.len());
             ReaderSource::S3Keys { bucket: bucket.clone(), keys }
@@ -5269,6 +5448,10 @@ async fn main() -> Result<()> {
         startup_replica_keys_resolve_secs.map(|secs| format!("{secs:.3}s")).unwrap_or_else(|| "-".to_owned());
     let startup_replica_keys =
         startup_replica_keys_count.map(|count| count.to_string()).unwrap_or_else(|| "-".to_owned());
+    let startup_replica_runtime_index =
+        startup_replica_runtime_index_secs.map(|secs| format!("{secs:.3}s")).unwrap_or_else(|| "-".to_owned());
+    let startup_replica_runtime_chunks =
+        startup_replica_runtime_index_chunks.map(|count| count.to_string()).unwrap_or_else(|| "-".to_owned());
     let read_range_text = read_block_range
         .map(|(start_height, end_height)| format!("{start_height}..{end_height}"))
         .unwrap_or_else(|| "all".to_owned());
@@ -5276,12 +5459,14 @@ async fn main() -> Result<()> {
         .map(|(start_height, end_height)| format!("{start_height}..{end_height}"))
         .unwrap_or_else(|| "all".to_owned());
     info!(
-        "[startup] ready_for_processing elapsed_total={:.3}s s3={} aws_cfg={} replica_keys={} key_resolve={} reader_workers={} cleaned_tmp={} read_range={} output_range={}",
+        "[startup] ready_for_processing elapsed_total={:.3}s s3={} aws_cfg={} replica_keys={} key_resolve={} runtime_index={} runtime_chunks={} reader_workers={} cleaned_tmp={} read_range={} output_range={}",
         startup_started_at.elapsed().as_secs_f64(),
         uses_s3,
         startup_aws_config,
         startup_replica_keys,
         startup_replica_keys_resolve,
+        startup_replica_runtime_index,
+        startup_replica_runtime_chunks,
         replica_reader.worker_count(),
         cleaned_stale_tmp_files,
         read_range_text,
@@ -5289,14 +5474,11 @@ async fn main() -> Result<()> {
     );
     info!("[phase] processing blocks ...");
     let fetch_pair_started_at = Instant::now();
-    let (mut next_replica, mut next_fills) = fetch_next_pair(&mut replica_reader, &mut fills_reader)
-        .await
-        .with_context(|| {
+    let (mut next_replica, mut next_fills) =
+        fetch_next_pair(&mut replica_reader, &mut fills_reader).await.with_context(|| {
             format!(
                 "initial fetch_next_pair failed last_seen_fills_block={}",
-                last_seen_fills_block_number
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_owned())
+                last_seen_fills_block_number.map(|value| value.to_string()).unwrap_or_else(|| "none".to_owned())
             )
         })?;
     perf_stats.fetch_pair_ns += fetch_pair_started_at.elapsed().as_nanos();
