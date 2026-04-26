@@ -183,9 +183,29 @@ struct PerpDex {
 struct Book {
     asset: u64,
     halfs: Vec<Half>,
-    book_orders: HashMap<u64, BookOrder>,
+    #[serde(rename = "bod")]
+    book_order_data: BookOrderData,
     #[serde(default)]
     user_states: Vec<(String, UserState)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BookOrderData {
+    #[serde(rename = "e")]
+    entries: Vec<BookOrderSlot>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BookOrderSlot {
+    Occupied {
+        #[serde(rename = "o")]
+        order: BookOrder,
+    },
+    Vacant {
+        #[serde(rename = "v")]
+        _next: IgnoredAny,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,7 +271,9 @@ struct UserState {
 
 #[derive(Debug, Deserialize)]
 struct TriggerOrder {
+    #[serde(rename = "c")]
     core: TriggerCore,
+    #[serde(rename = "t")]
     trigger: TriggerMeta,
 }
 
@@ -275,7 +297,7 @@ struct TriggerCore {
 
 #[derive(Debug, Deserialize)]
 struct TriggerMeta {
-    #[serde(rename = "triggerPx")]
+    #[serde(rename = "p")]
     trigger_px: u64,
 }
 
@@ -302,7 +324,7 @@ struct TriggerRecord<'a> {
 }
 
 struct BookContext<'a> {
-    book_orders: &'a HashMap<u64, BookOrder>,
+    book_orders: &'a [BookOrderSlot],
     trigger_records: HashMap<u64, TriggerRecord<'a>>,
     trigger_sequence: Vec<TriggerRecord<'a>>,
 }
@@ -586,10 +608,7 @@ fn render_side<W: Write>(
     for (_, endpoints) in &half.levels {
         let mut current_idx = endpoints.f;
         loop {
-            let order = context
-                .book_orders
-                .get(&current_idx)
-                .ok_or_else(|| AppError(format!("missing book order index {current_idx}")))?;
+            let order = book_order_at(context.book_orders, current_idx)?;
             let snapshot = build_visible_order(spec, order, &context.trigger_records)?;
             if options.include_users {
                 write_json_value(writer, &mut first_item, &UserWrappedOrder(order.user.clone(), snapshot))?;
@@ -684,10 +703,7 @@ fn build_side_entries(
     for (_, endpoints) in &half.levels {
         let mut current_idx = endpoints.f;
         loop {
-            let order = context
-                .book_orders
-                .get(&current_idx)
-                .ok_or_else(|| AppError(format!("missing book order index {current_idx}")))?;
+            let order = book_order_at(context.book_orders, current_idx)?;
             let snapshot = build_visible_order(spec, order, &context.trigger_records)?;
             out.push(wrap_output_entry(order.user.as_str(), snapshot, options.include_users));
 
@@ -724,7 +740,16 @@ fn wrap_output_entry(user: &str, snapshot: SnapshotOrder, include_users: bool) -
 
 fn build_book_context(book: &Book) -> BookContext<'_> {
     let (trigger_records, trigger_sequence) = build_trigger_records(book);
-    BookContext { book_orders: &book.book_orders, trigger_records, trigger_sequence }
+    BookContext { book_orders: &book.book_order_data.entries, trigger_records, trigger_sequence }
+}
+
+fn book_order_at(book_orders: &[BookOrderSlot], index: u64) -> AppResult<&BookOrder> {
+    let index = usize::try_from(index).map_err(|_| AppError(format!("book order index {index} overflows usize")))?;
+    match book_orders.get(index) {
+        Some(BookOrderSlot::Occupied { order }) => Ok(order),
+        Some(BookOrderSlot::Vacant { .. }) => Err(AppError(format!("book order index {index} is vacant"))),
+        None => Err(AppError(format!("missing book order index {index}"))),
+    }
 }
 
 fn build_visible_order(
@@ -1303,9 +1328,9 @@ fn _compute_l4_native(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
 mod tests {
     use super::{
         BookPayload, BookSnapshotEntry, BookSource, BookSpec, ComputeOptions, DEFAULT_DATASET_DIR, LevelsPayload,
-        OutputOrderEntry, SnapshotOrder, UserWrappedOrder, checkpoint_record_from_snapshot_json_bytes,
-        checkpoint_segment_bounds, current_dataset_dir, order_type_from_code, scaled_to_condition_string,
-        scaled_to_string, select_specs, trigger_condition,
+        OutputOrderEntry, Root, SnapshotOrder, UserWrappedOrder, build_snapshot_document,
+        checkpoint_record_from_snapshot_json_bytes, checkpoint_segment_bounds, collect_book_specs, current_dataset_dir,
+        order_type_from_code, scaled_to_condition_string, scaled_to_string, select_specs, trigger_condition,
     };
     use serde_json::json;
 
@@ -1370,6 +1395,173 @@ mod tests {
     #[test]
     fn reports_default_dataset_dir() {
         assert_eq!(current_dataset_dir().to_string_lossy(), DEFAULT_DATASET_DIR);
+    }
+
+    #[test]
+    fn builds_snapshot_from_bod_order_layout() {
+        let root: Root = serde_json::from_value(json!({
+            "exchange": {
+                "locus": {
+                    "cls": [{ "meta": { "universe": [{ "name": "BTC", "szDecimals": 5 }] } }],
+                    "scl": { "meta": { "spot_infos": [], "token_infos": [] } },
+                    "ctx": { "height": 10_000u64, "time": "2026-04-26T12:39:39.783481402" }
+                },
+                "perp_dexs": [{
+                    "books": [{
+                        "asset": 0u64,
+                        "halfs": [
+                            { "levels": [[0, { "f": 0u64, "l": 1u64 }]] },
+                            { "levels": [] }
+                        ],
+                        "bod": {
+                            "e": [
+                                {
+                                    "o": {
+                                        "n": 1u64,
+                                        "r": 1000u64,
+                                        "O": 1500u64,
+                                        "u": "0xuser",
+                                        "t": "Gtc",
+                                        "c": {
+                                            "t": 1u64,
+                                            "s": "B",
+                                            "l": 100000u64,
+                                            "R": { "c": [42u64] }
+                                        },
+                                        "o": 10u64
+                                    }
+                                },
+                                {
+                                    "o": {
+                                        "r": 2000u64,
+                                        "u": "0xuser2",
+                                        "t": null,
+                                        "c": { "t": 2u64, "s": "B", "l": 100000u64 },
+                                        "o": 11u64
+                                    }
+                                },
+                                { "v": 0u64 }
+                            ],
+                            "l": 2u64,
+                            "n": 2u64
+                        },
+                        "user_states": [[
+                            "0xuser",
+                            {
+                                "u": [[
+                                    42u64,
+                                    {
+                                        "c": {
+                                            "t": 3u64,
+                                            "S": 500u64,
+                                            "r": true,
+                                            "d": "T",
+                                            "s": "A",
+                                            "l": 101000u64
+                                        },
+                                        "t": { "p": 102000u64, "m": true, "t": "tp" }
+                                    }
+                                ]]
+                            }
+                        ]]
+                    }]
+                }],
+                "spot_books": []
+            }
+        }))
+        .expect("root from new book layout");
+        let options = ComputeOptions { include_trigger_orders: true, ..ComputeOptions::default() };
+        let specs = select_specs(collect_book_specs(&root.exchange).expect("book specs"), &options).expect("select");
+        let snapshot = build_snapshot_document(&root.exchange, &specs, &options).expect("snapshot");
+
+        assert_eq!(
+            serde_json::to_value(snapshot).expect("snapshot json"),
+            json!([
+                [
+                    "BTC",
+                    {
+                        "block_height": 10000u64,
+                        "block_time": "2026-04-26T12:39:39.783481402",
+                        "book_orders": [
+                            [
+                                {
+                                    "coin": "BTC",
+                                    "side": "B",
+                                    "limitPx": "10000.0",
+                                    "sz": "0.01",
+                                    "oid": 10u64,
+                                    "timestamp": 1u64,
+                                    "triggerCondition": "N/A",
+                                    "isTrigger": false,
+                                    "triggerPx": "0.0",
+                                    "children": [{
+                                        "coin": "BTC",
+                                        "side": "A",
+                                        "limitPx": "10100.0",
+                                        "sz": "0.005",
+                                        "oid": 42u64,
+                                        "timestamp": 3u64,
+                                        "triggerCondition": "Price above 10200",
+                                        "isTrigger": true,
+                                        "triggerPx": "10200.0",
+                                        "children": [],
+                                        "isPositionTpsl": false,
+                                        "reduceOnly": true,
+                                        "orderType": "Take Profit Market",
+                                        "origSz": "0.005",
+                                        "tif": null,
+                                        "cloid": null
+                                    }],
+                                    "isPositionTpsl": false,
+                                    "reduceOnly": false,
+                                    "orderType": "Limit",
+                                    "origSz": "0.015",
+                                    "tif": "Gtc",
+                                    "cloid": null
+                                },
+                                {
+                                    "coin": "BTC",
+                                    "side": "B",
+                                    "limitPx": "10000.0",
+                                    "sz": "0.02",
+                                    "oid": 11u64,
+                                    "timestamp": 2u64,
+                                    "triggerCondition": "N/A",
+                                    "isTrigger": false,
+                                    "triggerPx": "0.0",
+                                    "children": [],
+                                    "isPositionTpsl": false,
+                                    "reduceOnly": false,
+                                    "orderType": "Limit",
+                                    "origSz": "0.0",
+                                    "tif": null,
+                                    "cloid": null
+                                }
+                            ],
+                            []
+                        ],
+                        "untriggered_orders": [{
+                            "coin": "BTC",
+                            "side": "A",
+                            "limitPx": "10100.0",
+                            "sz": "0.005",
+                            "oid": 42u64,
+                            "timestamp": 3u64,
+                            "triggerCondition": "Price above 10200",
+                            "isTrigger": true,
+                            "triggerPx": "10200.0",
+                            "children": [],
+                            "isPositionTpsl": false,
+                            "reduceOnly": true,
+                            "orderType": "Take Profit Market",
+                            "origSz": "0.005",
+                            "tif": null,
+                            "cloid": null
+                        }]
+                    }
+                ]
+            ])
+        );
     }
 
     #[test]
